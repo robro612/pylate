@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../../img/favicon.ico">
-      <meta name="generator" content="mkdocs-1.6.0, mkdocs-material-9.5.32">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.5.32">
     
     
       
@@ -934,6 +934,10 @@
       
         
       
+        
+      
+        
+      
     
     
       
@@ -950,7 +954,7 @@
         
   
   
-    <a href="../../scores/colbert-kd-scores/" class="md-nav__link">
+    <a href="../../scores/colbert-kd-scores-top-p/" class="md-nav__link">
       
   
   <span class="md-ellipsis">
@@ -1251,6 +1255,19 @@
 </ul>
 </details>
 <details class="- note">
+<summary>from_stanford_weights</summary>
+<p>Load the weight of the Dense layer using weights from a stanford-nlp checkpoint.</p>
+<p><strong>Parameters</strong></p>
+<ul>
+<li><strong>model_name_or_path</strong>     (<em>str | os.PathLike</em>)    </li>
+<li><strong>cache_folder</strong>     (<em>str | os.PathLike | None</em>)     – defaults to <code>None</code>    </li>
+<li><strong>revision</strong>     (<em>str | None</em>)     – defaults to <code>None</code>    </li>
+<li><strong>local_files_only</strong>     (<em>bool | None</em>)     – defaults to <code>None</code>    </li>
+<li><strong>token</strong>     (<em>str | bool | None</em>)     – defaults to <code>None</code>    </li>
+<li><strong>use_auth_token</strong>     (<em>str | bool | None</em>)     – defaults to <code>None</code>    </li>
+</ul>
+</details>
+<details class="- note">
 <summary>get_buffer</summary>
 <p>Return the buffer given by <code>target</code> if it exists, otherwise throw an error.</p>
 <p>See the docstring for <code>get_submodule</code> for a more detailed explanation of this method's functionality as well as how to correctly specify <code>target</code>.  Args:     target: The fully-qualified string name of the buffer         to look for. (See <code>get_submodule</code> for how to specify a         fully-qualified string.)  Returns:     torch.Tensor: The buffer referenced by <code>target</code>  Raises:     AttributeError: If the target string references an invalid         path or resolves to something that is not a         buffer</p>
@@ -1312,7 +1329,7 @@
 <details class="- note">
 <summary>load_state_dict</summary>
 <p>Copy parameters and buffers from :attr:<code>state_dict</code> into this module and its descendants.</p>
-<p>If :attr:<code>strict</code> is <code>True</code>, then the keys of :attr:<code>state_dict</code> must exactly match the keys returned by this module's :meth:<code>~torch.nn.Module.state_dict</code> function.  .. warning::     If :attr:<code>assign</code> is <code>True</code> the optimizer must be created after     the call to :attr:<code>load_state_dict</code> unless     :func:<code>~torch.__future__.get_swap_module_params_on_conversion</code> is <code>True</code>.  Args:     state_dict (dict): a dict containing parameters and         persistent buffers.     strict (bool, optional): whether to strictly enforce that the keys         in :attr:<code>state_dict</code> match the keys returned by this module's         :meth:<code>~torch.nn.Module.state_dict</code> function. Default: <code>True</code>     assign (bool, optional): When <code>False</code>, the properties of the tensors         in the current module are preserved while when <code>True</code>, the         properties of the Tensors in the state dict are preserved. The only         exception is the <code>requires_grad</code> field of :class:<code>~torch.nn.Parameter</code>s         for which the value from the module is preserved.         Default: <code>False</code>  Returns:     <code>NamedTuple</code> with <code>missing_keys</code> and <code>unexpected_keys</code> fields:         * <strong>missing_keys</strong> is a list of str containing the missing keys         * <strong>unexpected_keys</strong> is a list of str containing the unexpected keys  Note:     If a parameter or buffer is registered as <code>None</code> and its corresponding key     exists in :attr:<code>state_dict</code>, :meth:<code>load_state_dict</code> will raise a     <code>RuntimeError</code>.</p>
+<p>If :attr:<code>strict</code> is <code>True</code>, then the keys of :attr:<code>state_dict</code> must exactly match the keys returned by this module's :meth:<code>~torch.nn.Module.state_dict</code> function.  .. warning::     If :attr:<code>assign</code> is <code>True</code> the optimizer must be created after     the call to :attr:<code>load_state_dict</code> unless     :func:<code>~torch.__future__.get_swap_module_params_on_conversion</code> is <code>True</code>.  Args:     state_dict (dict): a dict containing parameters and         persistent buffers.     strict (bool, optional): whether to strictly enforce that the keys         in :attr:<code>state_dict</code> match the keys returned by this module's         :meth:<code>~torch.nn.Module.state_dict</code> function. Default: <code>True</code>     assign (bool, optional): When <code>False</code>, the properties of the tensors         in the current module are preserved while when <code>True</code>, the         properties of the Tensors in the state dict are preserved. The only         exception is the <code>requires_grad</code> field of :class:<code>~torch.nn.Parameter</code>s         for which the value from the module is preserved.         Default: <code>False</code>  Returns:     <code>NamedTuple</code> with <code>missing_keys</code> and <code>unexpected_keys</code> fields:         * <strong>missing_keys</strong> is a list of str containing any keys that are expected             by this module but missing from the provided <code>state_dict</code>.         * <strong>unexpected_keys</strong> is a list of str containing the keys that are not             expected by this module but present in the provided <code>state_dict</code>.  Note:     If a parameter or buffer is registered as <code>None</code> and its corresponding key     exists in :attr:<code>state_dict</code>, :meth:<code>load_state_dict</code> will raise a     <code>RuntimeError</code>.</p>
 <p><strong>Parameters</strong></p>
 <ul>
 <li><strong>state_dict</strong>     (<em>Mapping[str, Any]</em>)    </li>

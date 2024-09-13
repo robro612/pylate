@@ -2,142 +2,122 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://lightonai.github.io/pylate/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/overview/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/ColBERTDistillationEvaluator/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/ColBERTTripletEvaluator/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/evaluate/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/get-beir-triples/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/load-beir/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/evaluation/load-custom-dataset/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/indexes/Voyager/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/losses/Contrastive/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/losses/Distillation/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/models/ColBERT/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/models/Dense/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/rank/rerank/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/retrieve/ColBERT/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
+    </url>
+    <url>
+         <loc>https://lightonai.github.io/pylate/api/scores/colbert-kd-scores-top-p/</loc>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/scores/colbert-kd-scores/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/scores/colbert-scores-pairwise/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
+    </url>
+    <url>
+         <loc>https://lightonai.github.io/pylate/api/scores/colbert-scores-top-p/</loc>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/scores/colbert-scores/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/utils/ColBERTCollator/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/utils/KDProcessing/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/utils/convert-to-tensor/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/api/utils/iter-batch/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/documentation/datasets/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/documentation/evaluation/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/documentation/retrieval/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/documentation/training/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/models/models/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
     <url>
          <loc>https://lightonai.github.io/pylate/parse/__main__/</loc>
-         <lastmod>2024-08-29</lastmod>
-         <changefreq>daily</changefreq>
+         <lastmod>2024-09-13</lastmod>
     </url>
 </urlset>

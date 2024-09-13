@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../../img/favicon.ico">
-      <meta name="generator" content="mkdocs-1.6.0, mkdocs-material-9.5.32">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.5.32">
     
     
       
@@ -943,6 +943,10 @@
       
         
       
+        
+      
+        
+      
     
     
       
@@ -959,7 +963,7 @@
         
   
   
-    <a href="../../scores/colbert-kd-scores/" class="md-nav__link">
+    <a href="../../scores/colbert-kd-scores-top-p/" class="md-nav__link">
       
   
   <span class="md-ellipsis">
@@ -1180,11 +1184,11 @@
 <p><strong>bias</strong> (<em>bool</em>) – defaults to <code>False</code></p>
 </li>
 <li>
-<p><strong>query_prefix</strong> (<em>str | None</em>) – defaults to <code>[Q]</code></p>
+<p><strong>query_prefix</strong> (<em>str | None</em>) – defaults to <code>None</code></p>
 <p>Prefix to add to the queries.</p>
 </li>
 <li>
-<p><strong>document_prefix</strong> (<em>str | None</em>) – defaults to <code>[D]</code></p>
+<p><strong>document_prefix</strong> (<em>str | None</em>) – defaults to <code>None</code></p>
 <p>Prefix to add to the documents.</p>
 </li>
 <li>
@@ -1574,7 +1578,7 @@
 <details class="- note">
 <summary>load_state_dict</summary>
 <p>Copy parameters and buffers from :attr:<code>state_dict</code> into this module and its descendants.</p>
-<p>If :attr:<code>strict</code> is <code>True</code>, then the keys of :attr:<code>state_dict</code> must exactly match the keys returned by this module's :meth:<code>~torch.nn.Module.state_dict</code> function.  .. warning::     If :attr:<code>assign</code> is <code>True</code> the optimizer must be created after     the call to :attr:<code>load_state_dict</code> unless     :func:<code>~torch.__future__.get_swap_module_params_on_conversion</code> is <code>True</code>.  Args:     state_dict (dict): a dict containing parameters and         persistent buffers.     strict (bool, optional): whether to strictly enforce that the keys         in :attr:<code>state_dict</code> match the keys returned by this module's         :meth:<code>~torch.nn.Module.state_dict</code> function. Default: <code>True</code>     assign (bool, optional): When <code>False</code>, the properties of the tensors         in the current module are preserved while when <code>True</code>, the         properties of the Tensors in the state dict are preserved. The only         exception is the <code>requires_grad</code> field of :class:<code>~torch.nn.Parameter</code>s         for which the value from the module is preserved.         Default: <code>False</code>  Returns:     <code>NamedTuple</code> with <code>missing_keys</code> and <code>unexpected_keys</code> fields:         * <strong>missing_keys</strong> is a list of str containing the missing keys         * <strong>unexpected_keys</strong> is a list of str containing the unexpected keys  Note:     If a parameter or buffer is registered as <code>None</code> and its corresponding key     exists in :attr:<code>state_dict</code>, :meth:<code>load_state_dict</code> will raise a     <code>RuntimeError</code>.</p>
+<p>If :attr:<code>strict</code> is <code>True</code>, then the keys of :attr:<code>state_dict</code> must exactly match the keys returned by this module's :meth:<code>~torch.nn.Module.state_dict</code> function.  .. warning::     If :attr:<code>assign</code> is <code>True</code> the optimizer must be created after     the call to :attr:<code>load_state_dict</code> unless     :func:<code>~torch.__future__.get_swap_module_params_on_conversion</code> is <code>True</code>.  Args:     state_dict (dict): a dict containing parameters and         persistent buffers.     strict (bool, optional): whether to strictly enforce that the keys         in :attr:<code>state_dict</code> match the keys returned by this module's         :meth:<code>~torch.nn.Module.state_dict</code> function. Default: <code>True</code>     assign (bool, optional): When <code>False</code>, the properties of the tensors         in the current module are preserved while when <code>True</code>, the         properties of the Tensors in the state dict are preserved. The only         exception is the <code>requires_grad</code> field of :class:<code>~torch.nn.Parameter</code>s         for which the value from the module is preserved.         Default: <code>False</code>  Returns:     <code>NamedTuple</code> with <code>missing_keys</code> and <code>unexpected_keys</code> fields:         * <strong>missing_keys</strong> is a list of str containing any keys that are expected             by this module but missing from the provided <code>state_dict</code>.         * <strong>unexpected_keys</strong> is a list of str containing the keys that are not             expected by this module but present in the provided <code>state_dict</code>.  Note:     If a parameter or buffer is registered as <code>None</code> and its corresponding key     exists in :attr:<code>state_dict</code>, :meth:<code>load_state_dict</code> will raise a     <code>RuntimeError</code>.</p>
 <p><strong>Parameters</strong></p>
 <ul>
 <li><strong>state_dict</strong>     (<em>Mapping[str, Any]</em>)    </li>
@@ -1671,7 +1675,7 @@
 <li><strong>protected_tokens</strong>     (<em>int</em>)     – defaults to <code>1</code>    </li>
 </ul>
 <p><strong>Returns</strong></p>
-<p><em>list</em>:     A list of pooled embeddings for each document.</p>
+<p><em>list[torch.Tensor]</em>:     A list of pooled embeddings for each document.</p>
 </details>
 <details class="- note">
 <summary>pop</summary>

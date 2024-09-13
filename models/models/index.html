@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../img/favicon.ico">
-      <meta name="generator" content="mkdocs-1.6.0, mkdocs-material-9.5.32">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.5.32">
     
     
       
@@ -558,7 +558,27 @@
 
 
 <h1 id="available-models">Available models<a class="headerlink" href="#available-models" title="Permanent link">&para;</a></h1>
-<p>Here is a list of the pre-trained ColBERT models available in PyLate along with their results on BEIR:</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>Following an update, all the models trained using the stanford-nlp ColBERT library or RAGatouille should be compatible with PyLate natively.
+You can simply load the model in PyLate:</p>
+<div class="language-python highlight"><pre><span></span><code><span class="kn">from</span> <span class="nn">pylate</span> <span class="kn">import</span> <span class="n">models</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="n">models</span><span class="o">.</span><span class="n">ColBERT</span><span class="p">(</span>
+    <span class="n">model_name_or_path</span><span class="o">=</span><span class="s2">&quot;colbert-ir/colbertv2.0&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>Note that some models can use non-default parameters (e.g, prefixes) and so you might have to specify them, e.g for the <a href="https://huggingface.co/jinaai/jina-colbert-v2">jinaai/jina-colbert-v2</a> model, you need to specify the prefixes and allow the query tokens to attend to expansion tokens:
+<div class="language-python highlight"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">models</span><span class="o">.</span><span class="n">ColBERT</span><span class="p">(</span>
+    <span class="n">model_name_or_path</span><span class="o">=</span><span class="s2">&quot;jinaai/jina-colbert-v2&quot;</span><span class="p">,</span>
+    <span class="n">query_prefix</span><span class="o">=</span><span class="s2">&quot;[QueryMarker]&quot;</span><span class="p">,</span>
+    <span class="n">document_prefix</span><span class="o">=</span><span class="s2">&quot;[DocumentMarker]&quot;</span><span class="p">,</span>
+    <span class="n">attend_to_expansion_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div></p>
+</div>
+<p>Here is a list of some of the pre-trained ColBERT models available in PyLate along with their results on BEIR:</p>
 <div class="tabbed-set tabbed-alternate" data-tabs="1:1"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">Table</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block"></div>
@@ -618,6 +638,23 @@
 <td>87.72</td>
 <td>59.1</td>
 <td>45.58</td>
+</tr>
+<tr>
+<td><a href="https://huggingface.co/jinaai/jina-colbert-v2">jinaai/jina-colbert-v2</a></td>
+<td>53.1</td>
+<td>34.6</td>
+<td>67.8</td>
+<td>18.6</td>
+<td>40.8</td>
+<td>83.4</td>
+<td>76.6</td>
+<td>27.4</td>
+<td>36.6</td>
+<td>23.9</td>
+<td>80.05</td>
+<td>88.7</td>
+<td>64.0</td>
+<td>47.1</td>
 </tr>
 </tbody>
 </table>
