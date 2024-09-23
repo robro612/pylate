@@ -170,3 +170,56 @@ def colbert_kd_scores(
         scores = scores * mask.unsqueeze(2)
 
     return scores.max(axis=-1).values.sum(axis=-1)
+
+
+def colbert_xtr_train_scores(
+    queries_embeddings: list | np.ndarray | torch.Tensor,
+    documents_embeddings: list | np.ndarray | torch.Tensor,
+    mask: torch.Tensor = None,
+    k_prime: int = 100,
+) -> torch.Tensor:
+    queries_embeddings = convert_to_tensor(queries_embeddings)
+    documents_embeddings = convert_to_tensor(documents_embeddings)
+
+    # queries_embeddings : B x Q x H
+    # documents_embeddings : B x N x D x H
+    # mask : B x N x D
+
+    # B x Q x B x N x D
+    cross_batch_scores = torch.einsum(
+        "bqh, cndh->bqcnd",
+        queries_embeddings,
+        documents_embeddings,
+    )
+    if mask is not None:
+        mask = convert_to_tensor(mask)
+        cross_batch_scores = cross_batch_scores * mask
+
+    # B x Q x (B x N x D)
+    cross_batch_scores_alldocs = cross_batch_scores.reshape(
+        *cross_batch_scores.shape[:2], -1
+    )
+
+    # B x Q
+    kprimeth_highest_document_scores = cross_batch_scores_alldocs.kthvalue(
+        k=cross_batch_scores_alldocs.size(-1) - k_prime + 1,
+        dim=-1,
+    ).values
+
+    batch_arange = torch.arange(cross_batch_scores.size(0))
+
+    # B x Q x N x D
+    same_batch_scores = cross_batch_scores[batch_arange, :, batch_arange, :, :]
+
+    xtr_mask = same_batch_scores > kprimeth_highest_document_scores[..., None, None]
+
+    Z = xtr_mask.sum(dim=-1).unsqueeze(-1)
+
+    same_batch_scores_xtr_masked = (same_batch_scores * xtr_mask) / (Z + 1e-8)
+
+    # B x N
+    maxsim_scores = same_batch_scores_xtr_masked.max(dim=-1).values.sum(dim=1)
+
+    return maxsim_scores
+
+
