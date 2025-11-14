@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from pylate import evaluation, indexes, models, retrieve
+from pylate.models.colbert import PoolingConfig
 
 if __name__ == "__main__":
     query_len = {
@@ -44,8 +45,29 @@ if __name__ == "__main__":
         default="nfcorpus",
         help="Name of the dataset to evaluate on (default: 'fiqa')",
     )
+    parser.add_argument(
+        "--pool_factor",
+        type=int,
+        default=1,
+        help="Pooling factor to use (default: 1)",
+    )
+    parser.add_argument(
+        "--pooling_method",
+        type=str,
+        default="hierarchical",
+        help="Pooling method to use (default: 'hierarchical')",
+        choices=["hierarchical", "spherical"],
+    )
+    parser.add_argument(
+        "--index_type",
+        type=str,
+        default="plaid",
+        help="Index type to use (default: 'plaid')",
+        choices=["flat", "plaid"],
+    )
     args = parser.parse_args()
     dataset_name = args.dataset_name
+
     model_name = "lightonai/GTE-ModernColBERT-v1"
     model = models.ColBERT(
         model_name_or_path=model_name,
@@ -72,18 +94,39 @@ if __name__ == "__main__":
             split="dev" if "msmarco" in dataset_name else "test",
         )
 
-    index = indexes.PLAID(
-        override=True,
-        index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
-    )
+    match args.index_type:
+        case "flat":
+            index = indexes.Flat(
+                override=True,
+                index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
+            )
+        case "plaid":
+            index = indexes.PLAID(
+                override=True,
+                index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
+            )
+        case _:
+            raise ValueError(f"Invalid index type: {args.index_type}")
 
     retriever = retrieve.ColBERT(index=index)
 
+    pooling_config = PoolingConfig(
+        pool_factor=args.pool_factor,
+        protected_tokens=1,
+        clustering_method=args.pooling_method,
+    )
+    print(f"Pooling config: {pooling_config}")
+
     documents_embeddings = model.encode(
         sentences=[document["text"] for document in documents],
-        batch_size=2000,
+        batch_size=1000,
         is_query=False,
         show_progress_bar=True,
+        pooling_config=pooling_config,
+    )
+    num_tokens = sum(len(embedding) for embedding in documents_embeddings)
+    print(
+        f"Number of tokens: {num_tokens}, Number of documents: {len(documents)}, Average number of tokens per document: {num_tokens / len(documents)}"
     )
 
     index.add_documents(

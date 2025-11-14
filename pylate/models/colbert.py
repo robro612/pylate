@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import string
+from dataclasses import dataclass
 from typing import Iterable, Literal, Optional
 
 import numpy as np
@@ -25,6 +26,7 @@ from ..hf_hub.model_card import PylateModelCardData
 from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from .Dense import Dense
+from .compression import CompressionConfig, CompressionContext, PoolingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -475,8 +477,7 @@ class ColBERT(SentenceTransformer):
         device: str = None,
         normalize_embeddings: bool = True,
         is_query: bool = True,
-        pool_factor: int = 1,
-        protected_tokens: int = 1,
+        compression_config: Optional["CompressionConfig" | "CompressionContext"] = None,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
         Computes sentence embeddings.
@@ -519,11 +520,12 @@ class ColBERT(SentenceTransformer):
         is_query
             Whether the input sentences are queries. If True, the query prefix is added to the input sentences and the
             sequence is padded; otherwise, the document prefix is added and the sequence is not padded. Defaults to True.
-        pool_factor
-            The factor by which to pool the document embeddings, resulting in 1/pool_factor of the original tokens. If set
-            to 1, no pooling is done; if set to 2, 50% of the tokens are kept; if set to 3, 33%, and so on. Defaults to 1.
-        protected_tokens
-            The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
+        compression_config
+            Optional compression configuration or context for token pruning and pooling. Can be:
+            - CompressionConfig: Creates a new context internally
+            - CompressionContext: Uses the provided context (allows accessing tracked data afterward)
+            - None: No compression applied
+            If provided, pruning then pooling is applied sequentially after encoding but before normalization. Defaults to None.
 
         """
         if isinstance(sentences, list):
@@ -545,8 +547,7 @@ class ColBERT(SentenceTransformer):
                         device=device,
                         normalize_embeddings=normalize_embeddings,
                         is_query=is_query,
-                        pool_factor=pool_factor,
-                        protected_tokens=protected_tokens,
+                        compression_config=compression_config,
                     )
 
                     batch_embeddings = (
@@ -621,6 +622,16 @@ class ColBERT(SentenceTransformer):
 
         self.to(device)
 
+        # Initialize compression context if provided
+        # If compression_config is a CompressionContext, use it directly (allows accessing tracked data)
+        # Otherwise create a new context from the config
+        if compression_config is None:
+            compression_context = None
+        elif isinstance(compression_config, CompressionContext):
+            compression_context = compression_config
+        else:
+            compression_context = CompressionContext(compression_config)
+
         all_embeddings = []
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
@@ -685,6 +696,7 @@ class ColBERT(SentenceTransformer):
 
             with torch.no_grad():
                 # TODO: add the truncate/sliding window logic here
+                # TODO: Rohan add a flag to go into the model to get the last layer QK attention scores for Compactor Pruning
                 out_features = self.forward(input=features)
                 if self.device.type == "hpu":
                     out_features = copy.deepcopy(out_features)
@@ -707,6 +719,15 @@ class ColBERT(SentenceTransformer):
                         # We only keep the original tokens and prune padding tokens
                         masks = out_features["attention_mask"].bool()
 
+                # Apply pruning strategies if compression context is provided
+                if compression_context and compression_context.has_pruning():
+                    masks = compression_context.apply_pruning(
+                        token_embeddings=out_features["token_embeddings"],
+                        input_ids=out_features["input_ids"],
+                        base_mask=masks,
+                        is_query=is_query,
+                    )
+
                 embeddings = []
                 for (
                     token_embedding,
@@ -721,13 +742,31 @@ class ColBERT(SentenceTransformer):
                     )
                     embeddings.append(token_embedding)
 
-                # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
-                if pool_factor > 1 and not is_query:
-                    embeddings = self.pool_embeddings_hierarchical(
-                        documents_embeddings=embeddings,
-                        pool_factor=pool_factor,
-                        protected_tokens=protected_tokens,
-                    )
+                # Apply pooling from compression_config or standalone pooling_config
+                # Priority: compression_config.pooling > pooling_config parameter
+                pooling_configs_to_apply = []
+                if compression_context and compression_context.config.pooling:
+                    pooling_configs_to_apply = compression_context.config.pooling
+
+                if pooling_configs_to_apply and not is_query:
+                    for pool_cfg in pooling_configs_to_apply:
+                        if pool_cfg.pool_factor > 1:
+                            if pool_cfg.clustering_method == "hierarchical":
+                                embeddings = self.pool_embeddings_hierarchical(
+                                    documents_embeddings=embeddings,
+                                    pool_factor=pool_cfg.pool_factor,
+                                    protected_tokens=pool_cfg.protected_tokens,
+                                )
+                            elif pool_cfg.clustering_method == "spherical":
+                                embeddings = self.pool_embeddings_spherical(
+                                    documents_embeddings=embeddings,
+                                    pool_factor=pool_cfg.pool_factor,
+                                    protected_tokens=pool_cfg.protected_tokens,
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Invalid clustering method: {pool_cfg.clustering_method}"
+                                )
 
                 # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
                 if convert_to_numpy:
@@ -835,6 +874,67 @@ class ColBERT(SentenceTransformer):
             # Re-append protected embeddings
             pooled_document_embeddings.extend(protected_embeddings)
             pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+
+        return pooled_embeddings
+
+    def pool_embeddings_spherical(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+    ) -> list[torch.Tensor]:
+        """
+        Pools document embeddings using spherical (KMeans) clustering via fastkmeans.FastKMeans.
+        Args:
+            documents_embeddings: List of [num_tokens, dim] tensors (one per document).
+            pool_factor: Number of tokens to group into each cluster (reducing token count by this factor).
+            protected_tokens: Number of tokens at the start of each document not to cluster.
+        Returns:
+            List of pooled [new_num_tokens, dim] tensors (one per document).
+        """
+        import torch
+        from fastkmeans import FastKMeans
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pooled_embeddings = []
+
+        for document_embeddings in documents_embeddings:
+            document_embeddings = document_embeddings.to(device=device)
+            protected_embeddings = document_embeddings[:protected_tokens]
+            embeddings_to_pool = document_embeddings[protected_tokens:]
+
+            num_embeddings = embeddings_to_pool.shape[0]
+            num_clusters = max(num_embeddings // pool_factor, 1)
+
+            if num_embeddings <= num_clusters:
+                pooled_document_embeddings = [
+                    embeddings_to_pool[i] for i in range(num_embeddings)
+                ]
+            else:
+                kmeans = FastKMeans(
+                    n_clusters=num_clusters,
+                    spherical=True,
+                    gpu=device.type == "cuda",
+                    verbose=False,
+                )
+                labels = kmeans.fit_predict(embeddings_to_pool)
+                # Pool by cluster id
+                pooled_document_embeddings = []
+                for cluster_id in range(num_clusters):
+                    cluster_indices = [
+                        i for i, label in enumerate(labels) if label == cluster_id
+                    ]
+                    if len(cluster_indices) > 0:
+                        cluster_embedding = embeddings_to_pool[cluster_indices].mean(
+                            dim=0
+                        )
+                        pooled_document_embeddings.append(cluster_embedding)
+
+            # Add protected (unclustered) tokens to the front
+            pooled_document_embeddings = (
+                list(protected_embeddings) + pooled_document_embeddings
+            )
+            pooled_embeddings.append(torch.stack(pooled_document_embeddings))
 
         return pooled_embeddings
 

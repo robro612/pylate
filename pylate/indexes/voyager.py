@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import itertools
 import os
-
+import time
 import numpy as np
 import torch
 from sqlitedict import SqliteDict
+from tqdm.rich import tqdm
 
 from ..utils import iter_batch
 from .base import Base

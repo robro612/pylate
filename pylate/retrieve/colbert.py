@@ -4,6 +4,7 @@ import logging
 
 import numpy as np
 import torch
+import time
 
 from ..indexes import PLAID, Voyager
 from ..rank import RerankResult, rerank

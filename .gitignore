@@ -144,6 +144,9 @@ test.ipynb
 # wandb logs
 wandb/
 
+# dev environment
+.vscode/
+
 # output models
 output_models/
 output/
@@ -165,3 +168,6 @@ uv.lock
 
 indexes/*
 pylate-index/*
+
+# experimental results / dev artifacts
+results/
