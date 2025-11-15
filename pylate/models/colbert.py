@@ -19,14 +19,20 @@ from sentence_transformers.models import Transformer
 from sentence_transformers.quantization import quantize_embeddings
 from sentence_transformers.util import batch_to_device, load_file_path
 from torch import nn
-from tqdm.autonotebook import trange
+from tqdm.autonotebook import trange, tqdm
 from transformers.utils import cached_file
 
 from ..hf_hub.model_card import PylateModelCardData
 from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from .Dense import Dense
-from .compression import CompressionConfig, CompressionContext, PoolingConfig
+from .compression import (
+    CompressionConfig,
+    CompressionContext,
+    CompressionExperimentConfig,
+    CompressionExperimentResults,
+    PoolingConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -477,8 +483,10 @@ class ColBERT(SentenceTransformer):
         device: str = None,
         normalize_embeddings: bool = True,
         is_query: bool = True,
-        compression_config: Optional["CompressionConfig" | "CompressionContext"] = None,
-    ) -> list[torch.Tensor] | ndarray | torch.Tensor:
+        compression_config: Optional[
+            CompressionConfig | CompressionContext | CompressionExperimentConfig
+        ] = None,
+    ) -> list[torch.Tensor] | ndarray | torch.Tensor | CompressionExperimentResults:
         """
         Computes sentence embeddings.
 
@@ -524,6 +532,8 @@ class ColBERT(SentenceTransformer):
             Optional compression configuration or context for token pruning and pooling. Can be:
             - CompressionConfig: Creates a new context internally
             - CompressionContext: Uses the provided context (allows accessing tracked data afterward)
+            - CompressionExperimentConfig: Runs multiple compression configs in a single encoding pass,
+              returning CompressionExperimentResults with embeddings saved to disk or kept in memory
             - None: No compression applied
             If provided, pruning then pooling is applied sequentially after encoding but before normalization. Defaults to None.
 
@@ -622,17 +632,55 @@ class ColBERT(SentenceTransformer):
 
         self.to(device)
 
-        # Initialize compression context if provided
-        # If compression_config is a CompressionContext, use it directly (allows accessing tracked data)
-        # Otherwise create a new context from the config
+        # Handle compression config - could be single or experiment mode
+        if compression_config is not None and is_query:
+            raise ValueError("Compression is not supported for queries")
         if compression_config is None:
-            compression_context = None
-        elif isinstance(compression_config, CompressionContext):
-            compression_context = compression_config
-        else:
-            compression_context = CompressionContext(compression_config)
+            compression_contexts = [None]
+            experiment_mode = False
+            experiment_config = None
+        elif isinstance(compression_config, CompressionExperimentConfig):
+            experiment_mode = True
+            experiment_config = compression_config
+            compression_contexts = [
+                CompressionContext(cfg)
+                if isinstance(cfg, CompressionConfig)
+                else cfg
+                if isinstance(cfg, CompressionContext)
+                else CompressionContext(CompressionConfig())
+                for cfg in experiment_config.configs
+            ]
+            # Initialize experiment tracking
+            import time
 
-        all_embeddings = []
+            start_time = time.time()
+            stats = {
+                "num_documents": 0,
+                "num_configs": len(compression_contexts),
+                "config_token_counts": [0] * len(compression_contexts),
+                "encoding_time": 0.0,
+                "compression_times": [0.0] * len(compression_contexts),
+            }
+            # Initialize storage based on mode
+            if experiment_config.storage_mode == "disk":
+                for i in range(len(compression_contexts)):
+                    torch.save(
+                        {"embeddings": [], "num_docs": 0},
+                        experiment_config.get_output_file(i),
+                    )
+                all_embeddings_per_config = None
+            else:  # memory or cpu
+                all_embeddings_per_config = [[] for _ in compression_contexts]
+        elif isinstance(compression_config, CompressionContext):
+            compression_contexts = [compression_config]
+            experiment_mode = False
+            experiment_config = None
+        else:
+            compression_contexts = [CompressionContext(compression_config)]
+            experiment_mode = False
+            experiment_config = None
+
+        all_embeddings = [] if not experiment_mode else None
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
 
@@ -640,9 +688,13 @@ class ColBERT(SentenceTransformer):
             0,
             len(sentences),
             batch_size,
-            desc=f"Encoding queries (bs={batch_size})"
-            if is_query
-            else f"Encoding documents (bs={batch_size})",
+            desc=f"Encoding experiment (bs={batch_size}, {len(compression_contexts)} configs)"
+            if experiment_mode
+            else (
+                f"Encoding queries (bs={batch_size})"
+                if is_query
+                else f"Encoding documents (bs={batch_size})"
+            ),
             disable=not show_progress_bar,
         ):
             sentences_batch = sentences_sorted[start_index : start_index + batch_size]
@@ -695,85 +747,184 @@ class ColBERT(SentenceTransformer):
             features.update(extra_features)
 
             with torch.no_grad():
+                batch_start = time.time() if experiment_mode else None
+
                 # TODO: add the truncate/sliding window logic here
                 # TODO: Rohan add a flag to go into the model to get the last layer QK attention scores for Compactor Pruning
+                # === EXPENSIVE: Transformer forward pass ONCE per batch ===
                 out_features = self.forward(input=features)
                 if self.device.type == "hpu":
                     out_features = copy.deepcopy(out_features)
 
-                if not is_query:
-                    # Compute the mask for the skiplist (punctuation symbols)
-                    skiplist_mask = self.skiplist_mask(
-                        input_ids=features["input_ids"], skiplist=self.skiplist
-                    )
-                    masks = torch.logical_and(
-                        input=skiplist_mask, other=out_features["attention_mask"]
-                    )
+                if experiment_mode:
+                    stats["encoding_time"] += time.time() - batch_start
+
+                # === Loop over compression contexts (1 for normal mode, N for experiment mode) ===
+                use_progress_bar = show_progress_bar and not is_query and compression_contexts
+                if use_progress_bar:
+                    bar = tqdm(compression_contexts, desc=f"Compression", disable=not show_progress_bar, leave=False)
                 else:
-                    if self.do_query_expansion:
-                        # We keep all tokens in the query (no skiplist) and we do not want to prune expansion tokens in queries even if we do not attend to them in attention layers
-                        masks = torch.ones_like(
-                            input=out_features["input_ids"], dtype=torch.bool
+                    bar = compression_contexts
+
+                for config_idx, compression_context in enumerate(bar):
+                    if use_progress_bar:
+                        bar_desc = f"Compression {config_idx + 1}/{len(compression_contexts)}: {compression_context.config.description}"
+                        bar.set_description(f"{bar_desc:<20}", refresh=True)
+
+                    comp_start = time.time() if experiment_mode else None
+                    # Compute initial mask
+                    if not is_query:
+                        # Compute the mask for the skiplist (punctuation symbols)
+                        skiplist_mask = self.skiplist_mask(
+                            input_ids=features["input_ids"], skiplist=self.skiplist
+                        )
+                        masks = torch.logical_and(
+                            input=skiplist_mask, other=out_features["attention_mask"]
                         )
                     else:
-                        # We only keep the original tokens and prune padding tokens
-                        masks = out_features["attention_mask"].bool()
+                        if self.do_query_expansion:
+                            # We keep all tokens in the query (no skiplist) and we do not want to prune expansion tokens in queries even if we do not attend to them in attention layers
+                            masks = torch.ones_like(
+                                input=out_features["input_ids"], dtype=torch.bool
+                            )
+                        else:
+                            # We only keep the original tokens and prune padding tokens
+                            masks = out_features["attention_mask"].bool()
 
-                # Apply pruning strategies if compression context is provided
-                if compression_context and compression_context.has_pruning():
-                    masks = compression_context.apply_pruning(
-                        token_embeddings=out_features["token_embeddings"],
-                        input_ids=out_features["input_ids"],
-                        base_mask=masks,
-                        is_query=is_query,
-                    )
-
-                embeddings = []
-                for (
-                    token_embedding,
-                    mask,
-                ) in zip(out_features["token_embeddings"], masks):
-                    token_embedding = (
-                        torch.nn.functional.normalize(
-                            input=token_embedding[mask], p=2, dim=1
+                    # Apply pruning strategies if compression context is provided
+                    if compression_context and compression_context.has_pruning():
+                        masks = compression_context.apply_pruning(
+                            token_embeddings=out_features["token_embeddings"],
+                            input_ids=out_features["input_ids"],
+                            base_mask=masks,
+                            is_query=is_query,
                         )
-                        if normalize_embeddings
-                        else token_embedding[mask]
-                    )
-                    embeddings.append(token_embedding)
 
-                # Apply pooling from compression_config or standalone pooling_config
-                # Priority: compression_config.pooling > pooling_config parameter
-                pooling_configs_to_apply = []
-                if compression_context and compression_context.config.pooling:
-                    pooling_configs_to_apply = compression_context.config.pooling
+                    embeddings = []
+                    for (
+                        token_embedding,
+                        mask,
+                    ) in zip(out_features["token_embeddings"], masks):
+                        token_embedding = (
+                            torch.nn.functional.normalize(
+                                input=token_embedding[mask], p=2, dim=1
+                            )
+                            if normalize_embeddings
+                            else token_embedding[mask]
+                        )
+                        embeddings.append(token_embedding)
 
-                if pooling_configs_to_apply and not is_query:
-                    for pool_cfg in pooling_configs_to_apply:
-                        if pool_cfg.pool_factor > 1:
-                            if pool_cfg.clustering_method == "hierarchical":
-                                embeddings = self.pool_embeddings_hierarchical(
-                                    documents_embeddings=embeddings,
-                                    pool_factor=pool_cfg.pool_factor,
-                                    protected_tokens=pool_cfg.protected_tokens,
-                                )
-                            elif pool_cfg.clustering_method == "spherical":
-                                embeddings = self.pool_embeddings_spherical(
-                                    documents_embeddings=embeddings,
-                                    pool_factor=pool_cfg.pool_factor,
-                                    protected_tokens=pool_cfg.protected_tokens,
-                                )
-                            else:
-                                raise ValueError(
-                                    f"Invalid clustering method: {pool_cfg.clustering_method}"
-                                )
+                    # Apply pooling from compression_config or standalone pooling_config
+                    # Priority: compression_config.pooling > pooling_config parameter
+                    pooling_configs_to_apply = []
+                    if compression_context and compression_context.config.pooling:
+                        pooling_configs_to_apply = compression_context.config.pooling
 
-                # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
-                if convert_to_numpy:
-                    embeddings = [embedding.cpu() for embedding in embeddings]
+                    if pooling_configs_to_apply:
+                        for pool_cfg in pooling_configs_to_apply:
+                            if pool_cfg.pool_factor > 1:
+                                if pool_cfg.clustering_method == "hierarchical":
+                                    embeddings = self.pool_embeddings_hierarchical(
+                                        documents_embeddings=embeddings,
+                                        pool_factor=pool_cfg.pool_factor,
+                                        protected_tokens=pool_cfg.protected_tokens,
+                                    )
+                                elif pool_cfg.clustering_method == "spherical":
+                                    embeddings = self.pool_embeddings_spherical(
+                                        documents_embeddings=embeddings,
+                                        pool_factor=pool_cfg.pool_factor,
+                                        protected_tokens=pool_cfg.protected_tokens,
+                                    )
+                                else:
+                                    raise ValueError(
+                                        f"Invalid clustering method: {pool_cfg.clustering_method}"
+                                    )
 
-                all_embeddings.extend(embeddings)
+                    # Store results
+                    if experiment_mode:
+                        stats["config_token_counts"][config_idx] += sum(
+                            len(emb) for emb in embeddings
+                        )
+                        stats["compression_times"][config_idx] += (
+                            time.time() - comp_start
+                        )
 
+                        if experiment_config.storage_mode == "disk":
+                            output_file = experiment_config.get_output_file(config_idx)
+                            saved_data = torch.load(output_file)
+                            saved_data["embeddings"].extend(
+                                [emb.cpu() for emb in embeddings]
+                            )
+                            saved_data["num_docs"] += len(embeddings)
+                            torch.save(saved_data, output_file)
+                            del embeddings
+                        elif experiment_config.storage_mode == "cpu":
+                            all_embeddings_per_config[config_idx].extend(
+                                [emb.cpu() for emb in embeddings]
+                            )
+                            del embeddings
+                        else:  # memory
+                            all_embeddings_per_config[config_idx].extend(embeddings)
+                    else:
+                        # Normal mode - just accumulate
+                        # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
+                        if convert_to_numpy:
+                            embeddings = [embedding.cpu() for embedding in embeddings]
+                        all_embeddings.extend(embeddings)
+
+                if experiment_mode:
+                    stats["num_documents"] += len(sentences_batch)
+
+        # Handle experiment mode return
+        if experiment_mode:
+            # Finalize statistics
+            stats["total_time"] = time.time() - start_time
+            stats["avg_tokens_per_doc"] = [
+                count / stats["num_documents"] if stats["num_documents"] > 0 else 0.0
+                for count in stats["config_token_counts"]
+            ]
+
+            # Reorder embeddings back to original document order
+            # Embeddings are currently in sorted order (by length), same as in normal mode
+            # Use the same reordering logic as normal mode (line 910)
+            reorder_map = np.argsort(length_sorted_idx)
+
+            if experiment_config.storage_mode == "disk":
+                # For disk mode, need to load, reorder, and save
+                for config_idx in range(len(compression_contexts)):
+                    output_file = experiment_config.get_output_file(config_idx)
+                    saved_data = torch.load(output_file)
+                    embeddings_list = saved_data["embeddings"]
+                    # Reorder embeddings back to original order
+                    reordered_embeddings = [embeddings_list[i] for i in reorder_map]
+                    saved_data["embeddings"] = reordered_embeddings
+                    torch.save(saved_data, output_file)
+            else:  # memory or cpu
+                # Reorder embeddings for each config
+                for config_idx in range(len(compression_contexts)):
+                    all_embeddings_per_config[config_idx] = [
+                        all_embeddings_per_config[config_idx][i] for i in reorder_map
+                    ]
+
+            # Create results object
+            results = CompressionExperimentResults(
+                experiment_config=experiment_config,
+                output_files=[
+                    experiment_config.get_output_file(i)
+                    for i in range(len(compression_contexts))
+                ]
+                if experiment_config.storage_mode == "disk"
+                else None,
+                embeddings=all_embeddings_per_config
+                if experiment_config.storage_mode in ["memory", "cpu"]
+                else None,
+                contexts=compression_contexts,
+                statistics=stats,
+            )
+
+            return results
+
+        # Normal mode: continue with standard return logic
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
             all_embeddings = torch.nn.utils.rnn.pad_sequence(

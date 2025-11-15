@@ -617,60 +617,58 @@ if __name__ == "__main__":
         )
 
         # Test 2: Inspect pruned tokens
-        if False:
-            # Test 2a: Global pruning - prune 50 token TYPES (all occurrences)
-            print("\n" + "=" * 80)
-            print("TEST: GLOBAL PRUNING (k=50 means 50 unique token types)")
-            print(
-                "This should identify the 50 token types with lowest IDF and prune ALL occurrences"
-            )
-            print("=" * 80)
-            inspect_pruned_tokens(
-                model=model,
-                documents=documents,
-                config=CompressionConfig(
-                    pruning=[
-                        IDFPruningConfig(
-                            mode="global",
-                            top_k=50,
-                            stats=idf_stats,
-                            protected_tokens=1,
-                            track_pruned_tokens=True,
-                            ignore_tokens=special_token_ids,
-                        )
-                    ]
-                ),
-                sampling="random",
-                num_docs=5,
-                num_tokens_per_doc=10,
-            )
 
-            # Test 2b: Per-document pruning - prune 20 token OCCURRENCES per doc
-            print("\n" + "=" * 80)
-            print("TEST: PER-DOCUMENT PRUNING (k=20 means 20 occurrences per doc)")
-            print(
-                "This should prune 20 lowest-IDF token occurrences from each document"
-            )
-            print("=" * 80)
-            inspect_pruned_tokens(
-                model=model,
-                documents=documents,
-                config=CompressionConfig(
-                    pruning=[
-                        IDFPruningConfig(
-                            mode="document",
-                            top_k=20,
-                            stats=idf_stats,
-                            protected_tokens=1,
-                            track_pruned_tokens=True,
-                            ignore_tokens=special_token_ids,
-                        )
-                    ]
-                ),
-                sampling="random",
-                num_docs=10,
-                num_tokens_per_doc=10,
-            )
+        # Test 2a: Global pruning - prune 50 token TYPES (all occurrences)
+        print("\n" + "=" * 80)
+        print("TEST: GLOBAL PRUNING (k=50 means 50 unique token types)")
+        print(
+            "This should identify the 50 token types with lowest IDF and prune ALL occurrences"
+        )
+        print("=" * 80)
+        inspect_pruned_tokens(
+            model=model,
+            documents=documents,
+            config=CompressionConfig(
+                pruning=[
+                    IDFPruningConfig(
+                        mode="global",
+                        top_k=50,
+                        stats=idf_stats,
+                        protected_tokens=1,
+                        track_pruned_tokens=True,
+                        ignore_tokens=special_token_ids,
+                    )
+                ]
+            ),
+            sampling="random",
+            num_docs=5,
+            num_tokens_per_doc=10,
+        )
+
+        # Test 2b: Per-document pruning - prune 20 token OCCURRENCES per doc
+        print("\n" + "=" * 80)
+        print("TEST: PER-DOCUMENT PRUNING (k=20 means 20 occurrences per doc)")
+        print("This should prune 20 lowest-IDF token occurrences from each document")
+        print("=" * 80)
+        inspect_pruned_tokens(
+            model=model,
+            documents=documents,
+            config=CompressionConfig(
+                pruning=[
+                    IDFPruningConfig(
+                        mode="document",
+                        top_k=20,
+                        stats=idf_stats,
+                        protected_tokens=1,
+                        track_pruned_tokens=True,
+                        ignore_tokens=special_token_ids,
+                    )
+                ]
+            ),
+            sampling="random",
+            num_docs=10,
+            num_tokens_per_doc=10,
+        )
 
         print("\n✓ All tests completed successfully!")
 

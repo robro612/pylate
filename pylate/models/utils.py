@@ -68,6 +68,61 @@ class TokenTFIDFStats:
         ] = []  # List of {token_id: count} per doc
         self.doc_lengths: list[int] = []  # Number of tokens per document
 
+    @classmethod
+    def from_colbert_model(
+        cls,
+        model: "ColBERT",
+        documents: list[str],
+        show_progress: bool = True,
+    ) -> "TokenTFIDFStats":
+        """
+        Create TokenTFIDFStats from a ColBERT model and list of document strings.
+
+        This is a convenience constructor that tokenizes documents using the model's
+        tokenizer and then fits the statistics.
+
+        Parameters
+        ----------
+        model : ColBERT
+            ColBERT model to use for tokenization
+        documents : list[str]
+            List of document strings to process
+        show_progress : bool, optional
+            Whether to show progress during tokenization and fitting. Default is True.
+
+        Returns
+        -------
+        TokenTFIDFStats
+            Fitted TokenTFIDFStats instance
+
+        Examples
+        --------
+        >>> from pylate.models import ColBERT
+        >>> model = ColBERT("lightonai/GTE-ModernColBERT-v1")
+        >>> docs = ["This is document one", "This is document two"]
+        >>> stats = TokenTFIDFStats.from_colbert_model(model, docs)
+        """
+        # Tokenize documents
+        tokenized_docs = []
+        for doc_text in tqdm(
+            documents,
+            desc="Tokenizing documents",
+            disable=not show_progress,
+        ):
+            tokens = model.tokenizer.encode(
+                doc_text,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=model.document_length,
+            )
+            tokenized_docs.append(tokens)
+
+        # Create instance and fit
+        stats = cls(num_docs=len(documents))
+        stats.fit(tokenized_docs, show_progress=show_progress)
+
+        return stats
+
     def fit(
         self,
         tokenized_docs: List[Union[List[int], torch.Tensor, np.ndarray]],
