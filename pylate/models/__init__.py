@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 from .colbert import ColBERT
-from .Dense import Dense
 from .compression import (
+    CompressionArtifacts,
     CompressionConfig,
-    CompressionContext,
-    CompressionExperimentConfig,
-    CompressionExperimentResults,
-    IDFPruningConfig,
-    PoolingConfig,
+    CompressionStrategy,
+    Compressor,
+    validate_compression_artifact_shape,
 )
+from .Dense import Dense
 
 __all__ = [
     "ColBERT",
     "Dense",
+    "CompressionArtifacts",
     "CompressionConfig",
-    "CompressionContext",
-    "CompressionExperimentConfig",
-    "CompressionExperimentResults",
-    "IDFPruningConfig",
-    "PoolingConfig",
+    "CompressionStrategy",
+    "Compressor",
+    "validate_compression_artifact_shape",
 ]

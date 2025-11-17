@@ -5,11 +5,7 @@ from __future__ import annotations
 import argparse
 
 from pylate import evaluation, indexes, models, retrieve
-from pylate.models import (
-    CompressionConfig,
-    CompressionExperimentConfig,
-    CompressionExperimentResults,
-)
+from pylate.models import CompressionConfig
 
 if __name__ == "__main__":
     query_len = {
@@ -100,56 +96,50 @@ if __name__ == "__main__":
             raise ValueError(f"Invalid index type: {args.index_type}")
 
     retriever = retrieve.ColBERT(index=index)
-
-    from datetime import datetime
     
-    compression_config = CompressionConfig(description="Baseline (no compression)")
-    experiment_config = CompressionExperimentConfig(
-        configs=[compression_config],
-        storage_mode="memory",
-        output_dir="results/compression_experiments/testing",
-        run_id=datetime.now().strftime("%Y%m%d_%H%M%S"),
-    )
+    # compression config with global idk pruning
+    
 
-    results: CompressionExperimentResults = model.encode(
+    documents_embeddings, compression_artifacts = model.encode(
         sentences=[document["text"] for document in documents],
         batch_size=1000,
         is_query=False,
         show_progress_bar=True,
-        compression_config=experiment_config,
+        return_extra_artifacts={"input_ids": True, "attention_scores": False},
     )
-    documents_embeddings = results.embeddings[0]
     num_tokens = sum(len(embedding) for embedding in documents_embeddings)
     print(
         f"Number of tokens: {num_tokens}, Number of documents: {len(documents)}, Average number of tokens per document: {num_tokens / len(documents)}"
     )
 
-    index.add_documents(
-        documents_ids=[document["id"] for document in documents],
-        documents_embeddings=documents_embeddings,
-    )
-    queries_embeddings = model.encode(
-        sentences=list(queries.values()),
-        is_query=True,
-        show_progress_bar=True,
-        batch_size=32,
-    )
 
-    scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
 
-    # Remove query_id from scores, needed for FiQA dataset
-    for (query_id, query), query_scores in zip(queries.items(), scores):
-        for score in query_scores:
-            if score["id"] == query_id:
-                # Remove the query_id from the score
-                query_scores.remove(score)
+    # index.add_documents(
+    #     documents_ids=[document["id"] for document in documents],
+    #     documents_embeddings=documents_embeddings,
+    # )
+    # queries_embeddings = model.encode(
+    #     sentences=list(queries.values()),
+    #     is_query=True,
+    #     show_progress_bar=True,
+    #     batch_size=32,
+    # )
 
-    evaluation_scores = evaluation.evaluate(
-        scores=scores,
-        qrels=qrels,
-        queries=list(queries.keys()),
-        # queries=queries,
-        metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
-    )
+    # scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
 
-    print(evaluation_scores)
+    # # Remove query_id from scores, needed for FiQA dataset
+    # for (query_id, query), query_scores in zip(queries.items(), scores):
+    #     for score in query_scores:
+    #         if score["id"] == query_id:
+    #             # Remove the query_id from the score
+    #             query_scores.remove(score)
+
+    # evaluation_scores = evaluation.evaluate(
+    #     scores=scores,
+    #     qrels=qrels,
+    #     queries=list(queries.keys()),
+    #     # queries=queries,
+    #     metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+    # )
+
+    # print(evaluation_scores)

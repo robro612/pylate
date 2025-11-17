@@ -6,8 +6,7 @@ import logging
 import math
 import os
 import string
-from dataclasses import dataclass
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, TypeAlias
 
 import numpy as np
 import torch
@@ -19,20 +18,14 @@ from sentence_transformers.models import Transformer
 from sentence_transformers.quantization import quantize_embeddings
 from sentence_transformers.util import batch_to_device, load_file_path
 from torch import nn
-from tqdm.autonotebook import trange, tqdm
+from tqdm.autonotebook import trange
 from transformers.utils import cached_file
 
 from ..hf_hub.model_card import PylateModelCardData
 from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from .Dense import Dense
-from .compression import (
-    CompressionConfig,
-    CompressionContext,
-    CompressionExperimentConfig,
-    CompressionExperimentResults,
-    PoolingConfig,
-)
+from .compression import validate_compression_artifact_shape
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +462,7 @@ class ColBERT(SentenceTransformer):
             tensors=[input_ids[:, :1], prefix_tensor, input_ids[:, 1:]], dim=1
         )
 
+    DocumentEmbeddings: TypeAlias = list[torch.Tensor] | ndarray | torch.Tensor
     def encode(
         self,
         sentences: str | list[str],
@@ -483,10 +477,10 @@ class ColBERT(SentenceTransformer):
         device: str = None,
         normalize_embeddings: bool = True,
         is_query: bool = True,
-        compression_config: Optional[
-            CompressionConfig | CompressionContext | CompressionExperimentConfig
-        ] = None,
-    ) -> list[torch.Tensor] | ndarray | torch.Tensor | CompressionExperimentResults:
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+        return_extra_artifacts: Optional[dict[str, bool]] = None,
+    ) -> DocumentEmbeddings | tuple[DocumentEmbeddings, dict[str, list[torch.Tensor]]]:
         """
         Computes sentence embeddings.
 
@@ -528,14 +522,14 @@ class ColBERT(SentenceTransformer):
         is_query
             Whether the input sentences are queries. If True, the query prefix is added to the input sentences and the
             sequence is padded; otherwise, the document prefix is added and the sequence is not padded. Defaults to True.
-        compression_config
-            Optional compression configuration or context for token pruning and pooling. Can be:
-            - CompressionConfig: Creates a new context internally
-            - CompressionContext: Uses the provided context (allows accessing tracked data afterward)
-            - CompressionExperimentConfig: Runs multiple compression configs in a single encoding pass,
-              returning CompressionExperimentResults with embeddings saved to disk or kept in memory
-            - None: No compression applied
-            If provided, pruning then pooling is applied sequentially after encoding but before normalization. Defaults to None.
+        pool_factor
+            The factor by which to pool the document embeddings, resulting in 1/pool_factor of the original tokens. If set
+            to 1, no pooling is done; if set to 2, 50% of the tokens are kept; if set to 3, 33%, and so on. Defaults to 1.
+        protected_tokens
+            The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
+        return_extra_artifacts
+            Dictionary indicating which extra artifacts to return (input_ids, attention_scores).
+            If None, no extra artifacts are returned. Defaults to None.
 
         """
         if isinstance(sentences, list):
@@ -557,7 +551,9 @@ class ColBERT(SentenceTransformer):
                         device=device,
                         normalize_embeddings=normalize_embeddings,
                         is_query=is_query,
-                        compression_config=compression_config,
+                        pool_factor=pool_factor,
+                        protected_tokens=protected_tokens,
+                        return_extra_artifacts=return_extra_artifacts,
                     )
 
                     batch_embeddings = (
@@ -632,69 +628,25 @@ class ColBERT(SentenceTransformer):
 
         self.to(device)
 
-        # Handle compression config - could be single or experiment mode
-        if compression_config is not None and is_query:
-            raise ValueError("Compression is not supported for queries")
-        if compression_config is None:
-            compression_contexts = [None]
-            experiment_mode = False
-            experiment_config = None
-        elif isinstance(compression_config, CompressionExperimentConfig):
-            experiment_mode = True
-            experiment_config = compression_config
-            compression_contexts = [
-                CompressionContext(cfg)
-                if isinstance(cfg, CompressionConfig)
-                else cfg
-                if isinstance(cfg, CompressionContext)
-                else CompressionContext(CompressionConfig())
-                for cfg in experiment_config.configs
-            ]
-            # Initialize experiment tracking
-            import time
-
-            start_time = time.time()
-            stats = {
-                "num_documents": 0,
-                "num_configs": len(compression_contexts),
-                "config_token_counts": [0] * len(compression_contexts),
-                "encoding_time": 0.0,
-                "compression_times": [0.0] * len(compression_contexts),
-            }
-            # Initialize storage based on mode
-            if experiment_config.storage_mode == "disk":
-                for i in range(len(compression_contexts)):
-                    torch.save(
-                        {"embeddings": [], "num_docs": 0},
-                        experiment_config.get_output_file(i),
-                    )
-                all_embeddings_per_config = None
-            else:  # memory or cpu
-                all_embeddings_per_config = [[] for _ in compression_contexts]
-        elif isinstance(compression_config, CompressionContext):
-            compression_contexts = [compression_config]
-            experiment_mode = False
-            experiment_config = None
-        else:
-            compression_contexts = [CompressionContext(compression_config)]
-            experiment_mode = False
-            experiment_config = None
-
-        all_embeddings = [] if not experiment_mode else None
+        # Check if compression artifacts are requested
+        extract_artifacts = return_extra_artifacts is not None and any(return_extra_artifacts.values())
+        
+        all_embeddings = []
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
+        
+        # Initialize artifact collections if requested
+        if extract_artifacts:
+            all_input_ids = [] if return_extra_artifacts.get("input_ids", False) else None
+            all_attention_scores = [] if return_extra_artifacts.get("attention_scores", False) else None
 
         for start_index in trange(
             0,
             len(sentences),
             batch_size,
-            desc=f"Encoding experiment (bs={batch_size}, {len(compression_contexts)} configs)"
-            if experiment_mode
-            else (
-                f"Encoding queries (bs={batch_size})"
-                if is_query
-                else f"Encoding documents (bs={batch_size})"
-            ),
+            desc=f"Encoding queries (bs={batch_size})"
+            if is_query
+            else f"Encoding documents (bs={batch_size})",
             disable=not show_progress_bar,
         ):
             sentences_batch = sentences_sorted[start_index : start_index + batch_size]
@@ -747,184 +699,81 @@ class ColBERT(SentenceTransformer):
             features.update(extra_features)
 
             with torch.no_grad():
-                batch_start = time.time() if experiment_mode else None
-
                 # TODO: add the truncate/sliding window logic here
-                # TODO: Rohan add a flag to go into the model to get the last layer QK attention scores for Compactor Pruning
-                # === EXPENSIVE: Transformer forward pass ONCE per batch ===
                 out_features = self.forward(input=features)
                 if self.device.type == "hpu":
                     out_features = copy.deepcopy(out_features)
 
-                if experiment_mode:
-                    stats["encoding_time"] += time.time() - batch_start
-
-                # === Loop over compression contexts (1 for normal mode, N for experiment mode) ===
-                use_progress_bar = show_progress_bar and not is_query and compression_contexts
-                if use_progress_bar:
-                    bar = tqdm(compression_contexts, desc=f"Compression", disable=not show_progress_bar, leave=False)
+                if not is_query:
+                    # Compute the mask for the skiplist (punctuation symbols)
+                    skiplist_mask = self.skiplist_mask(
+                        input_ids=features["input_ids"], skiplist=self.skiplist
+                    )
+                    masks = torch.logical_and(
+                        input=skiplist_mask, other=out_features["attention_mask"]
+                    )
                 else:
-                    bar = compression_contexts
-
-                for config_idx, compression_context in enumerate(bar):
-                    if use_progress_bar:
-                        bar_desc = f"Compression {config_idx + 1}/{len(compression_contexts)}: {compression_context.config.description}"
-                        bar.set_description(f"{bar_desc:<20}", refresh=True)
-
-                    comp_start = time.time() if experiment_mode else None
-                    # Compute initial mask
-                    if not is_query:
-                        # Compute the mask for the skiplist (punctuation symbols)
-                        skiplist_mask = self.skiplist_mask(
-                            input_ids=features["input_ids"], skiplist=self.skiplist
-                        )
-                        masks = torch.logical_and(
-                            input=skiplist_mask, other=out_features["attention_mask"]
+                    if self.do_query_expansion:
+                        # We keep all tokens in the query (no skiplist) and we do not want to prune expansion tokens in queries even if we do not attend to them in attention layers
+                        masks = torch.ones_like(
+                            input=out_features["input_ids"], dtype=torch.bool
                         )
                     else:
-                        if self.do_query_expansion:
-                            # We keep all tokens in the query (no skiplist) and we do not want to prune expansion tokens in queries even if we do not attend to them in attention layers
-                            masks = torch.ones_like(
-                                input=out_features["input_ids"], dtype=torch.bool
+                        # We only keep the original tokens and prune padding tokens
+                        masks = out_features["attention_mask"].bool()
+
+                embeddings = []
+                # Extract compression artifacts if requested (apply same mask as embeddings)
+                if extract_artifacts:
+                    batch_size_actual = features["input_ids"].shape[0]
+                    for doc_idx in range(batch_size_actual):
+                        mask_doc = masks[doc_idx]
+                        if return_extra_artifacts.get("input_ids", False):
+                            # Apply mask to input_ids to match returned embeddings
+                            input_ids_masked = features["input_ids"][doc_idx][mask_doc].clone()
+                            all_input_ids.append(input_ids_masked)
+                        if return_extra_artifacts.get("attention_scores", False):
+                            # TODO: Extract attention scores from model
+                            # For now, raise error if requested but not implemented
+                            raise NotImplementedError(
+                                "Attention score extraction not yet implemented. "
+                                "Set return_extra_artifacts['attention_scores']=False"
                             )
-                        else:
-                            # We only keep the original tokens and prune padding tokens
-                            masks = out_features["attention_mask"].bool()
-
-                    # Apply pruning strategies if compression context is provided
-                    if compression_context and compression_context.has_pruning():
-                        masks = compression_context.apply_pruning(
-                            token_embeddings=out_features["token_embeddings"],
-                            input_ids=out_features["input_ids"],
-                            base_mask=masks,
-                            is_query=is_query,
+                
+                for (
+                    token_embedding,
+                    mask,
+                ) in zip(out_features["token_embeddings"], masks):
+                    # Normal behavior: mask and normalize (same whether artifacts requested or not)
+                    token_embedding = (
+                        torch.nn.functional.normalize(
+                            input=token_embedding[mask], p=2, dim=1
                         )
+                        if normalize_embeddings
+                        else token_embedding[mask]
+                    )
+                    embeddings.append(token_embedding)
 
-                    embeddings = []
-                    for (
-                        token_embedding,
-                        mask,
-                    ) in zip(out_features["token_embeddings"], masks):
-                        token_embedding = (
-                            torch.nn.functional.normalize(
-                                input=token_embedding[mask], p=2, dim=1
-                            )
-                            if normalize_embeddings
-                            else token_embedding[mask]
-                        )
-                        embeddings.append(token_embedding)
+                # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
+                # Skip pooling if artifacts are requested (pooling should happen during pruning)
+                if pool_factor > 1 and not is_query and not extract_artifacts:
+                    embeddings = self.pool_embeddings_hierarchical(
+                        documents_embeddings=embeddings,
+                        pool_factor=pool_factor,
+                        protected_tokens=protected_tokens,
+                    )
+                if pool_factor > 1 and return_extra_artifacts is not None:
+                    raise ValueError(
+                        "Pooling and compression artifacts are not supported together. "
+                        "With non-None return_extra_artifacts, pooling must be done separately, after encoding."
+                    )
 
-                    # Apply pooling from compression_config or standalone pooling_config
-                    # Priority: compression_config.pooling > pooling_config parameter
-                    pooling_configs_to_apply = []
-                    if compression_context and compression_context.config.pooling:
-                        pooling_configs_to_apply = compression_context.config.pooling
+                # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
+                if convert_to_numpy:
+                    embeddings = [embedding.cpu() for embedding in embeddings]
 
-                    if pooling_configs_to_apply:
-                        for pool_cfg in pooling_configs_to_apply:
-                            if pool_cfg.pool_factor > 1:
-                                if pool_cfg.clustering_method == "hierarchical":
-                                    embeddings = self.pool_embeddings_hierarchical(
-                                        documents_embeddings=embeddings,
-                                        pool_factor=pool_cfg.pool_factor,
-                                        protected_tokens=pool_cfg.protected_tokens,
-                                    )
-                                elif pool_cfg.clustering_method == "spherical":
-                                    embeddings = self.pool_embeddings_spherical(
-                                        documents_embeddings=embeddings,
-                                        pool_factor=pool_cfg.pool_factor,
-                                        protected_tokens=pool_cfg.protected_tokens,
-                                    )
-                                else:
-                                    raise ValueError(
-                                        f"Invalid clustering method: {pool_cfg.clustering_method}"
-                                    )
+                all_embeddings.extend(embeddings)
 
-                    # Store results
-                    if experiment_mode:
-                        stats["config_token_counts"][config_idx] += sum(
-                            len(emb) for emb in embeddings
-                        )
-                        stats["compression_times"][config_idx] += (
-                            time.time() - comp_start
-                        )
-
-                        if experiment_config.storage_mode == "disk":
-                            output_file = experiment_config.get_output_file(config_idx)
-                            saved_data = torch.load(output_file)
-                            saved_data["embeddings"].extend(
-                                [emb.cpu() for emb in embeddings]
-                            )
-                            saved_data["num_docs"] += len(embeddings)
-                            torch.save(saved_data, output_file)
-                            del embeddings
-                        elif experiment_config.storage_mode == "cpu":
-                            all_embeddings_per_config[config_idx].extend(
-                                [emb.cpu() for emb in embeddings]
-                            )
-                            del embeddings
-                        else:  # memory
-                            all_embeddings_per_config[config_idx].extend(embeddings)
-                    else:
-                        # Normal mode - just accumulate
-                        # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
-                        if convert_to_numpy:
-                            embeddings = [embedding.cpu() for embedding in embeddings]
-                        all_embeddings.extend(embeddings)
-
-                if experiment_mode:
-                    stats["num_documents"] += len(sentences_batch)
-
-        # Handle experiment mode return
-        if experiment_mode:
-            # Finalize statistics
-            stats["total_time"] = time.time() - start_time
-            stats["avg_tokens_per_doc"] = [
-                count / stats["num_documents"] if stats["num_documents"] > 0 else 0.0
-                for count in stats["config_token_counts"]
-            ]
-
-            # Reorder embeddings back to original document order
-            # Embeddings are currently in sorted order (by length), same as in normal mode
-            # Use the same reordering logic as normal mode (line 910)
-            reorder_map = np.argsort(length_sorted_idx)
-
-            if experiment_config.storage_mode == "disk":
-                # For disk mode, need to load, reorder, and save
-                for config_idx in range(len(compression_contexts)):
-                    output_file = experiment_config.get_output_file(config_idx)
-                    saved_data = torch.load(output_file)
-                    embeddings_list = saved_data["embeddings"]
-                    # Reorder embeddings back to original order
-                    reordered_embeddings = [embeddings_list[i] for i in reorder_map]
-                    saved_data["embeddings"] = reordered_embeddings
-                    torch.save(saved_data, output_file)
-            else:  # memory or cpu
-                # Reorder embeddings for each config
-                for config_idx in range(len(compression_contexts)):
-                    all_embeddings_per_config[config_idx] = [
-                        all_embeddings_per_config[config_idx][i] for i in reorder_map
-                    ]
-
-            # Create results object
-            results = CompressionExperimentResults(
-                experiment_config=experiment_config,
-                output_files=[
-                    experiment_config.get_output_file(i)
-                    for i in range(len(compression_contexts))
-                ]
-                if experiment_config.storage_mode == "disk"
-                else None,
-                embeddings=all_embeddings_per_config
-                if experiment_config.storage_mode in ["memory", "cpu"]
-                else None,
-                contexts=compression_contexts,
-                statistics=stats,
-            )
-
-            return results
-
-        # Normal mode: continue with standard return logic
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
             all_embeddings = torch.nn.utils.rnn.pad_sequence(
@@ -936,7 +785,16 @@ class ColBERT(SentenceTransformer):
                 tensor=all_embeddings, split_size_or_sections=1, dim=0
             )
 
-        all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+        # Reorder embeddings back to original order
+        reorder_map = np.argsort(length_sorted_idx)
+        all_embeddings = [all_embeddings[idx] for idx in reorder_map]
+        
+        # Reorder artifacts if extracted (to match embeddings order)
+        if extract_artifacts:
+            if all_input_ids is not None:
+                all_input_ids = [all_input_ids[idx] for idx in reorder_map]
+            if all_attention_scores is not None:
+                all_attention_scores = [all_attention_scores[idx] for idx in reorder_map]
 
         if precision and precision != "float32":
             all_embeddings = quantize_embeddings(
@@ -960,6 +818,21 @@ class ColBERT(SentenceTransformer):
                 for embedding in all_embeddings
             ]
 
+        # Return embeddings and compression artifacts if requested
+        if extract_artifacts:
+            artifacts = {}
+            if all_input_ids is not None:
+                artifacts["input_ids"] = all_input_ids
+            if all_attention_scores is not None:
+                artifacts["attention_scores"] = all_attention_scores
+            
+            # Validate shapes match (artifacts should match masked embeddings)
+            for artifact_name, artifact in artifacts.items():
+                validate_compression_artifact_shape(all_embeddings, artifact)
+            
+            result_embeddings = all_embeddings[0] if input_was_string else all_embeddings
+            return result_embeddings, artifacts
+        
         return all_embeddings[0] if input_was_string else all_embeddings
 
     def pool_embeddings_hierarchical(
@@ -1025,67 +898,6 @@ class ColBERT(SentenceTransformer):
             # Re-append protected embeddings
             pooled_document_embeddings.extend(protected_embeddings)
             pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
-
-        return pooled_embeddings
-
-    def pool_embeddings_spherical(
-        self,
-        documents_embeddings: list[torch.Tensor],
-        pool_factor: int = 1,
-        protected_tokens: int = 1,
-    ) -> list[torch.Tensor]:
-        """
-        Pools document embeddings using spherical (KMeans) clustering via fastkmeans.FastKMeans.
-        Args:
-            documents_embeddings: List of [num_tokens, dim] tensors (one per document).
-            pool_factor: Number of tokens to group into each cluster (reducing token count by this factor).
-            protected_tokens: Number of tokens at the start of each document not to cluster.
-        Returns:
-            List of pooled [new_num_tokens, dim] tensors (one per document).
-        """
-        import torch
-        from fastkmeans import FastKMeans
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pooled_embeddings = []
-
-        for document_embeddings in documents_embeddings:
-            document_embeddings = document_embeddings.to(device=device)
-            protected_embeddings = document_embeddings[:protected_tokens]
-            embeddings_to_pool = document_embeddings[protected_tokens:]
-
-            num_embeddings = embeddings_to_pool.shape[0]
-            num_clusters = max(num_embeddings // pool_factor, 1)
-
-            if num_embeddings <= num_clusters:
-                pooled_document_embeddings = [
-                    embeddings_to_pool[i] for i in range(num_embeddings)
-                ]
-            else:
-                kmeans = FastKMeans(
-                    n_clusters=num_clusters,
-                    spherical=True,
-                    gpu=device.type == "cuda",
-                    verbose=False,
-                )
-                labels = kmeans.fit_predict(embeddings_to_pool)
-                # Pool by cluster id
-                pooled_document_embeddings = []
-                for cluster_id in range(num_clusters):
-                    cluster_indices = [
-                        i for i, label in enumerate(labels) if label == cluster_id
-                    ]
-                    if len(cluster_indices) > 0:
-                        cluster_embedding = embeddings_to_pool[cluster_indices].mean(
-                            dim=0
-                        )
-                        pooled_document_embeddings.append(cluster_embedding)
-
-            # Add protected (unclustered) tokens to the front
-            pooled_document_embeddings = (
-                list(protected_embeddings) + pooled_document_embeddings
-            )
-            pooled_embeddings.append(torch.stack(pooled_document_embeddings))
 
         return pooled_embeddings
 
