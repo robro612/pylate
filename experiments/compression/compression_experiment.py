@@ -87,7 +87,7 @@ def load_model(model_name: str, dataset_name: str) -> ColBERT:
     return model
 
 
-def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict, str]:
+def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict]:
     """
     Load dataset (documents, queries, qrels).
 
@@ -99,13 +99,11 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict, str]:
     Returns
     -------
     tuple
-        (documents, queries, qrels, normalized_dataset_name)
+        (documents, queries, qrels)
     """
     print("\n" + "=" * 80)
     print(f"Loading dataset: {dataset_name}")
     print("=" * 80)
-
-    normalized_name = dataset_name
 
     if "cqadupstack" in dataset_name:
         # Download dataset if not already downloaded
@@ -119,18 +117,17 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict, str]:
             f"evaluation_datasets/{dataset_name}",
             split="test",
         )
-        normalized_name = dataset_name.replace("/", "_")
     else:
         documents, queries, qrels = evaluation.load_beir(
             dataset_name=dataset_name,
             split="dev" if "msmarco" in dataset_name else "test",
         )
 
-    print(f"✓ Loaded dataset: {normalized_name}")
+    print(f"✓ Loaded dataset: {dataset_name}")
     print(f"  Documents: {len(documents)}")
     print(f"  Queries: {len(queries)}")
 
-    return documents, queries, qrels, normalized_name
+    return documents, queries, qrels
 
 
 def create_experiment_config(
@@ -669,10 +666,10 @@ def main() -> None:
     args = parse_args()
 
     # Load model
-    model = load_model(args.model_name, args.dataset_name)
+    model : ColBERT = load_model(args.model_name, args.dataset_name)
 
     # Load dataset
-    documents, queries, qrels, dataset_name = load_dataset(args.dataset_name)
+    documents, queries, qrels = load_dataset(args.dataset_name)
 
     # Collect IDF statistics
     print("\n" + "=" * 80)
@@ -687,7 +684,7 @@ def main() -> None:
     # Set up experiment output directory
     if args.experiment_output_dir is None:
         experiment_output_dir = Path(
-            f"./compression_experiments/{dataset_name}_{args.model_name.split('/')[-1]}"
+            f"./compression_experiments/{args.dataset_name}_{args.model_name.split('/')[-1]}"
         )
     else:
         experiment_output_dir = Path(args.experiment_output_dir)
@@ -758,7 +755,7 @@ def main() -> None:
             queries=queries,
             qrels=qrels,
             queries_embeddings=queries_embeddings,
-            dataset_name=dataset_name,
+            dataset_name=args.dataset_name,
             model_name=args.model_name,
             index_type=args.index_type,
             stats=stats,
@@ -784,7 +781,7 @@ def main() -> None:
             all_evaluation_results=all_evaluation_results,
             experiment_config=experiment_config,
             args=args,
-            dataset_name=dataset_name,
+            dataset_name=args.dataset_name,
         )
     
     if args.clean_output_dir:
