@@ -7,21 +7,20 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import time
 from tqdm.autonotebook import tqdm
 
 import pandas as pd
 
 from pylate import evaluation, indexes, models, retrieve
-from pylate.models import (
-    ColBERT,
+from pylate.models import ColBERT
+from pylate.models.compression import (
     CompressionConfig,
-    CompressionContext,
-    CompressionExperimentConfig,
-    CompressionExperimentResults,
     IDFPruningConfig,
+    IDFPruningStrategy,
     PoolingConfig,
+    PoolingStrategy,
 )
-from pylate.models.utils import TokenTFIDFStats
 
 # Query length mapping for different datasets
 QUERY_LEN = {
@@ -126,110 +125,202 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict]:
     print(f"✓ Loaded dataset: {dataset_name}")
     print(f"  Documents: {len(documents)}")
     print(f"  Queries: {len(queries)}")
+    print(f"  Qrels: {len(qrels)}")
 
     return documents, queries, qrels
 
 
-def create_experiment_config(
-    idf_stats: TokenTFIDFStats,
-    idf_document_top_k: list[int],
-    idf_global_top_k: list[int],
-    pool_factors: list[int],
-    output_dir: Path,
-    storage_mode: str,
-    run_id: str,
-) -> CompressionExperimentConfig:
-    """
-    Create compression experiment configuration.
-
-    Parameters
-    ----------
-    idf_stats : TokenTFIDFStats
-        IDF statistics for pruning
-    idf_document_top_k : list[int]
-        Top-k values for per-document IDF pruning
-    idf_global_top_k : list[int]
-        Top-k values for global IDF pruning
-    pool_factors : list[int]
-        Pool factors for pooling compression
-    output_dir : Path
-        Output directory for experiment results
-    storage_mode : str
-        Storage mode ("cpu", "memory", or "disk")
-    run_id : str
-        Run ID for consistent file naming and tracking. Shard files use format:
-        run-{run_id}.config-{config_idx}.pt (matching runfile format).
-        The run_id is saved in experiment_metadata.json for tracking and matching shards to configs.
-
-    Returns
-    -------
-    CompressionExperimentConfig
-        Configured experiment config
-    """
-    # Create compression experiment configs
-    configs = [
-        CompressionConfig(description="Baseline (no compression)")
-    ]  # Baseline (no compression)
-
-    # Add per-document IDF pruning configs
-    for k in idf_document_top_k:
-        configs.append(
-            CompressionConfig(
-                description=f"Doc-wise IDF pruning k={k}",
-                pruning=[IDFPruningConfig(mode="document", top_k=k, stats=idf_stats)],
-            )
-        )
-
-    # Add global IDF pruning configs
-    for k in idf_global_top_k:
-        configs.append(
-            CompressionConfig(
-                description=f"Global IDF pruning k={k}",
-                pruning=[IDFPruningConfig(mode="global", top_k=k, stats=idf_stats)],
-            )
-        )
-
-    # Add pooling configs
-    for pool_factor in pool_factors:
-        configs.append(
-            CompressionConfig(
-                description=f"Hierarchical Pooling f={pool_factor} protected tokens=1",
-                pooling=[
-                    PoolingConfig(
-                        pool_factor=pool_factor,
-                        protected_tokens=1,
-                        clustering_method="hierarchical",
-                    )
-                ],
-            )
-        )
-
-    # Create compression experiment config
-    experiment_config = CompressionExperimentConfig(
-        configs=configs,
-        output_dir=output_dir,
-        storage_mode=storage_mode,
-        overwrite=True,
-        run_id=run_id,
+def sanitize_name(name: str) -> str:
+    """Sanitize dataset/model names so they can be safely used in filesystem paths."""
+    return (
+        name.replace("/", "_")
+        .replace(" ", "_")
+        .replace(":", "_")
+        .replace("\\", "_")
     )
 
-    print("\n" + "=" * 80)
-    print(f"Created compression experiment with {len(configs)} configs")
-    print(f"Storage mode: {storage_mode}")
-    print(f"Output directory: {output_dir}")
-    print("=" * 80)
-    print("\nConfigurations:")
-    for i, config in enumerate(configs):
-        if config is None:
-            print(f"  [{i}] Baseline (no compression)")
-        else:
-            print(f"  [{i}] {config.description}")
 
-    return experiment_config
+def serialize_config_for_storage(config: CompressionConfig | None) -> dict[str, Any]:
+    """Serialize a compression config (or baseline) for storage."""
+    if config is None:
+        return {"type": "baseline", "description": "No compression"}
+    return config.serialize()
+
+
+def save_results_jsonl(
+    output_dir: Path,
+    run_id: str,
+    model_name: str,
+    dataset_name: str,
+    args: argparse.Namespace,
+    configs: list[CompressionConfig | None],
+    stats: dict[str, Any],
+    evaluation_results: list[dict[str, Any]],
+) -> Path:
+    """
+    Save experiment metadata, compression configs, timing, and per-config results to JSONL.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / f"results_{run_id}.jsonl"
+
+    metadata_entry = {
+        "type": "metadata",
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "model_name": model_name,
+        "dataset_name": dataset_name,
+        "num_documents": stats.get("num_documents"),
+        "num_configs": len(configs),
+        "args": {
+            "index_type": args.index_type,
+            "batch_size": args.batch_size,
+            "metrics": args.metrics,
+            "configs_file": args.configs_file,
+        },
+        "timing": {
+            "encoding_time": stats.get("encoding_time"),
+            "query_encoding_time": stats.get("query_encoding_time"),
+            "total_time": stats.get("total_time"),
+        },
+        "configs": [serialize_config_for_storage(config) for config in configs],
+    }
+
+    with open(jsonl_path, "w") as f:
+        f.write(json.dumps(metadata_entry, default=str) + "\n")
+
+        for result in evaluation_results:
+            config_idx = result["config_idx"]
+            entry = {
+                "type": "result",
+                "run_id": run_id,
+                "config_idx": config_idx,
+                "config_name": result["config_name"],
+                "config": serialize_config_for_storage(configs[config_idx]),
+                "token_count": result["token_count"],
+                "avg_tokens_per_doc": result["avg_tokens_per_doc"],
+                "compression_time": stats["compression_times"][config_idx],
+                "metrics": result["evaluation"],
+                "runfile_path": result.get("runfile_path"),
+            }
+            f.write(json.dumps(entry, default=str) + "\n")
+
+    print(f"\nSaved JSONL results to: {jsonl_path}")
+    return jsonl_path
+
+
+def load_configs_from_jsonl(jsonl_path: Path, model: ColBERT) -> list[CompressionConfig | None]:
+    """
+    Load compression configurations from a JSONL file.
+    
+    Each line should be a JSON object representing a CompressionConfig.
+    For baseline (no compression), use either:
+    - {"type": "baseline"} or {"description": "baseline"}
+    - An empty strategies list: {"strategies": [], "description": "Baseline"}
+    
+    Parameters
+    ----------
+    jsonl_path : Path
+        Path to JSONL file containing compression configs
+    model : ColBERT
+        Model instance (needed for tokenizer.all_special_ids)
+        
+    Returns
+    -------
+    list[CompressionConfig | None]
+        List of compression configs (None for baseline)
+    """
+    configs = []
+    with open(jsonl_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            # Check if this is a baseline config
+            if (data.get("type") == "baseline" or 
+                not data.get("strategies") or 
+                len(data.get("strategies", [])) == 0):
+                configs.append(None)
+            else:
+                config = CompressionConfig.from_dict(data)
+                # Set ignore_token_ids for IDF pruning strategies if not already set
+                for strategy in config.strategies:
+                    if isinstance(strategy, IDFPruningStrategy) and strategy.config.ignore_token_ids is None:
+                        strategy.config.ignore_token_ids = model.tokenizer.all_special_ids
+                configs.append(config)
+    return configs
+
+
+def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
+    """
+    Create default compression configurations matching beir_dataset.py.
+    
+    Parameters
+    ----------
+    model : ColBERT
+        Model instance (needed for tokenizer.all_special_ids)
+        
+    Returns
+    -------
+    list[CompressionConfig | None]
+        List of compression configs (None for baseline)
+    """
+    configs = [None]  # Baseline (no compression)
+    
+    # Global IDF pruning configs
+    for k in [5, 10, 20, 30, 40, 50, 75, 100, 125, 150, 175, 200]:
+        pruning_config = IDFPruningConfig(
+            mode="global",
+            top_k=k,
+            protected_tokens=1,
+            ignore_token_ids=model.tokenizer.all_special_ids,
+            use_tfidf=False,
+            track_pruned_tokens=False,
+        )
+        strategy = IDFPruningStrategy(pruning_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"Global IDF pruning k={k}",
+        )
+        configs.append(config)
+    
+    # Document-wise IDF pruning configs
+    for k in [5, 10, 20, 30, 40, 50, 75, 100]:
+        pruning_config = IDFPruningConfig(
+            mode="document",
+            top_k=k,
+            protected_tokens=1,
+            ignore_token_ids=model.tokenizer.all_special_ids,
+            use_tfidf=False,
+            track_pruned_tokens=False,
+        )
+        strategy = IDFPruningStrategy(pruning_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"Doc-wise IDF pruning k={k}",
+        )
+        configs.append(config)
+    
+    # Pooling configs
+    for k in [2, 3, 4, 5]:
+        pooling_config = PoolingConfig(
+            pool_factor=k,
+            protected_tokens=1,
+            clustering_method="hierarchical",
+            show_progress_bar=True,
+        )
+        strategy = PoolingStrategy(pooling_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"Hierarchical Pooling f={k} protected tokens=1",
+        )
+        configs.append(config)
+    
+    return configs
 
 
 def print_experiment_statistics(
-    experiment_results: CompressionExperimentResults,
+    stats: dict[str, Any],
     configs: list[CompressionConfig | None],
 ) -> None:
     """
@@ -237,19 +328,18 @@ def print_experiment_statistics(
 
     Parameters
     ----------
-    experiment_results : CompressionExperimentResults
-        Results from compression experiment
+    stats : dict
+        Statistics dictionary with keys: num_documents, encoding_time, config_token_counts, avg_tokens_per_doc
     configs : list
         List of compression configs
     """
-    stats = experiment_results.statistics
-
     print("\n" + "=" * 80)
     print("EXPERIMENT STATISTICS")
     print("=" * 80)
     print(f"Documents encoded: {stats['num_documents']}")
     print(f"Encoding time: {stats['encoding_time']:.3f}s")
-    print(f"Total time: {stats['total_time']:.3f}s")
+    if 'total_time' in stats:
+        print(f"Total time: {stats['total_time']:.3f}s")
 
     # Create DataFrame for token counts
     data = []
@@ -430,9 +520,9 @@ def evaluate_config(
 def create_or_update_runfile_manifest(
     runfile_output_dir: Path,
     run_id: str,
-    experiment_results: CompressionExperimentResults,
+    stats: dict[str, Any],
     all_evaluation_results: list[dict[str, Any]],
-    experiment_config: CompressionExperimentConfig,
+    configs: list[CompressionConfig | None],
     args: argparse.Namespace,
     dataset_name: str,
 ) -> None:
@@ -448,12 +538,12 @@ def create_or_update_runfile_manifest(
         Directory containing runfiles
     run_id : str
         Unique run ID for this experiment (e.g., timestamp-based)
-    experiment_results : CompressionExperimentResults
-        Results from compression experiment
+    stats : dict
+        Statistics dictionary
     all_evaluation_results : list[dict]
         List of evaluation result dictionaries
-    experiment_config : CompressionExperimentConfig
-        The experiment configuration used
+    configs : list[CompressionConfig | None]
+        List of compression configs
     args : argparse.Namespace
         Command line arguments
     dataset_name : str
@@ -466,32 +556,22 @@ def create_or_update_runfile_manifest(
         "model_name": args.model_name,
         "dataset_name": dataset_name,
         "index_type": args.index_type,
-        "storage_mode": args.storage_mode,
         "batch_size": args.batch_size,
         "metrics": args.metrics,
-        "idf_document_top_k": args.idf_document_top_k,
-        "idf_global_top_k": args.idf_global_top_k,
-        "pool_factors": args.pool_factors,
+        "configs_file": str(args.configs_file) if args.configs_file else None,
     }
-    
-    # Get statistics from experiment results
-    stats = experiment_results.statistics
     
     # Append each config entry as a new line (naive append)
     with open(manifest_path, "a") as f:  # 'a' mode for append
         for result in all_evaluation_results:
             config_idx = result["config_idx"]
-            config = experiment_config.configs[config_idx]
+            config = configs[config_idx]
             
             # Serialize config
             if config is None:
-                serialized_config = {"type": "none", "description": "No compression"}
-            elif isinstance(config, CompressionContext):
-                serialized_config = config.serialize()
-            elif isinstance(config, CompressionConfig):
-                serialized_config = config.serialize()
+                serialized_config = {"type": "baseline", "description": "No compression"}
             else:
-                serialized_config = {"type": "unknown", "description": str(config)}
+                serialized_config = config.serialize()
             
             # Get timing information for this config
             compression_time = None
@@ -505,7 +585,7 @@ def create_or_update_runfile_manifest(
                 "experiment_args": experiment_args,
                 "experiment_stats": {
                     "num_documents": stats.get("num_documents"),
-                    "num_configs": stats.get("num_configs"),
+                    "num_configs": stats.get("num_configs", len(configs)),
                     "encoding_time": stats.get("encoding_time"),
                     "total_time": stats.get("total_time"),
                 },
@@ -602,43 +682,16 @@ def parse_args() -> argparse.Namespace:
         choices=["flat", "plaid"],
     )
     parser.add_argument(
-        "--storage_mode",
-        type=str,
-        default="disk",
-        choices=["cpu", "memory", "disk"],
-        help="Storage mode for experiment results (default: 'disk')",
-    )
-    parser.add_argument(
         "--experiment_output_dir",
         type=str,
-        default="results/compression_experiments",
-        help="Output directory for compression experiment results (default: 'results/compression_experiments')",
+        default=None,
+        help="Output directory for compression experiment results. Defaults to results/compression_experiments/<model>/<dataset>",
     )
     parser.add_argument(
-        "--clean_output_dir",
-        action="store_true",
-        help="Clean output directory of shard files after experiment",
-    )
-    parser.add_argument(
-        "--idf_document_top_k",
-        type=int,
-        nargs="+",
-        default=[],
-        help="Top-k values for per-document IDF pruning (default: [])",
-    )
-    parser.add_argument(
-        "--idf_global_top_k",
-        type=int,
-        nargs="+",
-        default=[],
-        help="Top-k values for global IDF pruning (default: [])",
-    )
-    parser.add_argument(
-        "--pool_factors",
-        type=int,
-        nargs="+",
-        default=[],
-        help="Pool factors for pooling compression (default: [])",
+        "--configs_file",
+        type=str,
+        default=None,
+        help="Path to JSONL file containing compression configs. If not provided, uses default configs matching beir_dataset.py",
     )
     parser.add_argument(
         "--batch_size",
@@ -664,71 +717,89 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Main execution function."""
     args = parse_args()
+    overall_start = time.time()
 
     # Load model
-    model : ColBERT = load_model(args.model_name, args.dataset_name)
+    model: ColBERT = load_model(args.model_name, args.dataset_name)
 
     # Load dataset
     documents, queries, qrels = load_dataset(args.dataset_name)
 
-    # Collect IDF statistics
-    print("\n" + "=" * 80)
-    print("Collecting IDF statistics from corpus...")
-    print("=" * 80)
-    document_texts = [doc["text"] for doc in documents]
-    idf_stats = TokenTFIDFStats.from_colbert_model(
-        model, document_texts, show_progress=True
-    )
-    print(f"✓ Collected stats for {len(idf_stats.idf_scores)} unique tokens")
-
     # Set up experiment output directory
+    model_dir = sanitize_name(args.model_name.split("/")[-1])
+    dataset_dir = sanitize_name(args.dataset_name)
     if args.experiment_output_dir is None:
-        experiment_output_dir = Path(
-            f"./compression_experiments/{args.dataset_name}_{args.model_name.split('/')[-1]}"
+        experiment_output_dir = (
+            Path("results")
+            / "compression_experiments"
+            / model_dir
+            / dataset_dir
         )
     else:
         experiment_output_dir = Path(args.experiment_output_dir)
+    experiment_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate run_id for consistent naming and tracking (saved in experiment_metadata.json)
-    # This allows matching shard files to configs even without runfiles
+    # Generate run_id for consistent naming and tracking
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Create experiment config
-    experiment_config = create_experiment_config(
-        idf_stats=idf_stats,
-        idf_document_top_k=args.idf_document_top_k,
-        idf_global_top_k=args.idf_global_top_k,
-        pool_factors=args.pool_factors,
-        output_dir=experiment_output_dir,
-        storage_mode=args.storage_mode,
-        run_id=run_id,
-    )
-
-    # Run compression experiment
+    # Load compression configs
     print("\n" + "=" * 80)
-    print("Running compression experiment...")
+    print("Loading compression configurations...")
     print("=" * 80)
-    experiment_results = model.encode(
+    if args.configs_file:
+        configs = load_configs_from_jsonl(Path(args.configs_file), model)
+        print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
+    else:
+        configs = create_default_configs(model)
+        print(f"✓ Created {len(configs)} default configs")
+    
+    print("\nConfigurations:")
+    for i, config in enumerate(configs):
+        if config is None:
+            print(f"  [{i}] Baseline (no compression)")
+        else:
+            print(f"  [{i}] {config.description}")
+
+    # Encode documents once with artifacts (input_ids needed for IDF pruning)
+    print("\n" + "=" * 80)
+    print("Encoding documents...")
+    print("=" * 80)
+    encoding_start = time.time()
+    documents_embeddings, artifacts = model.encode(
         sentences=[document["text"] for document in documents],
         batch_size=args.batch_size,
         is_query=False,
         show_progress_bar=True,
-        compression_config=experiment_config,
+        convert_to_tensor=True,
+        return_extra_artifacts={"input_ids": True, "attention_scores": False},
     )
-
-    # Print experiment statistics
-    print_experiment_statistics(experiment_results, experiment_config.configs)
+    encoding_time = time.time() - encoding_start
+    print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
 
     # Encode queries once
     print("\n" + "=" * 80)
     print("Encoding queries...")
     print("=" * 80)
+    query_encoding_start = time.time()
     queries_embeddings = model.encode(
         sentences=list(queries.values()),
         is_query=True,
         show_progress_bar=True,
         batch_size=512,
+        convert_to_tensor=True,
     )
+    query_encoding_time = time.time() - query_encoding_start
+
+    # Track statistics
+    stats = {
+        "num_documents": len(documents),
+        "encoding_time": encoding_time,
+        "query_encoding_time": query_encoding_time,
+        "config_token_counts": [],
+        "avg_tokens_per_doc": [],
+        "compression_times": [],
+        "num_configs": len(configs),
+    }
 
     # Evaluate each compression config
     print("\n" + "=" * 80)
@@ -736,21 +807,41 @@ def main() -> None:
     print("=" * 80)
 
     all_evaluation_results = []
-    stats = experiment_results.statistics
     
     # Set up runfile output directory if saving runfiles
     runfile_output_dir = None
     if args.save_runfiles:
         runfile_output_dir = experiment_output_dir / "runfiles"
         runfile_output_dir.mkdir(parents=True, exist_ok=True)
-        # Use the same run_id that was passed to experiment_config
-        run_id = experiment_config.run_id  # Already set, but explicit for clarity
 
-    for config_idx, (config, documents_embeddings) in enumerate(experiment_results):
+    for config_idx, config in enumerate(configs):
+        compression_start = time.time()
+        
+        # Apply compression if config is not None (baseline)
+        if config is None:
+            compressed_embeddings = documents_embeddings
+        else:
+            compressor = config.create_compressor()
+            compressed_embeddings, _ = compressor.compress(
+                embeddings=documents_embeddings,
+                artifacts=artifacts,
+            )
+        
+        compression_time = time.time() - compression_start
+        
+        # Calculate token statistics
+        num_tokens = sum(len(emb) for emb in compressed_embeddings)
+        avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
+        
+        stats["config_token_counts"].append(num_tokens)
+        stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
+        stats["compression_times"].append(compression_time)
+        
+        # Evaluate this config
         result = evaluate_config(
             config_idx=config_idx,
             config=config,
-            documents_embeddings=documents_embeddings,
+            documents_embeddings=compressed_embeddings,
             documents=documents,
             queries=queries,
             qrels=qrels,
@@ -766,33 +857,38 @@ def main() -> None:
         )
         all_evaluation_results.append(result)
 
+    stats["total_time"] = time.time() - overall_start
+
+    # Print experiment statistics
+    print_experiment_statistics(stats, configs)
+
     # Print summary table
     df = print_results_table(all_evaluation_results, metrics=args.metrics)
 
     # Save results to TSV
     df.to_csv(experiment_output_dir / f"results_{run_id}.tsv", index=False, sep="\t")
+    save_results_jsonl(
+        output_dir=experiment_output_dir,
+        run_id=run_id,
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        args=args,
+        configs=configs,
+        stats=stats,
+        evaluation_results=all_evaluation_results,
+    )
     
     # Create or update runfile manifest if saving runfiles
-    if args.save_runfiles and runfile_output_dir is not None and run_id is not None:
+    if args.save_runfiles and runfile_output_dir is not None:
         create_or_update_runfile_manifest(
             runfile_output_dir=runfile_output_dir,
             run_id=run_id,
-            experiment_results=experiment_results,
+            stats=stats,
             all_evaluation_results=all_evaluation_results,
-            experiment_config=experiment_config,
+            configs=configs,
             args=args,
             dataset_name=args.dataset_name,
         )
-    
-    if args.clean_output_dir:
-        print("\n" + "=" * 80)
-        print("Cleaning output directory of .pt files...")
-        print("=" * 80)
-        # remove all .pt files in the output directory
-        bar = tqdm(experiment_output_dir.glob("*.pt"), desc="Cleaning output directory", leave=False)   
-        for file in bar:
-            bar.set_description(f"Cleaning {file.name}", refresh=True)
-            file.unlink()
 
 
 if __name__ == "__main__":
