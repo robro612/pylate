@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional, Union, Collection
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import numpy as np
 from scipy.cluster import hierarchy
@@ -203,6 +204,157 @@ class CompressionStrategy(ABC):
     """
     
     required_artifacts: list[str] = []  # Class variable: list of artifact keys required by this strategy
+    
+    @abstractmethod
+    def compress(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply compression to embeddings and update artifacts.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Must contain all required artifacts.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (compressed_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with compressed embeddings.
+            Metadata artifacts are passed through unchanged.
+        """
+        pass
+    
+    def compress_parallel(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+        batch_size: int = 100,
+        num_workers: Optional[int] = None,
+        show_progress: bool = False,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply compression in parallel by batching documents and processing them concurrently.
+        
+        This method splits the documents into batches and processes each batch in parallel
+        using threads. Results are then recombined to maintain the original order.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Must contain all required artifacts.
+        batch_size
+            Number of documents to process in each batch. Defaults to 100.
+        num_workers
+            Number of worker threads to use. If None, defaults to min(batch_size, number of documents).
+        show_progress
+            If True, shows a progress bar during parallel compression. Defaults to False.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (compressed_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with compressed embeddings.
+            Metadata artifacts are passed through unchanged.
+        """
+        if len(embeddings) == 0:
+            return [], artifacts
+        
+        # Determine number of workers
+        if num_workers is None:
+            num_workers = min(batch_size, len(embeddings), 8)  # Cap at 8 workers by default
+        num_workers = max(1, num_workers)  # At least 1 worker
+        
+        # If we have very few documents, just use the regular compress method
+        # This avoids overhead of parallelization for small batches
+        if len(embeddings) <= batch_size or len(embeddings) < num_workers * 2:
+            return self.compress(embeddings, artifacts)
+        
+        # Split documents into batches
+        batches = []
+        for i in range(0, len(embeddings), batch_size):
+            batch_embeddings = embeddings[i:i + batch_size]
+            # Extract corresponding artifacts for this batch
+            batch_artifacts = {}
+            for artifact_name, artifact_value in artifacts.items():
+                if isinstance(artifact_value, list):
+                    batch_artifacts[artifact_name] = artifact_value[i:i + batch_size]
+                else:
+                    # Metadata artifacts are shared across all batches
+                    batch_artifacts[artifact_name] = artifact_value
+            batches.append((i, batch_embeddings, batch_artifacts))
+        
+        # Process batches in parallel
+        all_compressed_embeddings = [None] * len(embeddings)
+        all_updated_artifacts = {}
+        
+        # Initialize artifact structure
+        for artifact_name, artifact_value in artifacts.items():
+            if isinstance(artifact_value, list):
+                all_updated_artifacts[artifact_name] = [None] * len(embeddings)
+            else:
+                # For metadata artifacts (non-list), preserve the original reference
+                # This ensures shared artifacts like tfidf_stats are available to all batches
+                all_updated_artifacts[artifact_name] = artifact_value
+        
+        def process_batch(start_idx: int, batch_emb: list[torch.Tensor], batch_art: CompressionArtifacts) -> tuple[int, list[torch.Tensor], CompressionArtifacts]:
+            """Process a single batch and return results with start index."""
+            # Add batch start index to artifacts for strategies that need global document indices
+            # This allows strategies like IDFPruningStrategy to use correct doc_idx
+            batch_art_with_start = batch_art.copy()
+            batch_art_with_start["_batch_start_idx"] = start_idx
+            compressed_emb, updated_art = self.compress(batch_emb, batch_art_with_start)
+            # Remove the internal start_idx from returned artifacts
+            if "_batch_start_idx" in updated_art:
+                del updated_art["_batch_start_idx"]
+            return start_idx, compressed_emb, updated_art
+        
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all batches
+            future_to_batch = {
+                executor.submit(process_batch, start_idx, batch_emb, batch_art): start_idx
+                for start_idx, batch_emb, batch_art in batches
+            }
+            
+            # Collect results as they complete
+            iterator = as_completed(future_to_batch) if not show_progress else tqdm(as_completed(future_to_batch), total=len(batches), desc="Parallel compression")
+            for future in iterator:
+                start_idx, compressed_emb, updated_art = future.result()
+                
+                # Store compressed embeddings
+                for j, emb in enumerate(compressed_emb):
+                    all_compressed_embeddings[start_idx + j] = emb
+                
+                # Store updated artifacts
+                for artifact_name, artifact_value in updated_art.items():
+                    if isinstance(artifact_value, list):
+                        for j, artifact_item in enumerate(artifact_value):
+                            all_updated_artifacts[artifact_name][start_idx + j] = artifact_item
+                    else:
+                        # For metadata artifacts (non-list), use the same reference
+                        # This ensures shared artifacts like tfidf_stats are preserved
+                        if all_updated_artifacts[artifact_name] is None:
+                            all_updated_artifacts[artifact_name] = artifact_value
+                        # If it's already set, keep the same reference (they should be identical)
+        
+        # Verify all embeddings were processed
+        if None in all_compressed_embeddings:
+            raise RuntimeError("Some batches failed to process during parallel compression")
+        
+        # Verify all shape-matched artifacts were processed
+        for artifact_name, artifact_value in all_updated_artifacts.items():
+            if isinstance(artifact_value, list) and None in artifact_value:
+                raise RuntimeError(f"Some {artifact_name} artifacts failed to process during parallel compression")
+        
+        return all_compressed_embeddings, all_updated_artifacts
 
 
 class IDFPruningStrategy(CompressionStrategy):
@@ -346,7 +498,7 @@ class IDFPruningStrategy(CompressionStrategy):
     def _get_tokens_to_prune_global(
         self,
         stats: TokenTFIDFStats,
-        input_ids: list[torch.Tensor],
+        input_ids: Optional[list[torch.Tensor]] = None,
     ) -> set[int]:
         """
         Identify token types to prune globally based on lowest scores.
@@ -354,9 +506,10 @@ class IDFPruningStrategy(CompressionStrategy):
         Parameters
         ----------
         stats
-            TF-IDF statistics
+            TF-IDF statistics (computed on all documents)
         input_ids
-            List of input_id tensors
+            Optional list of input_id tensors. If provided, used to check protected tokens.
+            If None, computes from stats alone (assumes no protected token filtering needed).
         
         Returns
         -------
@@ -364,32 +517,71 @@ class IDFPruningStrategy(CompressionStrategy):
             Set of token IDs to prune globally
         """
         # Collect all unique token types and their scores
+        # Iterate over all tokens in the stats (from idf_scores which contains all tokens in corpus)
         token_scores: dict[int, float] = {}
         
-        for doc_idx, doc_input_ids in enumerate(input_ids):
-            doc_tokens = doc_input_ids.cpu().tolist()
+        # Get all token IDs from stats
+        all_token_ids = set(stats.idf_scores.keys())
+        
+        # If input_ids provided, we need to check protected tokens per document
+        # Otherwise, just use IDF scores directly
+        if input_ids is not None:
+            # Check which tokens appear in protected positions
+            tokens_in_protected_positions: set[int] = set()
+            for doc_input_ids in input_ids:
+                doc_tokens = doc_input_ids.cpu().tolist()
+                protected_tokens = set(doc_tokens[:self.config.protected_tokens])
+                tokens_in_protected_positions.update(protected_tokens)
             
-            # Get unique tokens in this document
-            unique_tokens = set(doc_tokens)
-            
-            for token_id in unique_tokens:
-                # Skip protected tokens and ignored tokens
-                if token_id in doc_tokens[:self.config.protected_tokens]:
-                    continue
+            for token_id in all_token_ids:
+                # Skip ignored tokens
                 if self.config.ignore_token_ids and token_id in self.config.ignore_token_ids:
                     continue
                 
-                # Use minimum score across documents (most conservative)
-                score = self._get_token_score(stats, doc_idx, token_id)
-                if token_id not in token_scores or score < token_scores[token_id]:
-                    token_scores[token_id] = score
+                # Skip tokens that appear in protected positions (conservative approach)
+                if token_id in tokens_in_protected_positions:
+                    continue
+                
+                # For global mode with IDF, just use IDF score (doesn't depend on doc_idx)
+                # For TF-IDF, we'd need to check all documents, but for now use IDF
+                if self.config.use_tfidf:
+                    # For TF-IDF, get minimum score across all documents where token appears
+                    min_score = float('inf')
+                    for doc_idx in range(stats.num_docs):
+                        if token_id in stats.doc_token_counts[doc_idx]:
+                            score = stats.get_tfidf(doc_idx, token_id)
+                            min_score = min(min_score, score)
+                    if min_score == float('inf'):
+                        continue  # Token doesn't appear in any document
+                    token_scores[token_id] = min_score
+                else:
+                    # Just use IDF score (same for all documents)
+                    token_scores[token_id] = stats.get_idf(token_id)
+        else:
+            # No input_ids provided - compute from stats alone
+            # Skip ignored tokens, but can't check protected tokens without input_ids
+            for token_id in all_token_ids:
+                if self.config.ignore_token_ids and token_id in self.config.ignore_token_ids:
+                    continue
+                
+                # Use IDF score (or minimum TF-IDF if use_tfidf is True)
+                if self.config.use_tfidf:
+                    # For TF-IDF, get minimum score across all documents
+                    min_score = float('inf')
+                    for doc_idx in range(stats.num_docs):
+                        if token_id in stats.doc_token_counts[doc_idx]:
+                            score = stats.get_tfidf(doc_idx, token_id)
+                            min_score = min(min_score, score)
+                    if min_score == float('inf'):
+                        continue
+                    token_scores[token_id] = min_score
+                else:
+                    token_scores[token_id] = stats.get_idf(token_id)
         
         # Select tokens to prune based on top_k or threshold
         if self.config.top_k is not None:
             # Sort by score (ascending) and take top_k lowest
-            # Note: ignored tokens are already excluded from token_scores, so we'll prune exactly top_k non-ignored tokens
             sorted_tokens = sorted(token_scores.items(), key=lambda x: x[1])
-            # Take min(top_k, len(sorted_tokens)) to handle cases where we have fewer candidates than top_k
             num_to_prune = min(self.config.top_k, len(sorted_tokens))
             tokens_to_prune = {token_id for token_id, _ in sorted_tokens[:num_to_prune]}
         else:
@@ -505,13 +697,26 @@ class IDFPruningStrategy(CompressionStrategy):
                 raise ValueError(f"input_ids[{idx}] must be a torch.Tensor, got {type(doc_input_ids)}")
         
         # Initialize pruned tokens tracking if requested
-        if self.config.track_pruned_tokens:
+        # Check if we're in parallel mode (pruned_tokens already pre-allocated)
+        start_idx = artifacts.get("_batch_start_idx", 0)
+        is_parallel_mode = (
+            self.config.track_pruned_tokens and 
+            self._pruned_tokens is not None and 
+            isinstance(self._pruned_tokens, list) and
+            len(self._pruned_tokens) > len(embeddings)  # Pre-allocated for parallel
+        )
+        
+        if self.config.track_pruned_tokens and not is_parallel_mode:
+            # Sequential mode: start fresh
             self._pruned_tokens = []
-        else:
+        elif not self.config.track_pruned_tokens:
             self._pruned_tokens = None
         
-        # Compute TF-IDF statistics from input_ids
-        stats = self._compute_tfidf_stats(input_ids)
+        # Compute or use cached TF-IDF statistics from artifacts
+        if "tfidf_stats" in artifacts:
+            stats = artifacts["tfidf_stats"]
+        else:
+            stats = self._compute_tfidf_stats(input_ids)
         
         # Determine tokens to prune based on mode
         # Store keep masks for artifact updates
@@ -519,21 +724,27 @@ class IDFPruningStrategy(CompressionStrategy):
         
         if self.config.mode == "global":
             # Global mode: identify token types to prune globally
-            tokens_to_prune_global = self._get_tokens_to_prune_global(stats, input_ids)
+            # Check if pre-computed tokens are available (from parallel processing)
+            if "_tokens_to_prune_global" in artifacts:
+                tokens_to_prune_global = artifacts["_tokens_to_prune_global"]
+            else:
+                # Sequential mode: compute from current input_ids
+                tokens_to_prune_global = self._get_tokens_to_prune_global(stats, input_ids)
             
             # Prune all occurrences of these token types from all documents
             pruned_embeddings = []
             updated_input_ids = []
             
             criterion_str = f"top_k={self.config.top_k}" if self.config.top_k else f"threshold={self.config.threshold}"
+            doc_pairs = list(zip(embeddings, input_ids))
             iterator = tqdm(
-                enumerate(zip(embeddings, input_ids)),
+                enumerate(doc_pairs),
                 desc=f"IDF pruning (global, {criterion_str})",
                 total=len(embeddings),
                 disable=not self.config.show_progress_bar,
             )
             
-            for doc_idx, (doc_embeddings, doc_input_ids) in iterator:
+            for batch_doc_idx, (doc_embeddings, doc_input_ids) in iterator:
                 doc_tokens = doc_input_ids.cpu().tolist()
                 device = doc_input_ids.device
                 dtype = doc_input_ids.dtype
@@ -561,7 +772,7 @@ class IDFPruningStrategy(CompressionStrategy):
                 if len(keep_mask) != doc_embeddings.shape[0]:
                     raise ValueError(
                         f"Mask length ({len(keep_mask)}) does not match embedding length "
-                        f"({doc_embeddings.shape[0]}) for document {doc_idx}"
+                        f"({doc_embeddings.shape[0]}) for document {start_idx + batch_doc_idx}"
                     )
                 keep_mask_tensor = torch.tensor(keep_mask, device=doc_embeddings.device, dtype=torch.bool)
                 pruned_doc_embeddings = doc_embeddings[keep_mask_tensor]
@@ -575,7 +786,12 @@ class IDFPruningStrategy(CompressionStrategy):
                 updated_input_ids.append(pruned_doc_tokens)
                 
                 if self.config.track_pruned_tokens:
-                    self._pruned_tokens.append(pruned_token_ids)
+                    if is_parallel_mode:
+                        # Parallel mode: set at correct index
+                        self._pruned_tokens[start_idx + batch_doc_idx] = pruned_token_ids
+                    else:
+                        # Sequential mode: append
+                        self._pruned_tokens.append(pruned_token_ids)
                 
                 # Store keep mask for artifact updates
                 keep_masks.append(keep_mask)
@@ -587,16 +803,20 @@ class IDFPruningStrategy(CompressionStrategy):
             
             criterion_str = f"top_k={self.config.top_k}" if self.config.top_k else f"threshold={self.config.threshold}"
             iterator = tqdm(
-                enumerate(zip(embeddings, input_ids)),
+                zip(embeddings, input_ids),
                 desc=f"IDF pruning (document, {criterion_str})",
                 total=len(embeddings),
                 disable=not self.config.show_progress_bar,
             )
             
-            for doc_idx, (doc_embeddings, doc_input_ids) in iterator:
+            for batch_doc_idx, (doc_embeddings, doc_input_ids) in enumerate(iterator):
+                # Use global document index for stats lookup
+                # Get start index from artifacts if available (for parallel processing)
+                start_idx = artifacts.get("_batch_start_idx", 0)
+                global_doc_idx = start_idx + batch_doc_idx
                 # Get positions to prune for this document
                 positions_to_prune = self._get_tokens_to_prune_document(
-                    stats, doc_idx, doc_input_ids
+                    stats, global_doc_idx, doc_input_ids
                 )
                 
                 doc_tokens = doc_input_ids.cpu().tolist()
@@ -639,7 +859,12 @@ class IDFPruningStrategy(CompressionStrategy):
                 updated_input_ids.append(pruned_doc_tokens)
                 
                 if self.config.track_pruned_tokens:
-                    self._pruned_tokens.append(pruned_token_ids)
+                    if is_parallel_mode:
+                        # Parallel mode: set at correct index
+                        self._pruned_tokens[start_idx + batch_doc_idx] = pruned_token_ids
+                    else:
+                        # Sequential mode: append
+                        self._pruned_tokens.append(pruned_token_ids)
                 
                 # Store keep mask for artifact updates
                 keep_masks.append(keep_mask)
@@ -665,10 +890,96 @@ class IDFPruningStrategy(CompressionStrategy):
                 
                 updated_artifacts[artifact_name] = pruned_artifacts
             else:
-                # Metadata artifact: pass through unchanged
+                # Metadata artifact: pass through unchanged (including tfidf_stats)
                 updated_artifacts[artifact_name] = artifact_value
         
         return pruned_embeddings, updated_artifacts
+    
+    def compress_parallel(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+        batch_size: int = 100,
+        num_workers: Optional[int] = None,
+        show_progress: bool = False,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply IDF-based pruning in parallel, computing global statistics first.
+        
+        This method computes TF-IDF statistics across all documents first (to ensure
+        consistent results with sequential processing), then parallelizes the per-document
+        pruning operations using the base class parallel implementation.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Must contain "input_ids" as a list of tensors.
+        batch_size
+            Number of documents to process in each batch. Defaults to 100.
+        num_workers
+            Number of worker threads to use. If None, defaults to min(batch_size, number of documents, 8).
+        show_progress
+            If True, shows a progress bar during parallel compression. Defaults to False.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (pruned_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with pruned embeddings.
+            Metadata artifacts are passed through unchanged.
+        """
+        # Get input_ids from artifacts to compute global stats
+        if "input_ids" not in artifacts:
+            raise ValueError(
+                "IDFPruningStrategy requires 'input_ids' artifact. "
+                "Ensure input_ids are provided when encoding."
+            )
+        
+        input_ids = artifacts["input_ids"]
+        if not isinstance(input_ids, list):
+            raise ValueError("input_ids artifact must be a list of tensors")
+        
+        if len(input_ids) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(input_ids)} input_ids but {len(embeddings)} embeddings"
+            )
+        
+        # Compute TF-IDF statistics from ALL input_ids first (global computation)
+        # This ensures results match sequential processing
+        # Add stats to artifacts so compress() can use them
+        # Make a copy of artifacts to avoid modifying the input
+        if "tfidf_stats" in artifacts:
+            stats = artifacts["tfidf_stats"]
+        else:
+            stats = self._compute_tfidf_stats(input_ids)
+
+        artifacts_with_stats = artifacts.copy()
+        artifacts_with_stats["tfidf_stats"] = stats
+        
+        # For global mode, pre-compute tokens_to_prune_global across ALL documents
+        # This must be done before batching, otherwise each batch computes different tokens
+        if self.config.mode == "global":
+            tokens_to_prune_global = self._get_tokens_to_prune_global(stats, input_ids)
+            artifacts_with_stats["_tokens_to_prune_global"] = tokens_to_prune_global
+        
+        # Initialize pruned tokens tracking if requested
+        if self.config.track_pruned_tokens:
+            self._pruned_tokens = [None] * len(embeddings)
+        else:
+            self._pruned_tokens = None
+        
+        # Call the base class compress_parallel, which will call compress() on each batch
+        # compress() will use the stats and pre-computed tokens from artifacts
+        result_emb, result_art = super().compress_parallel(embeddings, artifacts_with_stats, batch_size, num_workers, show_progress)
+        
+        # If tracking pruned tokens, ensure all were collected
+        if self.config.track_pruned_tokens and self._pruned_tokens is not None:
+            if None in self._pruned_tokens:
+                raise RuntimeError("Some pruned tokens were not collected during parallel compression")
+        
+        return result_emb, result_art
 
 
 class PoolingStrategy(CompressionStrategy):
@@ -961,12 +1272,13 @@ class PoolingStrategy(CompressionStrategy):
             embedding_dim = embeddings_np.shape[1]
             
             # Initialize and train fastkmeans
-            use_gpu = device.type == "cuda"
+            # TODO: Using GPU causes some weird issues I haven't been able to debug. 
+            # Given that we're only throwing ~300 (max doclen) embeddings in any given clustering, it's not worth the hassle to figure out why.
             kmeans = fastkmeans.FastKMeans(
                 embedding_dim,
                 num_clusters,
                 niter=10,  # Number of iterations
-                gpu=use_gpu,
+                gpu=False,
                 verbose=False,
                 seed=42,
             )
@@ -1271,6 +1583,91 @@ class Compressor:
         # Apply each strategy in sequence
         for strategy in self.strategies:
             result_embeddings, copied_artifacts = strategy.compress(result_embeddings, copied_artifacts)
+            
+            # Validate 1:1 mapping maintained for shape-matched artifacts only
+            num_embeddings = len(result_embeddings)
+            for artifact_name, artifact_value in copied_artifacts.items():
+                if isinstance(artifact_value, list):
+                    if len(artifact_value) != num_embeddings:
+                        raise ValueError(
+                            f"Strategy {strategy.name} broke 1:1 mapping: "
+                            f"{num_embeddings} embeddings but {len(artifact_value)} {artifact_name} artifacts"
+                        )
+        
+        return result_embeddings, copied_artifacts
+    
+    def compress_parallel(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+        batch_size: int = 100,
+        num_workers: Optional[int] = None,
+        show_progress: bool = False,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply all compression strategies in sequence using parallel processing.
+        
+        This method applies each strategy in sequence, but each strategy processes
+        documents in parallel batches for improved performance.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Can contain:
+            - Shape-matched artifacts: `list[torch.Tensor]` (one per document)
+            - Metadata artifacts: `Any` (corpus-level or document-level metadata)
+            Must contain all required artifacts.
+        batch_size
+            Number of documents to process in each batch. Defaults to 100.
+        num_workers
+            Number of worker threads to use per strategy. If None, defaults to min(batch_size, number of documents).
+        show_progress
+            If True, shows a progress bar during parallel compression. Defaults to False.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (compressed_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with compressed embeddings.
+            Metadata artifacts are passed through unchanged.
+        
+        Raises
+        ------
+        ValueError
+            If required artifacts are missing
+        """
+        # Validate required artifacts are present
+        required = self.get_required_artifacts()
+        missing = required - set(artifacts.keys())
+        if missing:
+            raise ValueError(
+                f"Missing required artifacts: {missing}. "
+                f"Required by strategies: {required}"
+            )
+        
+        # Copy artifacts to avoid modifying input
+        # Shape-matched artifacts: deep copy tensors
+        # Metadata artifacts: shallow copy (they're typically immutable or shared)
+        copied_artifacts = {}
+        for k, v in artifacts.items():
+            if isinstance(v, list):
+                copied_artifacts[k] = [a.clone() for a in v]
+            else:
+                copied_artifacts[k] = v  # Metadata: pass through
+        
+        result_embeddings = [emb.clone() for emb in embeddings]
+        
+        # Apply each strategy in sequence, using parallel processing for each
+        for strategy in self.strategies:
+            result_embeddings, copied_artifacts = strategy.compress_parallel(
+                result_embeddings,
+                copied_artifacts,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                show_progress=show_progress,
+            )
             
             # Validate 1:1 mapping maintained for shape-matched artifacts only
             num_embeddings = len(result_embeddings)

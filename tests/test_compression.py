@@ -758,3 +758,253 @@ class TestEdgeCases:
         for i, pruned in enumerate(pruned_embeddings):
             assert pruned.shape[0] >= config.protected_tokens
 
+
+class TestParallelCompression:
+    """Tests for parallel compression functionality."""
+    
+    @pytest.fixture
+    def large_embeddings(self) -> list[torch.Tensor]:
+        """Create a larger set of embeddings for parallel testing."""
+        torch.manual_seed(42)
+        # Create 50 documents with varying lengths
+        embeddings = []
+        for i in range(50):
+            num_tokens = 10 + (i % 20)  # Vary from 10 to 29 tokens
+            embeddings.append(torch.randn(num_tokens, 128, device="cpu"))
+        return embeddings
+    
+    @pytest.fixture
+    def large_input_ids(self, large_embeddings: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Create input_ids matching the large embeddings."""
+        # Create diverse token patterns
+        input_ids = []
+        for i, emb in enumerate(large_embeddings):
+            num_tokens = emb.shape[0]
+            # Create tokens with some repetition for IDF testing
+            tokens = [101]  # CLS token
+            for j in range(1, num_tokens - 1):
+                # Mix common tokens (1-10) with unique tokens
+                if j % 3 == 0:
+                    tokens.append((j % 10) + 1)  # Common tokens
+                else:
+                    tokens.append(100 + i * 100 + j)  # Unique tokens per doc
+            tokens.append(102)  # SEP token
+            input_ids.append(torch.tensor(tokens, device="cpu"))
+        return input_ids
+    
+    @pytest.fixture
+    def large_artifacts(self, large_input_ids: list[torch.Tensor]) -> CompressionArtifacts:
+        """Create artifacts for large test set."""
+        return {
+            "input_ids": large_input_ids,
+            "attention_mask": [
+                torch.ones(len(ids), dtype=torch.long) for ids in large_input_ids
+            ],
+        }
+    
+    def test_parallel_vs_sequential_idf_pruning_document_mode(
+        self, large_embeddings: list[torch.Tensor], large_artifacts: CompressionArtifacts
+    ):
+        """Test that parallel and sequential compression produce identical results (document mode)."""
+        config = IDFPruningConfig(mode="document", top_k=5, protected_tokens=1)
+        strategy = IDFPruningStrategy(config)
+        
+        # Sequential compression
+        sequential_emb, sequential_art = strategy.compress(
+            large_embeddings.copy(), large_artifacts.copy()
+        )
+        
+        # Parallel compression
+        parallel_emb, parallel_art = strategy.compress_parallel(
+            large_embeddings.copy(), large_artifacts.copy(), batch_size=10, num_workers=4
+        )
+        
+        # Verify same number of documents
+        assert len(sequential_emb) == len(parallel_emb), (
+            f"Number of documents mismatch - sequential: {len(sequential_emb)}, parallel: {len(parallel_emb)}"
+        )
+        assert len(sequential_emb) == len(large_embeddings)
+        
+        # Verify embeddings are identical (use allclose for floating point comparison)
+        for i, (seq_emb, par_emb) in enumerate(zip(sequential_emb, parallel_emb)):
+            assert seq_emb.shape == par_emb.shape, (
+                f"Document {i}: Shape mismatch - sequential: {seq_emb.shape}, parallel: {par_emb.shape}"
+            )
+            assert torch.allclose(seq_emb, par_emb, rtol=1e-5, atol=1e-8), (
+                f"Document {i}: Embeddings should be identical - max diff: {torch.max(torch.abs(seq_emb - par_emb)).item()}"
+            )
+        
+        # Verify artifacts are identical
+        assert "input_ids" in sequential_art
+        assert "input_ids" in parallel_art
+        for i, (seq_ids, par_ids) in enumerate(zip(sequential_art["input_ids"], parallel_art["input_ids"])):
+            assert seq_ids.shape == par_ids.shape, (
+                f"Document {i}: Input IDs shape mismatch - sequential: {seq_ids.shape}, parallel: {par_ids.shape}"
+            )
+            assert torch.equal(seq_ids, par_ids), f"Document {i}: Input IDs should be identical"
+        
+        # Verify attention masks if present
+        if "attention_mask" in sequential_art and "attention_mask" in parallel_art:
+            for i, (seq_mask, par_mask) in enumerate(zip(sequential_art["attention_mask"], parallel_art["attention_mask"])):
+                assert seq_mask.shape == par_mask.shape, (
+                    f"Document {i}: Attention mask shape mismatch - sequential: {seq_mask.shape}, parallel: {par_mask.shape}"
+                )
+                assert torch.equal(seq_mask, par_mask), f"Document {i}: Attention masks should be identical"
+    
+    def test_parallel_vs_sequential_idf_pruning_global_mode(
+        self, large_embeddings: list[torch.Tensor], large_artifacts: CompressionArtifacts
+    ):
+        """Test that parallel and sequential compression produce identical results (global mode)."""
+        config = IDFPruningConfig(mode="global", top_k=10, protected_tokens=1)
+        strategy = IDFPruningStrategy(config)
+        
+        # Sequential compression
+        sequential_emb, sequential_art = strategy.compress(
+            large_embeddings.copy(), large_artifacts.copy()
+        )
+        
+        # Parallel compression
+        parallel_emb, parallel_art = strategy.compress_parallel(
+            large_embeddings.copy(), large_artifacts.copy(), batch_size=10, num_workers=4
+        )
+        
+        # Verify same number of documents
+        assert len(sequential_emb) == len(parallel_emb), (
+            f"Number of documents mismatch - sequential: {len(sequential_emb)}, parallel: {len(parallel_emb)}"
+        )
+        assert len(sequential_emb) == len(large_embeddings)
+
+        lengths_seq, lengths_par = zip(*[(len(seq_emb), len(par_emb)) for seq_emb, par_emb in zip(sequential_emb, parallel_emb)])
+        lengths_equal = all([len_seq == len_par for len_seq, len_par in zip(lengths_seq, lengths_par)])
+
+        assert set(lengths_seq) == set(lengths_par), "All document embeddings should have the same sequence length"
+        assert lengths_equal, "All document embeddings should have the same sequence length in the same order"
+
+        # Verify embeddings are identical (use allclose for floating point comparison)
+        for i, (seq_emb, par_emb) in enumerate(zip(sequential_emb, parallel_emb)):
+            assert seq_emb.shape == par_emb.shape, (
+                f"Document {i}: Shape mismatch - sequential: {seq_emb.shape}, parallel: {par_emb.shape}"
+            )
+            assert torch.allclose(seq_emb, par_emb, rtol=1e-5, atol=1e-8), (
+                f"Document {i}: Embeddings should be identical - max diff: {torch.max(torch.abs(seq_emb - par_emb)).item()}"
+            )
+        
+        # Verify artifacts are identical
+        assert "input_ids" in sequential_art
+        assert "input_ids" in parallel_art
+        for i, (seq_ids, par_ids) in enumerate(zip(sequential_art["input_ids"], parallel_art["input_ids"])):
+            assert seq_ids.shape == par_ids.shape, (
+                f"Document {i}: Input IDs shape mismatch - sequential: {seq_ids.shape}, parallel: {par_ids.shape}"
+            )
+            assert torch.equal(seq_ids, par_ids), f"Document {i}: Input IDs should be identical"
+    
+    def test_parallel_vs_sequential_with_tracked_tokens(
+        self, large_embeddings: list[torch.Tensor], large_artifacts: CompressionArtifacts
+    ):
+        """Test that parallel compression correctly tracks pruned tokens."""
+        config = IDFPruningConfig(
+            mode="document", top_k=5, protected_tokens=1, track_pruned_tokens=True
+        )
+        strategy = IDFPruningStrategy(config)
+        
+        # Sequential compression
+        sequential_emb, sequential_art = strategy.compress(
+            large_embeddings.copy(), large_artifacts.copy()
+        )
+        sequential_pruned = strategy.get_pruned_tokens()
+        
+        # Parallel compression
+        parallel_emb, parallel_art = strategy.compress_parallel(
+            large_embeddings.copy(), large_artifacts.copy(), batch_size=10, num_workers=4
+        )
+        parallel_pruned = strategy.get_pruned_tokens()
+        
+        # Verify pruned tokens are tracked
+        assert sequential_pruned is not None
+        assert parallel_pruned is not None
+        assert len(sequential_pruned) == len(parallel_pruned)
+        assert len(sequential_pruned) == len(large_embeddings)
+        
+        # Verify pruned tokens match
+        for seq_pruned, par_pruned in zip(sequential_pruned, parallel_pruned):
+            assert seq_pruned == par_pruned, "Pruned tokens should match"
+    
+    def test_parallel_compression_with_compressor(
+        self, large_embeddings: list[torch.Tensor], large_artifacts: CompressionArtifacts
+    ):
+        """Test parallel compression through Compressor interface."""
+        config = CompressionConfig(
+            strategies=[
+                IDFPruningStrategy(IDFPruningConfig(mode="document", top_k=5)),
+                PoolingStrategy(PoolingConfig(pool_factor=2)),
+            ]
+        )
+        compressor = config.create_compressor()
+        
+        # Sequential compression
+        sequential_emb, sequential_art = compressor.compress(
+            large_embeddings.copy(), large_artifacts.copy()
+        )
+        
+        # Parallel compression
+        parallel_emb, parallel_art = compressor.compress_parallel(
+            large_embeddings.copy(), large_artifacts.copy(), batch_size=10, num_workers=4
+        )
+        
+        # Verify same number of documents
+        assert len(sequential_emb) == len(parallel_emb), (
+            f"Number of documents mismatch - sequential: {len(sequential_emb)}, parallel: {len(parallel_emb)}"
+        )
+        
+        # Verify embeddings are identical (use allclose for floating point comparison)
+        for i, (seq_emb, par_emb) in enumerate(zip(sequential_emb, parallel_emb)):
+            assert seq_emb.shape == par_emb.shape, (
+                f"Document {i}: Shape mismatch - sequential: {seq_emb.shape}, parallel: {par_emb.shape}"
+            )
+            assert torch.allclose(seq_emb, par_emb, rtol=1e-5, atol=1e-8), (
+                f"Document {i}: Embeddings should be identical - max diff: {torch.max(torch.abs(seq_emb - par_emb)).item()}"
+            )
+    
+    def test_parallel_vs_sequential_pooling_hierarchical(
+        self, large_embeddings: list[torch.Tensor], large_artifacts: CompressionArtifacts
+    ):
+        """Test that parallel and sequential pooling produce identical results (hierarchical)."""
+        config = PoolingConfig(
+            pool_factor=2,
+            protected_tokens=1,
+            clustering_method="hierarchical",
+        )
+        strategy = PoolingStrategy(config)
+        
+        # Sequential compression
+        sequential_emb, sequential_art = strategy.compress(
+            large_embeddings.copy(), large_artifacts.copy()
+        )
+        
+        # Parallel compression
+        parallel_emb, parallel_art = strategy.compress_parallel(
+            large_embeddings.copy(), large_artifacts.copy(), batch_size=10, num_workers=4
+        )
+        
+        # Verify same number of documents
+        assert len(sequential_emb) == len(parallel_emb), (
+            f"Number of documents mismatch - sequential: {len(sequential_emb)}, parallel: {len(parallel_emb)}"
+        )
+        assert len(sequential_emb) == len(large_embeddings)
+        
+        # Verify embeddings are identical (use allclose for floating point comparison)
+        for i, (seq_emb, par_emb) in enumerate(zip(sequential_emb, parallel_emb)):
+            assert seq_emb.shape == par_emb.shape, (
+                f"Document {i}: Shape mismatch - sequential: {seq_emb.shape}, parallel: {par_emb.shape}"
+            )
+            assert torch.allclose(seq_emb, par_emb, rtol=1e-5, atol=1e-8), (
+                f"Document {i}: Embeddings should be identical - max diff: {torch.max(torch.abs(seq_emb - par_emb)).item()}"
+            )
+        
+        # Verify artifacts are identical
+        if "input_ids" in sequential_art and "input_ids" in parallel_art:
+            for i, (seq_ids, par_ids) in enumerate(zip(sequential_art["input_ids"], parallel_art["input_ids"])):
+                assert seq_ids.shape == par_ids.shape, (
+                    f"Document {i}: Input IDs shape mismatch - sequential: {seq_ids.shape}, parallel: {par_ids.shape}"
+                )
+                assert torch.equal(seq_ids, par_ids), f"Document {i}: Input IDs should be identical"
