@@ -461,6 +461,106 @@ class ColBERT(SentenceTransformer):
         return torch.cat(
             tensors=[input_ids[:, :1], prefix_tensor, input_ids[:, 1:]], dim=1
         )
+    
+    def _get_model_last_attention_layer(self) -> nn.Module:
+        # TODO: add cases for models other than lightonai/GTE-ModernColBERT-v1
+        return self[0].auto_model.layers[-1].attn
+
+    def _setup_attention_score_hook(
+        self, captured_attention_scores: list[torch.Tensor]
+    ) -> torch.utils.hooks.RemovableHandle | None:
+        """
+        Set up a forward hook on the last layer's attention module to capture attention scores.
+        
+        The hook computes per-token importance scores by aggregating attention across all heads
+        and source tokens. For each token j, the importance score is the sum of attention paid
+        to token j over all heads and all source tokens.
+        
+        Parameters
+        ----------
+        captured_attention_scores
+            List to store captured per-token importance scores during forward passes.
+            Each tensor has shape (batch, seq_len) representing aggregated attention scores.
+        
+        Returns
+        -------
+        torch.utils.hooks.RemovableHandle | None
+            The hook handle if a hook was registered, None otherwise.
+        """
+        # Get the last layer's attention module
+        last_attention_layer = self._get_model_last_attention_layer()
+        
+        # Forward hook to capture outputs and compute attention scores if needed
+        def attention_hook(module, input, output):
+            # Try to extract attention scores from output
+            attention_scores = None
+            
+            if isinstance(output, tuple) and len(output) > 1:
+                # If output is a tuple, attention scores might be at index 1
+                attention_scores = output[1]
+            elif hasattr(module, '_last_attention_scores'):
+                # Some implementations store attention scores in module state
+                attention_scores = module._last_attention_scores
+            
+            # If we don't have attention scores, compute them from inputs
+            if attention_scores is None:
+                # Get hidden states from input
+                if isinstance(input, tuple):
+                    hidden_states = input[0]
+                    attention_mask = input[1] if len(input) > 1 else None
+                else:
+                    hidden_states = input
+                    attention_mask = None
+                
+                # Compute attention scores manually for ModernBertAttention
+                batch_size, seq_len, hidden_size = hidden_states.shape
+                
+                # Get num_heads from config
+                num_heads = module.num_heads
+                head_dim = hidden_size // num_heads
+                
+                # Get Q, K, V from Wqkv projection
+                qkv = module.Wqkv(hidden_states)  # (batch, seq_len, 3*hidden_size)
+                qkv = qkv.view(batch_size, seq_len, 3, hidden_size)  # (batch, seq_len, 3, hidden_size)
+                q, k, v = qkv.chunk(3, dim=2)  # Each: (batch, seq_len, 1, hidden_size)
+                q = q.squeeze(2)  # (batch, seq_len, hidden_size)
+                k = k.squeeze(2)  # (batch, seq_len, hidden_size)
+                
+                # Reshape for multi-head attention
+                q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+                k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+                
+                # Compute attention scores: QK^T / sqrt(d_k)
+                attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+                
+                # Apply attention mask if provided
+                if attention_mask is not None:
+                    if attention_mask.dim() == 2:
+                        mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
+                    elif attention_mask.dim() == 3:
+                        mask = attention_mask.unsqueeze(1)  # (batch, 1, seq_len, seq_len)
+                    else:
+                        mask = attention_mask
+                    attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+                
+                # Apply softmax to get attention probabilities
+                attention_scores = torch.softmax(attention_scores, dim=-1)
+            
+            # Aggregate attention scores to per-token importance scores
+            # attention_scores shape: (batch, num_heads, seq_len, seq_len)
+            # where attention_scores[b, h, i, j] is attention token i pays to token j in head h
+            # We want: for each token j, sum over all heads h and all source tokens i
+            # This gives us the importance score for each token
+            if attention_scores is not None:
+                # attention_scores is (batch, num_heads, seq_len, seq_len)
+                # Sum over heads (dim=1) and source tokens (dim=2) to get (batch, seq_len)
+                # This gives us the total attention paid TO each token
+                importance_scores = attention_scores.sum(dim=1).sum(dim=1)  # (batch, seq_len)
+                captured_attention_scores.append(importance_scores.detach().clone())
+        
+        # Register hook
+        hook_handle = last_attention_layer.register_forward_hook(attention_hook)
+        return hook_handle
 
     DocumentEmbeddings: TypeAlias = list[torch.Tensor] | ndarray | torch.Tensor
     def encode(
@@ -639,6 +739,15 @@ class ColBERT(SentenceTransformer):
         if extract_artifacts:
             all_input_ids = [] if return_extra_artifacts.get("input_ids", False) else None
             all_attention_scores = [] if return_extra_artifacts.get("attention_scores", False) else None
+            
+            # Set up hook for attention score extraction if needed
+            attention_hook_handle = None
+            captured_attention_scores = []
+            if return_extra_artifacts.get("attention_scores", False):
+                attention_hook_handle = self._setup_attention_score_hook(captured_attention_scores)
+        else:
+            attention_hook_handle = None
+            captured_attention_scores = []
 
         for start_index in trange(
             0,
@@ -726,19 +835,29 @@ class ColBERT(SentenceTransformer):
                 # Extract compression artifacts if requested (apply same mask as embeddings)
                 if extract_artifacts:
                     batch_size_actual = features["input_ids"].shape[0]
+                    
+                    # Extract attention scores for this batch if requested
+                    batch_attention_scores = None
+                    if return_extra_artifacts.get("attention_scores", False) and captured_attention_scores:
+                        # Get the last captured attention scores (from this batch)
+                        batch_attention_scores = captured_attention_scores[-1]
+                        # Remove from list since we're processing it now
+                        captured_attention_scores.pop()
+                    
                     for doc_idx in range(batch_size_actual):
                         mask_doc = masks[doc_idx]
                         if return_extra_artifacts.get("input_ids", False):
                             # Apply mask to input_ids to match returned embeddings
                             input_ids_masked = features["input_ids"][doc_idx][mask_doc].clone()
                             all_input_ids.append(input_ids_masked)
-                        if return_extra_artifacts.get("attention_scores", False):
-                            # TODO: Extract attention scores from model
-                            # For now, raise error if requested but not implemented
-                            raise NotImplementedError(
-                                "Attention score extraction not yet implemented. "
-                                "Set return_extra_artifacts['attention_scores']=False"
-                            )
+                        if return_extra_artifacts.get("attention_scores", False) and batch_attention_scores is not None:
+                            # Extract attention importance scores for this document
+                            # batch_attention_scores shape: (batch, seq_len) - aggregated per-token importance scores
+                            doc_attention = batch_attention_scores[doc_idx]  # (seq_len,)
+                            # Apply mask to attention scores - keep only unmasked tokens
+                            masked_attention = doc_attention[mask_doc].clone()  # (num_unmasked_tokens,)
+                            # we can normalize the scores later if needed
+                            all_attention_scores.append(masked_attention)
                 
                 for (
                     token_embedding,
@@ -818,6 +937,10 @@ class ColBERT(SentenceTransformer):
                 for embedding in all_embeddings
             ]
 
+        # Clean up attention hook if it was registered
+        if attention_hook_handle is not None:
+            attention_hook_handle.remove()
+        
         # Return embeddings and compression artifacts if requested
         if extract_artifacts:
             artifacts = {}

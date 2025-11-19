@@ -20,6 +20,8 @@ from pylate.models.compression import (
     IDFPruningStrategy,
     PoolingConfig,
     PoolingStrategy,
+    AttentionPruningConfig,
+    AttentionPruningStrategy,
 )
 
 # Query length mapping for different datasets
@@ -266,14 +268,27 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
         List of compression configs (None for baseline)
     """
     configs = [None]  # Baseline (no compression)
+    # attention score pruning configs
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
+        attention_config = AttentionPruningConfig(
+            top_k=k,
+            protected_tokens=1,
+            track_pruned_tokens=False,
+        )
+        strategy = AttentionPruningStrategy(attention_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"Attention score pruning k={k}",
+        )
+        configs.append(config)
     
     # Global IDF pruning configs
-    for k in [5, 10, 20, 30, 40, 50, 75, 100, 125, 150, 175, 200]:
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
         pruning_config = IDFPruningConfig(
             mode="global",
             top_k=k,
             protected_tokens=1,
-            ignore_token_ids=model.tokenizer.all_special_ids,
+            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
             use_tfidf=False,
             track_pruned_tokens=False,
         )
@@ -285,12 +300,12 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
         configs.append(config)
     
     # Document-wise IDF pruning configs
-    for k in [5, 10, 20, 30, 40, 50, 75, 100]:
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
         pruning_config = IDFPruningConfig(
             mode="document",
             top_k=k,
             protected_tokens=1,
-            ignore_token_ids=model.tokenizer.all_special_ids,
+            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
             use_tfidf=False,
             track_pruned_tokens=False,
         )
@@ -302,19 +317,20 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
         configs.append(config)
     
     # Pooling configs
-    for k in [2, 3, 4, 5]:
-        pooling_config = PoolingConfig(
-            pool_factor=k,
-            protected_tokens=1,
-            clustering_method="hierarchical",
-            show_progress_bar=True,
-        )
-        strategy = PoolingStrategy(pooling_config)
-        config = CompressionConfig(
-            strategies=[strategy],
-            description=f"Hierarchical Pooling f={k} protected tokens=1",
-        )
-        configs.append(config)
+    for method in ["spherical", "hierarchical"]:
+        for k in [2, 3, 4, 5]:
+            pooling_config = PoolingConfig(
+                pool_factor=k,
+                protected_tokens=1,
+                clustering_method=method,
+                show_progress_bar=True,
+            )
+            strategy = PoolingStrategy(pooling_config)
+            config = CompressionConfig(
+                strategies=[strategy],
+                description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1",
+            )
+            configs.append(config)
     
     return configs
 
@@ -771,7 +787,7 @@ def main() -> None:
         is_query=False,
         show_progress_bar=True,
         convert_to_tensor=True,
-        return_extra_artifacts={"input_ids": True, "attention_scores": False},
+        return_extra_artifacts={"input_ids": True, "attention_scores": True},
     )
     encoding_time = time.time() - encoding_start
     print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
@@ -822,9 +838,12 @@ def main() -> None:
             compressed_embeddings = documents_embeddings
         else:
             compressor = config.create_compressor()
-            compressed_embeddings, _ = compressor.compress(
+            compressed_embeddings, _ = compressor.compress_parallel(
                 embeddings=documents_embeddings,
                 artifacts=artifacts,
+                batch_size=args.batch_size,
+                num_workers=8,
+                show_progress=True,
             )
         
         compression_time = time.time() - compression_start
