@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from pylate import evaluation, indexes, models, retrieve
-from pylate.models import CompressionConfig
+from pylate.models.compression import PoolingConfig, PoolingStrategy, IDFPruningConfig, IDFPruningStrategy
 
 if __name__ == "__main__":
     query_len = {
@@ -81,65 +81,129 @@ if __name__ == "__main__":
             split="dev" if "msmarco" in dataset_name else "test",
         )
 
-    match args.index_type:
-        case "flat":
-            index = indexes.Flat(
-                override=True,
-                index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
-            )
-        case "plaid":
-            index = indexes.PLAID(
-                override=True,
-                index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
-            )
-        case _:
-            raise ValueError(f"Invalid index type: {args.index_type}")
-
-    retriever = retrieve.ColBERT(index=index)
-    
-    # compression config with global idk pruning
-    
-
-    documents_embeddings, compression_artifacts = model.encode(
+    documents_embeddings, artifacts = model.encode(
         sentences=[document["text"] for document in documents],
         batch_size=1000,
         is_query=False,
         show_progress_bar=True,
+        convert_to_tensor=True,
         return_extra_artifacts={"input_ids": True, "attention_scores": False},
     )
-    num_tokens = sum(len(embedding) for embedding in documents_embeddings)
-    print(
-        f"Number of tokens: {num_tokens}, Number of documents: {len(documents)}, Average number of tokens per document: {num_tokens / len(documents)}"
+
+    pruning_configs = [
+        IDFPruningConfig(
+            mode="global",
+            top_k=k,
+            protected_tokens=1,
+            ignore_token_ids=model.tokenizer.all_special_ids,
+            use_tfidf=False,
+            track_pruned_tokens=False,
+        ) for k in [5, 10, 20, 30, 40, 50, 75, 100, 125, 150, 175, 200]
+    ] + [
+        IDFPruningConfig(
+            mode="document",
+            top_k=k,
+            protected_tokens=1,
+            ignore_token_ids=model.tokenizer.all_special_ids,
+            use_tfidf=False,
+            track_pruned_tokens=False,
+        ) for k in [5, 10, 20, 30, 40, 50, 75, 100]
+    ]
+    pruning_strategies = [IDFPruningStrategy(config) for config in pruning_configs]
+
+    pooling_configs = [
+        PoolingConfig(
+            pool_factor=k,
+            protected_tokens=1,
+            clustering_method="hierarchical",
+            show_progress_bar=True,
+        ) for k in [2, 3, 4, 5]
+    ]
+    pooling_strategies = [PoolingStrategy(config) for config in pooling_configs]
+    compression_strategies = [*pruning_strategies, *pooling_strategies]
+
+    queries_embeddings = model.encode(
+        sentences=list(queries.values()),
+        is_query=True,
+        show_progress_bar=True,
+        batch_size=512,
+        convert_to_tensor=True,
     )
 
+    def print_token_stats(embeddings: list, name: str) -> None:
+        num_tokens = sum(len(embedding) for embedding in embeddings)
+        data = {
+            "num_tokens": num_tokens,
+            "num_documents": len(documents),
+            "avg_tokens_per_document": num_tokens / len(documents),
+        }
+        print(
+            f"{name} - Number of tokens: {data['num_tokens']}, Number of documents: {data['num_documents']}, Average number of tokens per document: {data['avg_tokens_per_document']}"
+        )
+        return data
 
+    experiments = {
+        "baseline" : None,
+        **{strategy.name : strategy for strategy in compression_strategies}
+    }
+    experiment_results = {}
 
-    # index.add_documents(
-    #     documents_ids=[document["id"] for document in documents],
-    #     documents_embeddings=documents_embeddings,
-    # )
-    # queries_embeddings = model.encode(
-    #     sentences=list(queries.values()),
-    #     is_query=True,
-    #     show_progress_bar=True,
-    #     batch_size=32,
-    # )
+    for name, compression_strategy in experiments.items():
+        if compression_strategy is None:
+            compressed_embs = documents_embeddings
+        else:
+            compressed_embs, compressed_artifacts = compression_strategy.compress(
+                embeddings=documents_embeddings,
+                artifacts=artifacts,
+            )
+        
+        results = {}
+        token_stats = print_token_stats(compressed_embs, name)
+        results.update(token_stats)
 
-    # scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+        match args.index_type:
+            case "flat":
+                index = indexes.Flat(
+                    override=True,
+                    index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
+                )
+            case "plaid":
+                index = indexes.PLAID(
+                    override=True,
+                    index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
+                )
+            case _:
+                raise ValueError(f"Invalid index type: {args.index_type}")
 
-    # # Remove query_id from scores, needed for FiQA dataset
-    # for (query_id, query), query_scores in zip(queries.items(), scores):
-    #     for score in query_scores:
-    #         if score["id"] == query_id:
-    #             # Remove the query_id from the score
-    #             query_scores.remove(score)
+        retriever = retrieve.ColBERT(index=index)
 
-    # evaluation_scores = evaluation.evaluate(
-    #     scores=scores,
-    #     qrels=qrels,
-    #     queries=list(queries.keys()),
-    #     # queries=queries,
-    #     metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
-    # )
+        index.add_documents(
+            documents_ids=[document["id"] for document in documents],
+            documents_embeddings=compressed_embs,
+        )
 
-    # print(evaluation_scores)
+        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+
+        # Remove query_id from scores, needed for FiQA dataset
+        for (query_id, query), query_scores in zip(queries.items(), scores):
+            for score in query_scores:
+                if score["id"] == query_id:
+                    # Remove the query_id from the score
+                    query_scores.remove(score)
+
+        evaluation_scores = evaluation.evaluate(
+            scores=scores,
+            qrels=qrels,
+            queries=list(queries.keys()),
+            # queries=queries,
+            metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+        )
+
+        print(f"Evaluation scores for {name}:")
+        print(evaluation_scores)
+        results.update(evaluation_scores)
+        experiment_results[name] = results
+
+    import pandas as pd
+    df = pd.DataFrame.from_dict(experiment_results, orient="index")
+    df.to_csv(f"evaluation_results_{dataset_name}_{model_name.split('/')[-1]}_{args.index_type}.tsv", sep="\t", index=True)

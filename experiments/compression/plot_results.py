@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Minimal script to plot compression experiment results.
-Plots avg tokens/doc vs metric, grouped by method.
+Plots avg_tokens_per_document vs metric, grouped by method.
 """
 
 import argparse
@@ -10,41 +10,35 @@ import matplotlib.pyplot as plt
 import re
 from pathlib import Path
 
-
-def extract_method(config_str):
-    """Extract method name from Config string."""
-    # Handle Baseline case
-    if config_str.startswith("Baseline"):
-        return "Baseline"
-    
-    # Extract method name before parameters
-    # Examples:
-    # "Doc-wise IDF pruning k=2" -> "Doc-wise IDF pruning"
-    # "Global IDF pruning k=5" -> "Global IDF pruning"
-    # "Hierarchical Pooling f=2 protected tokens=1" -> "Hierarchical Pooling"
-    
-    # Remove parameter patterns (k=, f=, protected tokens=)
-    cleaned = re.sub(r'\s+(k|f|protected tokens)=\d+', '', config_str)
-    # Remove parenthetical info like "(no compression)"
-    cleaned = re.sub(r'\s+\([^)]+\)', '', cleaned)
-    
-    return cleaned.strip()
-
-
 def plot_results(tsv_path, dataset_name, metric, model='GTE-ModernColBERT-v1', output_dir='results/compression_experiments/plots'):
-    """Plot avg tokens/doc vs metric, grouped by method."""
+    """Plot avg_tokens_per_document vs metric, grouped by method."""
     # Read TSV file
-    df = pd.read_csv(tsv_path, sep='\t')
+    df = pd.read_csv(tsv_path, sep='\t', index_col=0)
     
     # Extract method from Config column
-    df['method'] = df['Config'].apply(extract_method)
+    def extract_method_class(name):
+        if isinstance(name, str):
+            name = name.lower()
+            if name == "baseline":
+                return "baseline"
+            elif name.startswith("idf_pruning_mode-global"):
+                return "idf-global"
+            elif name.startswith("idf_pruning_mode-document"):
+                return "idf-doc"
+            elif name.startswith("pooling-hierarchical"):
+                return "pooling-hierarchical"
+            elif name.startswith("pooling-spherical"):
+                return "pooling-spherical"
+        return "other"
+    df['method'] = df.index
+    df['method_class'] = df.index.map(extract_method_class)
     
     # Clean column names (remove spaces, handle special chars)
     df.columns = df.columns.str.strip()
     
     # Verify columns exist
-    if 'Avg Tokens/Doc' not in df.columns:
-        raise ValueError(f"Column 'Avg Tokens/Doc' not found. Available columns: {df.columns.tolist()}")
+    if 'avg_tokens_per_document' not in df.columns:
+        raise ValueError(f"Column 'avg_tokens_per_document' not found. Available columns: {df.columns.tolist()}")
     
     if metric not in df.columns:
         raise ValueError(f"Metric '{metric}' not found. Available columns: {df.columns.tolist()}")
@@ -53,31 +47,32 @@ def plot_results(tsv_path, dataset_name, metric, model='GTE-ModernColBERT-v1', o
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Separate baseline from other methods
-    baseline_data = df[df['method'] == 'Baseline']
-    other_methods = df[df['method'] != 'Baseline']
+    baseline_data = df[df['method_class'] == 'baseline']
+    other_methods = df[df['method_class'] != 'baseline']
     
     # Plot baseline as horizontal and vertical lines if it exists
     if not baseline_data.empty:
         baseline_metric_value = baseline_data[metric].iloc[0]
-        baseline_tokens_value = baseline_data['Avg Tokens/Doc'].iloc[0]
+        baseline_tokens_value = baseline_data['avg_tokens_per_document'].iloc[0]
         ax.axhline(y=baseline_metric_value, color='gray', linestyle='--', linewidth=2, label='Baseline')
         ax.axvline(x=baseline_tokens_value, color='gray', linestyle='--', linewidth=2)
     
     # Plot other methods as lines
-    for method in other_methods['method'].unique():
-        method_data = other_methods[other_methods['method'] == method].sort_values('Avg Tokens/Doc')
+    for method in other_methods['method_class'].unique():
+        method_data = other_methods[other_methods['method_class'] == method].sort_values('avg_tokens_per_document')
+        method_class = method_data['method_class'].iloc[0]
         ax.plot(
-            method_data['Avg Tokens/Doc'],
+            method_data['avg_tokens_per_document'],
             method_data[metric],
             marker='o',
-            label=method,
+            label=method_class,
             linewidth=2,
             markersize=6
         )
     
-    ax.set_xlabel('Avg Tokens/Doc', fontsize=12)
+    ax.set_xlabel('Average Tokens per Document', fontsize=12)
     ax.set_ylabel(metric, fontsize=12)
-    ax.set_title(f'{dataset_name} - {metric} vs Avg Tokens/Doc', fontsize=14)
+    ax.set_title(f'{dataset_name} - {metric} vs Average Tokens per Document', fontsize=14)
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -100,7 +95,7 @@ if __name__ == '__main__':
     parser.add_argument('--results_path', type=str, help='Path to results tsv file')
     parser.add_argument('--output_dir', type=str, help='Path to output directory')
     parser.add_argument('--dataset_name', type=str, help='Dataset name')
-    parser.add_argument('--metric', type=str, help='Metric to plot (e.g., map, ndcg@10)')
+    parser.add_argument('--metric', type=str, default='ndcg@10', help='Metric to plot (e.g., map, ndcg@10)')
     parser.add_argument('--model', type=str, default='GTE-ModernColBERT-v1', help='Model name (default: GTE-ModernColBERT-v1)')
     
     args = parser.parse_args()
