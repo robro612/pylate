@@ -5,37 +5,96 @@ Plots avg_tokens_per_document vs metric, grouped by method.
 """
 
 import argparse
-import pandas as pd
-import matplotlib.pyplot as plt
-import re
+import json
 from pathlib import Path
 
-def plot_results(tsv_path, dataset_name, metric, model='GTE-ModernColBERT-v1', output_dir='results/compression_experiments/plots'):
-    """Plot avg_tokens_per_document vs metric, grouped by method."""
-    # Read TSV file
-    df = pd.read_csv(tsv_path, sep='\t', index_col=0)
-    
-    # Extract method from Config column
-    def extract_method_class(name):
-        if isinstance(name, str):
-            name = name.lower()
-            if name == "baseline":
-                return "baseline"
-            elif name.startswith("idf_pruning_mode-global"):
-                return "idf-global"
-            elif name.startswith("idf_pruning_mode-document"):
-                return "idf-doc"
-            elif name.startswith("pooling-hierarchical"):
-                return "pooling-hierarchical"
-            elif name.startswith("pooling-spherical"):
-                return "pooling-spherical"
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+def _classify_method(config: dict) -> str:
+    """Return a compact label for the compression strategy."""
+    if not config:
         return "other"
-    df['method'] = df.index
-    df['method_class'] = df.index.map(extract_method_class)
-    
-    # Clean column names (remove spaces, handle special chars)
+    if config.get("type") == "baseline":
+        return "baseline"
+
+    strategies = config.get("strategies") or []
+    if not strategies:
+        return "other"
+
+    strategy = strategies[0]
+    strategy_type = (strategy or {}).get("type")
+    strategy_cfg = (strategy or {}).get("config", {})
+
+    if strategy_type == "attention_pruning":
+        return "attention"
+
+    if strategy_type == "idf_pruning":
+        mode = strategy_cfg.get("mode")
+        if mode == "global":
+            return "idf-global"
+        if mode == "document":
+            return "idf-doc"
+        return "idf"
+
+    if strategy_type == "pooling":
+        clustering = strategy_cfg.get("clustering_method")
+        if clustering:
+            return f"pooling-{clustering}"
+        return "pooling"
+
+    return strategy_type or "other"
+
+
+def _load_results(jsonl_path: str) -> pd.DataFrame:
+    """Read compression experiment results from the jsonl file."""
+    rows = []
+    with open(jsonl_path, "r", encoding="utf-8") as infile:
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("type") != "result":
+                continue
+
+            config = entry.get("config", {})
+            metrics = entry.get("metrics", {}) or {}
+            row = {
+                "method": entry.get("config_name"),
+                "method_class": _classify_method(config),
+                "avg_tokens_per_document": entry.get("avg_tokens_per_doc"),
+                "token_count": entry.get("token_count"),
+            }
+            row.update(metrics)
+            rows.append(row)
+
+    if not rows:
+        raise ValueError(f"No result entries found in {jsonl_path}")
+
+    df = pd.DataFrame(rows)
     df.columns = df.columns.str.strip()
-    
+    return df
+
+def _load_metadata(jsonl_path: str) -> dict:
+    """Read compression experiment metadata from the jsonl file."""
+    with open(jsonl_path, "r", encoding="utf-8") as infile:
+        for line in infile:
+            line = line.strip()
+            entry = json.loads(line)
+            if entry.get("type") == "metadata":
+                return entry
+    raise ValueError(f"No metadata entry found in {jsonl_path}")
+
+def plot_results(results_path, metric, output_dir):
+    """Plot avg_tokens_per_document vs metric, grouped by method."""
+    df = _load_results(results_path)
+    metadata = _load_metadata(results_path)
+
+    dataset_name = metadata.get("dataset_name")
+    model_name = metadata.get("model_name")
+    model_name_sanitized = model_name.replace("/", "_")
     # Verify columns exist
     if 'avg_tokens_per_document' not in df.columns:
         raise ValueError(f"Column 'avg_tokens_per_document' not found. Available columns: {df.columns.tolist()}")
@@ -82,7 +141,7 @@ def plot_results(tsv_path, dataset_name, metric, model='GTE-ModernColBERT-v1', o
     plot_dir.mkdir(parents=True, exist_ok=True)
     
     # Save plot
-    output_path = plot_dir / f'{model}_{dataset_name}_{metric}_plot.png'
+    output_path = plot_dir / f'{model_name_sanitized}_{dataset_name}_{metric}_plot.png'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to {output_path}")
     
@@ -92,13 +151,11 @@ def plot_results(tsv_path, dataset_name, metric, model='GTE-ModernColBERT-v1', o
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Plot compression experiment results')
-    parser.add_argument('--results_path', type=str, help='Path to results tsv file')
+    parser.add_argument('--results_path', type=str, help='Path to results jsonl file')
     parser.add_argument('--output_dir', type=str, help='Path to output directory')
-    parser.add_argument('--dataset_name', type=str, help='Dataset name')
     parser.add_argument('--metric', type=str, default='ndcg@10', help='Metric to plot (e.g., map, ndcg@10)')
-    parser.add_argument('--model', type=str, default='GTE-ModernColBERT-v1', help='Model name (default: GTE-ModernColBERT-v1)')
     
     args = parser.parse_args()
     
-    plot_results(args.results_path, args.dataset_name, args.metric, args.model, args.output_dir)
+    plot_results(args.results_path, args.metric, args.output_dir)
 
