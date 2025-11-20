@@ -10,6 +10,8 @@ from .compression import (
     IDFPruningStrategy,
     PoolingConfig,
     PoolingStrategy,
+    AttentionPruningConfig,
+    AttentionPruningStrategy,
     validate_compression_artifact_shape,
 )
 from .Dense import Dense
@@ -25,5 +27,7 @@ __all__ = [
     "IDFPruningStrategy",
     "PoolingConfig",
     "PoolingStrategy",
+    "AttentionPruningConfig",
+    "AttentionPruningStrategy",
     "validate_compression_artifact_shape",
 ]
