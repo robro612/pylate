@@ -22,6 +22,8 @@ from pylate.models.compression import (
     PoolingStrategy,
     AttentionPruningConfig,
     AttentionPruningStrategy,
+    CompactorPruningConfig,
+    CompactorPruningStrategy,
 )
 
 # Query length mapping for different datasets
@@ -253,7 +255,7 @@ def load_configs_from_jsonl(jsonl_path: Path, model: ColBERT) -> list[Compressio
     return configs
 
 
-def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
+def create_default_configs(model: ColBERT, dataset_name: str) -> list[CompressionConfig | None]:
     """
     Create default compression configurations matching beir_dataset.py.
     
@@ -267,70 +269,95 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
     list[CompressionConfig | None]
         List of compression configs (None for baseline)
     """
-    configs = [None]  # Baseline (no compression)
+    configs = []
+    # configs.append(None)  # Baseline (no compression)
+
+    ks = {
+        "trec-covid" :[10, 20, 40, 80, 120],
+        "fiqa" :[5, 10, 15, 25, 40, 60],
+        "nfcorpus" : [10, 20, 40, 80, 120, 180],
+    }.get(dataset_name, [10, 20, 40, 80])
+
     # attention score pruning configs
-    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
-        attention_config = AttentionPruningConfig(
-            top_k=k,
-            protected_tokens=1,
-            track_pruned_tokens=False,
-        )
-        strategy = AttentionPruningStrategy(attention_config)
-        config = CompressionConfig(
-            strategies=[strategy],
-            description=f"Attention score pruning k={k}",
-        )
-        configs.append(config)
-    
-    # Global IDF pruning configs
-    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
-        pruning_config = IDFPruningConfig(
-            mode="global",
-            top_k=k,
-            protected_tokens=1,
-            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
-            use_tfidf=False,
-            track_pruned_tokens=False,
-        )
-        strategy = IDFPruningStrategy(pruning_config)
-        config = CompressionConfig(
-            strategies=[strategy],
-            description=f"Global IDF pruning k={k}",
-        )
-        configs.append(config)
-    
-    # Document-wise IDF pruning configs
-    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
-        pruning_config = IDFPruningConfig(
-            mode="document",
-            top_k=k,
-            protected_tokens=1,
-            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
-            use_tfidf=False,
-            track_pruned_tokens=False,
-        )
-        strategy = IDFPruningStrategy(pruning_config)
-        config = CompressionConfig(
-            strategies=[strategy],
-            description=f"Doc-wise IDF pruning k={k}",
-        )
-        configs.append(config)
-    
-    # Pooling configs
-    for method in ["spherical", "hierarchical"]:
-        for k in [2, 3, 4, 5]:
-            pooling_config = PoolingConfig(
-                pool_factor=k,
+    for lambda_mix in [0.15, 0.3, 0.45, 0.6, 0.75]:
+        for k in ks:
+            compactor_config = CompactorPruningConfig(
+                top_k=k,
                 protected_tokens=1,
-                clustering_method=method,
-                show_progress_bar=True,
+                sketch_dim=None,
+                attention_head_reduction="sum",
+                leverage_head_reduction="sum",
+                lambda_mix=lambda_mix,
             )
-            strategy = PoolingStrategy(pooling_config)
+            strategy = CompactorPruningStrategy(compactor_config)
             config = CompressionConfig(
                 strategies=[strategy],
-                description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1",
+                description=f"Compactor pruning k={k} lambda_mix={lambda_mix} head_reductions=sum",
             )
             configs.append(config)
+    # for k in ks:
+    #     attention_config = AttentionPruningConfig(
+    #         top_k=k,
+    #         protected_tokens=1,
+    #         head_reduction="max",
+    #         track_pruned_tokens=False,
+    #     )
+    #     strategy = AttentionPruningStrategy(attention_config)
+    #     config = CompressionConfig(
+    #         strategies=[strategy],
+    #         description=f"Attention score pruning k={k} head_reduction=max",
+    #     )
+    #     configs.append(config)
+    
+    # # Global IDF pruning configs
+    # for k in ks:
+    #     pruning_config = IDFPruningConfig(
+    #         mode="global",
+    #         top_k=k,
+    #         protected_tokens=1,
+    #         ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
+    #         use_tfidf=False,
+    #         track_pruned_tokens=False,
+    #     )
+    #     strategy = IDFPruningStrategy(pruning_config)
+    #     config = CompressionConfig(
+    #         strategies=[strategy],
+    #         description=f"Global IDF pruning k={k}",
+    #     )
+    #     configs.append(config)
+    
+    # # Document-wise IDF pruning configs
+    # for k in ks:
+    #     pruning_config = IDFPruningConfig(
+    #         mode="document",
+    #         top_k=k,
+    #         protected_tokens=1,
+    #         ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
+    #         use_tfidf=False,
+    #         track_pruned_tokens=False,
+    #     )
+    #     strategy = IDFPruningStrategy(pruning_config)
+    #     config = CompressionConfig(
+    #         strategies=[strategy],
+    #         description=f"Doc-wise IDF pruning k={k}",
+    #     )
+    #     configs.append(config)
+    
+    # # Pooling configs
+    # for method in ["spherical", "hierarchical"]:
+    #     for k in [2, 3, 4, 5]:
+    #         pooling_config = PoolingConfig(
+    #             pool_factor=k,
+    #             protected_tokens=1,
+    #             clustering_method=method,
+    #             show_progress_bar=True,
+    #         )
+    #         strategy = PoolingStrategy(pooling_config)
+    #         config = CompressionConfig(
+    #             strategies=[strategy],
+    #             description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1",
+    #         )
+    #         configs.append(config)
     
     return configs
 
@@ -712,8 +739,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1000,
-        help="Batch size for encoding (default: 1000)",
+        default=2400,
+        help="Batch size for encoding (default: 2400)",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="Number of workers for parallel compression (default: 8)",
     )
     parser.add_argument(
         "--metrics",
@@ -727,6 +760,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save ranx runfiles for each configuration (default: False)",
     )
+    
     return parser.parse_args()
 
 
@@ -766,7 +800,7 @@ def main() -> None:
         configs = load_configs_from_jsonl(Path(args.configs_file), model)
         print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
     else:
-        configs = create_default_configs(model)
+        configs = create_default_configs(model, args.dataset_name)
         print(f"✓ Created {len(configs)} default configs")
     
     print("\nConfigurations:")
@@ -775,6 +809,11 @@ def main() -> None:
             print(f"  [{i}] Baseline (no compression)")
         else:
             print(f"  [{i}] {config.description}")
+
+    compressors = [config.create_compressor() for config in configs]
+    artifacts_with_args = [compressor.strategies[0].get_artifact_requirements() for compressor in compressors]
+    artifact_flags = {artifact: arg if arg else True  for artifact_with_arg in artifacts_with_args for artifact, arg in artifact_with_arg.items()}
+    print(artifact_flags)
 
     # Encode documents once with artifacts (input_ids needed for IDF pruning)
     print("\n" + "=" * 80)
@@ -787,7 +826,7 @@ def main() -> None:
         is_query=False,
         show_progress_bar=True,
         convert_to_tensor=True,
-        return_extra_artifacts={"input_ids": True, "attention_scores": True},
+        return_extra_artifacts=artifact_flags,
     )
     encoding_time = time.time() - encoding_start
     print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
@@ -801,7 +840,7 @@ def main() -> None:
         sentences=list(queries.values()),
         is_query=True,
         show_progress_bar=True,
-        batch_size=512,
+        batch_size=args.batch_size,
         convert_to_tensor=True,
     )
     query_encoding_time = time.time() - query_encoding_start
@@ -842,7 +881,7 @@ def main() -> None:
                 embeddings=documents_embeddings,
                 artifacts=artifacts,
                 batch_size=args.batch_size,
-                num_workers=8,
+                num_workers=args.num_workers,
                 show_progress=True,
             )
         

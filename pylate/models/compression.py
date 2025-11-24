@@ -5,10 +5,11 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Iterable, Literal, Optional, Union, Collection
+from typing import Any, Callable, Iterable, Literal, Optional, Union, Collection
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
+from torch import nn
 import numpy as np
 from scipy.cluster import hierarchy
 from tqdm.autonotebook import tqdm
@@ -180,6 +181,9 @@ class AttentionPruningConfig(CompressionStrategyConfigBase):
     threshold
         Prune tokens whose attention score is < threshold. Mutually exclusive with ``top_k``.
         Lower attention = less important for the representation.
+    head_reduction
+        Reduction function for aggregating attention scores over heads: "sum" or "max".
+        This parameter documents how attention scores were computed.
     protected_tokens
         Number of leading tokens to always retain (CLS / prefixes).
     track_pruned_tokens
@@ -198,6 +202,7 @@ class AttentionPruningConfig(CompressionStrategyConfigBase):
     track_pruned_tokens: bool = False
     show_progress_bar: bool = False
     normalize_scores: bool = False
+    head_reduction: Literal["sum", "max"] = "sum"
 
     def __post_init__(self) -> None:
         if self.top_k is None and self.threshold is None:
@@ -227,11 +232,100 @@ class AttentionPruningConfig(CompressionStrategyConfigBase):
             "track_pruned_tokens": self.track_pruned_tokens,
             "show_progress_bar": self.show_progress_bar,
             "normalize_scores": self.normalize_scores,
+            "head_reduction": self.head_reduction,
         }
     
     @property
     def strategy_type(self) -> str:
         return "attention_pruning"
+
+
+@dataclass
+class CompactorPruningConfig(CompressionStrategyConfigBase):
+    """
+    Configuration for Compactor-based pruning that combines attention and leverage scores.
+
+    Prunes tokens with low combined scores, where the score is computed as:
+    (a - a_avg) / std(a) + lambda * (o - o_avg) / std(o)
+    where a is attention scores and o is leverage scores.
+
+    Attributes
+    ----------
+    top_k
+        Number of tokens (after the protected prefix) to prune/remove. Mutually exclusive with ``threshold``.
+        Removes tokens with the **lowest combined scores**.
+        This is the number of token **occurrences** to prune per document.
+    threshold
+        Prune tokens whose combined score is < threshold. Mutually exclusive with ``top_k``.
+        Lower combined score = less important for the representation.
+    protected_tokens
+        Number of leading tokens to always retain (CLS / prefixes).
+    lambda_mix
+        Mixing parameter for combining attention and leverage scores. Defaults to 1.0.
+    sketch_dim
+        Optional sketch dimension for leverage scores. If None, uses full dimension.
+        This parameter is used when computing leverage scores (not in pruning itself).
+    attention_head_reduction
+        Reduction function for aggregating attention scores over heads: "sum" or "max".
+        This parameter documents how attention scores were computed.
+    leverage_head_reduction
+        Reduction function for aggregating leverage scores over heads: "sum" or "max".
+        This parameter documents how leverage scores were computed.
+    track_pruned_tokens
+        If True, tracks which tokens were pruned from each document. Access via
+        ``strategy.get_pruned_tokens()`` after encoding. Defaults to False.
+    show_progress_bar
+        If True, shows a progress bar during pruning. Defaults to False.
+    """
+
+    top_k: Optional[int] = None
+    threshold: Optional[float] = None
+    protected_tokens: int = 1
+    lambda_mix: float = 1.0
+    sketch_dim: Optional[int] = None
+    attention_head_reduction: Literal["sum", "max"] = "sum"
+    leverage_head_reduction: Literal["sum", "max"] = "sum"
+    track_pruned_tokens: bool = False
+    show_progress_bar: bool = False
+
+    def __post_init__(self) -> None:
+        if self.top_k is None and self.threshold is None:
+            raise ValueError("Compactor pruning requires either `top_k` or `threshold`.")
+        if self.top_k is not None and self.threshold is not None:
+            raise ValueError(
+                "Provide only one of `top_k` or `threshold` for Compactor pruning."
+            )
+        if self.top_k is not None and self.top_k <= 0:
+            raise ValueError("`top_k` must be a positive integer.")
+        if self.threshold is not None and not math.isfinite(self.threshold):
+            raise ValueError("`threshold` must be a finite float.")
+        if self.lambda_mix < 0:
+            raise ValueError("`lambda_mix` must be non-negative.")
+
+    def serialize(self) -> dict:
+        """
+        Serialize this configuration to a JSON-compatible dictionary.
+
+        Returns
+        -------
+        dict
+            JSON-serializable dictionary representation
+        """
+        return {
+            "top_k": self.top_k,
+            "threshold": self.threshold,
+            "protected_tokens": self.protected_tokens,
+            "lambda_mix": self.lambda_mix,
+            "sketch_dim": self.sketch_dim,
+            "attention_head_reduction": self.attention_head_reduction,
+            "leverage_head_reduction": self.leverage_head_reduction,
+            "track_pruned_tokens": self.track_pruned_tokens,
+            "show_progress_bar": self.show_progress_bar,
+        }
+    
+    @property
+    def strategy_type(self) -> str:
+        return "compactor_pruning"
 
 
 @dataclass
@@ -275,6 +369,29 @@ class CompressionStrategy(ABC):
     """
     
     required_artifacts: list[str] = []  # Class variable: list of artifact keys required by this strategy
+    
+    def get_artifact_requirements(self) -> dict[str, dict[str, Any]]:
+        """
+        Get dictionary of artifact requirements with their hook creation arguments.
+        
+        This method returns a dictionary mapping artifact names to their hook creation arguments.
+        For artifacts that don't need special arguments (like input_ids), an empty dict is returned.
+        
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Dictionary mapping artifact names to their hook creation arguments.
+            For example:
+            - "attention_scores" -> {"head_reduction": "sum"}
+            - "leverage_scores" -> {"sketch_dim": 64, "head_reduction": "sum"}
+            - "input_ids" -> {} (no arguments needed)
+        
+        Notes
+        -----
+        Default implementation returns empty dicts for all required artifacts.
+        Subclasses should override this if they need specific hook arguments.
+        """
+        return {artifact: {} for artifact in self.required_artifacts}
     
     @abstractmethod
     def compress(
@@ -1080,7 +1197,7 @@ class AttentionPruningStrategy(CompressionStrategy):
     def name(self) -> str:
         """Name of this compression strategy."""
         criterion_str = f"topk-{self.config.top_k}" if self.config.top_k else f"threshold-{self.config.threshold}"
-        return f"attention_pruning_{criterion_str}"
+        return f"attention_pruning_head_reduction-{self.config.head_reduction}_{criterion_str}"
     
     @property
     def strategy_type(self) -> str:
@@ -1124,8 +1241,25 @@ class AttentionPruningStrategy(CompressionStrategy):
             track_pruned_tokens=config_data.get("track_pruned_tokens", False),
             show_progress_bar=config_data.get("show_progress_bar", False),
             normalize_scores=config_data.get("normalize_scores", False),
+            head_reduction=config_data.get("head_reduction", "sum"),
         )
         return cls(config)
+
+    def get_artifact_requirements(self) -> dict[str, dict[str, Any]]:
+        """
+        Get artifact requirements with hook creation arguments.
+        
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Dictionary mapping artifact names to their hook creation arguments:
+            - "attention_scores" -> {"head_reduction": self.config.head_reduction}
+        """
+        return {
+            "attention_scores": {
+                "head_reduction": self.config.head_reduction,
+            },
+        }
     
     def get_pruned_tokens(self) -> Optional[list[list[int]]]:
         """
@@ -1403,6 +1537,499 @@ class AttentionPruningStrategy(CompressionStrategy):
             List of embedding tensors (one per document)
         artifacts
             Dictionary of artifacts. Must contain "attention_scores" as a list of tensors.
+        batch_size
+            Number of documents to process in each batch. Defaults to 100.
+        num_workers
+            Number of worker threads to use. If None, defaults to min(batch_size, number of documents, 8).
+        show_progress
+            If True, shows a progress bar during parallel compression. Defaults to False.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (pruned_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with pruned embeddings.
+            Metadata artifacts are passed through unchanged.
+        """
+        # Initialize pruned tokens tracking if requested
+        if self.config.track_pruned_tokens:
+            self._pruned_tokens = [None] * len(embeddings)
+        else:
+            self._pruned_tokens = None
+        
+        # Call the base class compress_parallel, which will call compress() on each batch
+        result_emb, result_art = super().compress_parallel(embeddings, artifacts, batch_size, num_workers, show_progress)
+        
+        # If tracking pruned tokens, ensure all were collected
+        if self.config.track_pruned_tokens and self._pruned_tokens is not None:
+            if None in self._pruned_tokens:
+                raise RuntimeError("Some pruned tokens were not collected during parallel compression")
+        
+        return result_emb, result_art
+
+
+class CompactorPruningStrategy(CompressionStrategy):
+    """
+    Compactor-based pruning strategy that combines attention and leverage scores.
+    
+    This strategy uses both attention scores and leverage scores from the model to identify
+    and prune tokens. The combined score is computed as:
+    (a - a_avg) / std(a) + lambda * (o - o_avg) / std(o)
+    where a is attention scores and o is leverage scores.
+    """
+    
+    required_artifacts: list[str] = ["attention_scores", "leverage_scores"]  # Requires both scores
+    
+    def __init__(self, config: CompactorPruningConfig):
+        """
+        Initialize the Compactor pruning strategy.
+        
+        Parameters
+        ----------
+        config
+            Compactor pruning configuration specifying top_k/threshold, lambda_mix, etc.
+        """
+        self.config = config
+        self._pruned_tokens: Optional[list[list[int]]] = None  # Track pruned tokens if requested
+    
+    @property
+    def name(self) -> str:
+        """Name of this compression strategy."""
+        criterion_str = f"topk-{self.config.top_k}" if self.config.top_k else f"threshold-{self.config.threshold}"
+        return f"compactor_pruning_lambda-{self.config.lambda_mix}_head_reduction-{self.config.attention_head_reduction}_sketch_dim-{self.config.sketch_dim}_{criterion_str}"
+    
+    @property
+    def strategy_type(self) -> str:
+        """Strategy type identifier for serialization."""
+        return "compactor_pruning"
+    
+    def serialize(self) -> dict:
+        """
+        Serialize this strategy to a JSON-compatible dictionary.
+        
+        Returns
+        -------
+        dict
+            JSON-serializable dictionary representation
+        """
+        return {
+            "type": self.strategy_type,
+            "config": self.config.serialize(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "CompactorPruningStrategy":
+        """
+        Create a strategy instance from a serialized dictionary.
+        
+        Parameters
+        ----------
+        data
+            Dictionary containing serialized strategy data
+            
+        Returns
+        -------
+        CompactorPruningStrategy
+            Deserialized strategy instance
+        """
+        config_data = data.get("config", {})
+        config = CompactorPruningConfig(
+            top_k=config_data.get("top_k"),
+            threshold=config_data.get("threshold"),
+            protected_tokens=config_data.get("protected_tokens", 1),
+            lambda_mix=config_data.get("lambda_mix", 0.5),
+            sketch_dim=config_data.get("sketch_dim"),
+            attention_head_reduction=config_data.get("attention_head_reduction", "sum"),
+            leverage_head_reduction=config_data.get("leverage_head_reduction", "sum"),
+            track_pruned_tokens=config_data.get("track_pruned_tokens", False),
+            show_progress_bar=config_data.get("show_progress_bar", True),
+        )
+        return cls(config)
+    
+    def get_artifact_requirements(self) -> dict[str, dict[str, Any]]:
+        """
+        Get artifact requirements with hook creation arguments.
+        
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Dictionary mapping artifact names to their hook creation arguments:
+            - "attention_scores" -> {"head_reduction": self.config.attention_head_reduction}
+            - "leverage_scores" -> {"sketch_dim": self.config.sketch_dim, "head_reduction": self.config.leverage_head_reduction}
+        """
+        return {
+            "attention_scores": {
+                "head_reduction": self.config.attention_head_reduction,
+            },
+            "leverage_scores": {
+                "sketch_dim": self.config.sketch_dim,
+                "head_reduction": self.config.leverage_head_reduction,
+            },
+        }
+    
+    def get_pruned_tokens(self) -> Optional[list[list[int]]]:
+        """
+        Get the list of pruned tokens for each document.
+        
+        Returns
+        -------
+        Optional[list[list[int]]]
+            List of pruned token IDs per document, or None if tracking is disabled.
+            Only available if track_pruned_tokens=True was set in config.
+        """
+        return self._pruned_tokens
+    
+    def _compute_combined_scores(
+        self,
+        attention_scores: torch.Tensor,
+        leverage_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute combined scores from attention and leverage scores.
+        
+        The formula is: (a - a_avg) / std(a) + lambda * (o - o_avg) / std(o)
+        where a is attention scores and o is leverage scores.
+        
+        Parameters
+        ----------
+        attention_scores
+            Attention scores tensor, shape (seq_len,)
+        leverage_scores
+            Leverage scores tensor, shape (seq_len,)
+        
+        Returns
+        -------
+        torch.Tensor
+            Combined scores, shape (seq_len,)
+        """
+        # Normalize attention scores: (a - a_avg) / std(a)
+        a_mean = attention_scores.mean()
+        a_std = attention_scores.std()
+        if a_std > 0:
+            normalized_attention = (attention_scores - a_mean) / a_std
+        else:
+            # If std is 0, all values are the same, so normalized scores are 0
+            normalized_attention = torch.zeros_like(attention_scores)
+        
+        # Normalize leverage scores: (o - o_avg) / std(o)
+        o_mean = leverage_scores.mean()
+        o_std = leverage_scores.std()
+        if o_std > 0:
+            normalized_leverage = (leverage_scores - o_mean) / o_std
+        else:
+            # If std is 0, all values are the same, so normalized scores are 0
+            normalized_leverage = torch.zeros_like(leverage_scores)
+        
+        # Combine: normalized_attention + lambda * normalized_leverage
+        combined_scores = normalized_attention + self.config.lambda_mix * normalized_leverage
+        
+        return combined_scores
+    
+    def _get_positions_to_prune(
+        self,
+        doc_attention_scores: torch.Tensor,
+        doc_leverage_scores: torch.Tensor,
+        doc_input_ids: torch.Tensor,
+    ) -> set[int]:
+        """
+        Identify token positions to prune for a single document based on combined scores.
+        
+        Parameters
+        ----------
+        doc_attention_scores
+            Attention scores tensor for this document, shape (seq_len,)
+        doc_leverage_scores
+            Leverage scores tensor for this document, shape (seq_len,)
+        doc_input_ids
+            Input IDs tensor for this document, shape (seq_len,)
+        
+        Returns
+        -------
+        set[int]
+            Set of token positions (indices) to prune in this document
+        """
+        doc_tokens = doc_input_ids.cpu().tolist()
+        attention_scores = doc_attention_scores.cpu()
+        leverage_scores = doc_leverage_scores.cpu()
+        
+        # Compute combined scores
+        combined_scores = self._compute_combined_scores(attention_scores, leverage_scores)
+        
+        # Score each token occurrence (after protected tokens)
+        token_scores: list[tuple[int, float]] = []  # (position, score)
+        
+        for pos in range(self.config.protected_tokens, len(doc_tokens)):
+            score = combined_scores[pos].item()
+            token_scores.append((pos, score))
+        
+        # Select tokens to prune based on top_k or threshold
+        if self.config.top_k is not None:
+            # Sort by score (ascending) and take top_k lowest
+            sorted_tokens = sorted(token_scores, key=lambda x: x[1])
+            # Take min(top_k, len(sorted_tokens)) to handle cases where we have fewer candidates than top_k
+            num_to_prune = min(self.config.top_k, len(sorted_tokens))
+            positions_to_prune = {pos for pos, _ in sorted_tokens[:num_to_prune]}
+        else:
+            # Prune tokens with score < threshold
+            positions_to_prune = {
+                pos for pos, score in token_scores
+                if score < self.config.threshold
+            }
+        
+        return positions_to_prune
+    
+    def compress(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply Compactor-based pruning to embeddings and update artifacts.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Must contain "attention_scores" and "leverage_scores" as lists of tensors.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (pruned_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with pruned embeddings.
+            Metadata artifacts are passed through unchanged.
+        
+        Raises
+        ------
+        ValueError
+            If attention_scores or leverage_scores artifacts are missing
+        """
+        # Get attention_scores and leverage_scores from artifacts
+        if "attention_scores" not in artifacts:
+            raise ValueError(
+                "CompactorPruningStrategy requires 'attention_scores' artifact. "
+                "Ensure attention_scores are provided when encoding."
+            )
+        if "leverage_scores" not in artifacts:
+            raise ValueError(
+                "CompactorPruningStrategy requires 'leverage_scores' artifact. "
+                "Ensure leverage_scores are provided when encoding."
+            )
+        
+        attention_scores = artifacts["attention_scores"]
+        leverage_scores = artifacts["leverage_scores"]
+        
+        if not isinstance(attention_scores, list):
+            raise ValueError("attention_scores artifact must be a list of tensors")
+        if not isinstance(leverage_scores, list):
+            raise ValueError("leverage_scores artifact must be a list of tensors")
+        
+        if len(attention_scores) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(attention_scores)} attention_scores but {len(embeddings)} embeddings"
+            )
+        if len(leverage_scores) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(leverage_scores)} leverage_scores but {len(embeddings)} embeddings"
+            )
+        
+        # Validate all scores are tensors
+        for idx, doc_attention in enumerate(attention_scores):
+            if not isinstance(doc_attention, torch.Tensor):
+                raise ValueError(f"attention_scores[{idx}] must be a torch.Tensor, got {type(doc_attention)}")
+            if len(doc_attention.shape) != 1:
+                raise ValueError(f"attention_scores[{idx}] must be 1D, got shape {doc_attention.shape}")
+        
+        for idx, doc_leverage in enumerate(leverage_scores):
+            if not isinstance(doc_leverage, torch.Tensor):
+                raise ValueError(f"leverage_scores[{idx}] must be a torch.Tensor, got {type(doc_leverage)}")
+            if len(doc_leverage.shape) != 1:
+                raise ValueError(f"leverage_scores[{idx}] must be 1D, got shape {doc_leverage.shape}")
+        
+        # Get input_ids if available (for tracking pruned tokens)
+        input_ids = artifacts.get("input_ids")
+        if input_ids is not None and not isinstance(input_ids, list):
+            raise ValueError("input_ids artifact must be a list of tensors if provided")
+        if input_ids is not None and len(input_ids) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(input_ids)} input_ids but {len(embeddings)} embeddings"
+            )
+        
+        # Initialize pruned tokens tracking if requested
+        # Check if we're in parallel mode (pruned_tokens already pre-allocated)
+        start_idx = artifacts.get("_batch_start_idx", 0)
+        is_parallel_mode = (
+            self.config.track_pruned_tokens and 
+            self._pruned_tokens is not None and 
+            isinstance(self._pruned_tokens, list) and
+            len(self._pruned_tokens) > len(embeddings)  # Pre-allocated for parallel
+        )
+        
+        if self.config.track_pruned_tokens and not is_parallel_mode:
+            # Sequential mode: start fresh
+            self._pruned_tokens = []
+        elif not self.config.track_pruned_tokens:
+            self._pruned_tokens = None
+        
+        # Prune tokens based on combined scores
+        pruned_embeddings = []
+        updated_attention_scores = []
+        updated_leverage_scores = []
+        updated_input_ids = []
+        
+        criterion_str = f"top_k={self.config.top_k}" if self.config.top_k else f"threshold={self.config.threshold}"
+        iterator = tqdm(
+            enumerate(zip(embeddings, attention_scores, leverage_scores)),
+            desc=f"Compactor pruning ({criterion_str})",
+            total=len(embeddings),
+            disable=not self.config.show_progress_bar,
+        )
+        
+        for batch_doc_idx, (doc_embeddings, doc_attention_scores, doc_leverage_scores) in iterator:
+            # Get input_ids for this document if available
+            doc_input_ids = input_ids[batch_doc_idx] if input_ids is not None else None
+            
+            # Ensure scores match embedding length
+            if doc_attention_scores.shape[0] != doc_embeddings.shape[0]:
+                raise ValueError(
+                    f"Document {start_idx + batch_doc_idx}: attention_scores length "
+                    f"({doc_attention_scores.shape[0]}) does not match embedding length "
+                    f"({doc_embeddings.shape[0]})"
+                )
+            if doc_leverage_scores.shape[0] != doc_embeddings.shape[0]:
+                raise ValueError(
+                    f"Document {start_idx + batch_doc_idx}: leverage_scores length "
+                    f"({doc_leverage_scores.shape[0]}) does not match embedding length "
+                    f"({doc_embeddings.shape[0]})"
+                )
+            
+            # Get positions to prune
+            if doc_input_ids is not None:
+                positions_to_prune = self._get_positions_to_prune(
+                    doc_attention_scores, doc_leverage_scores, doc_input_ids
+                )
+            else:
+                # If no input_ids, we can still prune based on scores alone
+                # Create a dummy input_ids tensor for the function
+                dummy_input_ids = torch.arange(doc_attention_scores.shape[0], device=doc_attention_scores.device)
+                positions_to_prune = self._get_positions_to_prune(
+                    doc_attention_scores, doc_leverage_scores, dummy_input_ids
+                )
+            
+            # Create mask: keep tokens not in positions_to_prune
+            keep_mask = []
+            pruned_token_ids = []
+            
+            for pos in range(doc_embeddings.shape[0]):
+                if pos < self.config.protected_tokens:
+                    # Always keep protected tokens
+                    keep_mask.append(True)
+                elif pos in positions_to_prune:
+                    # Prune this token
+                    keep_mask.append(False)
+                    if self.config.track_pruned_tokens and doc_input_ids is not None:
+                        pruned_token_ids.append(doc_input_ids[pos].item())
+                else:
+                    # Keep this token
+                    keep_mask.append(True)
+            
+            # Apply mask to embeddings and scores
+            keep_mask_tensor = torch.tensor(keep_mask, device=doc_embeddings.device, dtype=torch.bool)
+            pruned_doc_embeddings = doc_embeddings[keep_mask_tensor]
+            pruned_doc_attention = doc_attention_scores[keep_mask_tensor]
+            pruned_doc_leverage = doc_leverage_scores[keep_mask_tensor]
+            
+            pruned_embeddings.append(pruned_doc_embeddings)
+            updated_attention_scores.append(pruned_doc_attention)
+            updated_leverage_scores.append(pruned_doc_leverage)
+            
+            # Update input_ids if available
+            if doc_input_ids is not None:
+                pruned_doc_tokens = doc_input_ids[keep_mask_tensor]
+                updated_input_ids.append(pruned_doc_tokens)
+            
+            if self.config.track_pruned_tokens:
+                if is_parallel_mode:
+                    # Parallel mode: set at correct index
+                    self._pruned_tokens[start_idx + batch_doc_idx] = pruned_token_ids
+                else:
+                    # Sequential mode: append
+                    self._pruned_tokens.append(pruned_token_ids)
+        
+        # Update artifacts
+        updated_artifacts = {}
+        for artifact_name, artifact_value in artifacts.items():
+            if artifact_name == "attention_scores":
+                # Update attention_scores to match pruned embeddings
+                updated_artifacts[artifact_name] = updated_attention_scores
+            elif artifact_name == "leverage_scores":
+                # Update leverage_scores to match pruned embeddings
+                updated_artifacts[artifact_name] = updated_leverage_scores
+            elif artifact_name == "input_ids" and input_ids is not None:
+                # Update input_ids to match pruned embeddings
+                updated_artifacts[artifact_name] = updated_input_ids
+            elif isinstance(artifact_value, list):
+                # Shape-matched artifact: apply same pruning mask
+                pruned_artifacts = []
+                for doc_idx, artifact_tokens in enumerate(artifact_value):
+                    doc_attention_scores = attention_scores[doc_idx]
+                    doc_leverage_scores = leverage_scores[doc_idx]
+                    doc_input_ids_for_mask = input_ids[doc_idx] if input_ids is not None else None
+                    
+                    # Get positions to prune (same logic as above)
+                    if doc_input_ids_for_mask is not None:
+                        positions_to_prune = self._get_positions_to_prune(
+                            doc_attention_scores, doc_leverage_scores, doc_input_ids_for_mask
+                        )
+                    else:
+                        dummy_input_ids = torch.arange(doc_attention_scores.shape[0], device=doc_attention_scores.device)
+                        positions_to_prune = self._get_positions_to_prune(
+                            doc_attention_scores, doc_leverage_scores, dummy_input_ids
+                        )
+                    
+                    # Create keep mask
+                    keep_mask = []
+                    for pos in range(len(artifact_tokens)):
+                        if pos < self.config.protected_tokens:
+                            keep_mask.append(True)
+                        elif pos in positions_to_prune:
+                            keep_mask.append(False)
+                        else:
+                            keep_mask.append(True)
+                    
+                    # Apply mask to artifact
+                    keep_mask_tensor = torch.tensor(keep_mask, device=artifact_tokens.device, dtype=torch.bool)
+                    pruned_artifact = artifact_tokens[keep_mask_tensor]
+                    pruned_artifacts.append(pruned_artifact)
+                
+                updated_artifacts[artifact_name] = pruned_artifacts
+            else:
+                # Metadata artifact: pass through unchanged
+                updated_artifacts[artifact_name] = artifact_value
+        
+        return pruned_embeddings, updated_artifacts
+    
+    def compress_parallel(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+        batch_size: int = 100,
+        num_workers: Optional[int] = None,
+        show_progress: bool = False,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply Compactor-based pruning in parallel.
+        
+        This method parallelizes the per-document pruning operations using the base
+        class parallel implementation.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Must contain "attention_scores" and "leverage_scores" as lists of tensors.
         batch_size
             Number of documents to process in each batch. Defaults to 100.
         num_workers
@@ -1934,6 +2561,7 @@ class CompressionConfig:
         strategy_classes = {
             "idf_pruning": IDFPruningStrategy,
             "attention_pruning": AttentionPruningStrategy,
+            "compactor_pruning": CompactorPruningStrategy,
             "pooling": PoolingStrategy,
         }
         
@@ -1983,6 +2611,38 @@ class Compressor:
         for strategy in self.strategies:
             required.update(strategy.required_artifacts)
         return required
+    
+    def get_required_artifacts_with_args(self) -> dict[str, dict[str, Any]]:
+        """
+        Get dictionary of all required artifacts with their hook creation arguments.
+        
+        This method aggregates artifact requirements from all strategies, collecting
+        the hook creation arguments needed for each artifact.
+        
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Dictionary mapping artifact names to their hook creation arguments.
+            For example:
+            - "attention_scores" -> {"head_reduction": "sum"}
+            - "leverage_scores" -> {"sketch_dim": 64, "head_reduction": "sum"}
+            - "input_ids" -> {} (no arguments needed)
+        
+        Notes
+        -----
+        If multiple strategies require the same artifact with different arguments,
+        the arguments from the last strategy requiring it will be used.
+        Each strategy specifies its requirements via get_artifact_requirements().
+        """
+        artifacts_with_args: dict[str, dict[str, Any]] = {}
+        
+        for strategy in self.strategies:
+            strategy_requirements = strategy.get_artifact_requirements()
+            for artifact_name, args in strategy_requirements.items():
+                # Store the args (will overwrite if multiple strategies need same artifact)
+                artifacts_with_args[artifact_name] = args
+        
+        return artifacts_with_args
     
     def compress(
         self,
@@ -2135,3 +2795,142 @@ class Compressor:
                         )
         
         return result_embeddings, copied_artifacts
+
+# Hooks
+
+def make_attention_score_hook(results_list: list[torch.Tensor], head_reduction: Literal["sum", "max"] = "sum") -> Callable[[nn.Module, tuple, tuple], None]:
+    def attention_score_hook(module: nn.Module, input: tuple, output: tuple) -> None:
+        """
+        Compute per-token importance scores by aggregating attention across all heads
+        and source tokens. For each token j, the importance score is the sum of attention paid
+        to token j over all heads and all source tokens.
+        Places results in results_list.
+        """
+        # Try to extract attention scores from output
+        attention_scores = None
+
+        hidden_states = input[0]
+        attention_mask = input[1] if len(input) > 1 else None
+        
+        # Compute attention scores manually for ModernBertAttention
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        
+        # Get num_heads from config
+        num_heads = module.num_heads
+        head_dim = hidden_size // num_heads
+        
+        # Get Q, K, V from Wqkv projection
+        qkv = module.Wqkv(hidden_states)  # (batch, seq_len, 3*hidden_size)
+        qkv = qkv.view(batch_size, seq_len, 3, hidden_size)  # (batch, seq_len, 3, hidden_size)
+        q, k, v = qkv.chunk(3, dim=2)  # Each: (batch, seq_len, 1, hidden_size)
+        q = q.squeeze(2)  # (batch, seq_len, hidden_size)
+        k = k.squeeze(2)  # (batch, seq_len, hidden_size)
+        
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+        k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+        
+        # Compute attention scores: QK^T / sqrt(d_k)
+        # -> (batch, num_heads, seq_len, seq_len)
+        attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, seq_len)
+            elif attention_mask.dim() == 3:
+                mask = attention_mask.unsqueeze(1)  # (batch, 1, seq_len, seq_len)
+            else:
+                mask = attention_mask
+            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+        
+        # Aggregate attention scores to per-token importance scores
+        # attention_scores: (batch, num_heads, seq_len, seq_len)
+        # Sum over source tokens (dim=1) for per-token importance (batch, num_heads,seq_len)
+        per_head_importance_scores = attention_scores.sum(dim=1) # (batch, num_heads, seq_len)
+        match head_reduction:
+            case "sum":
+                importance_scores = per_head_importance_scores.sum(dim=1) # (batch, seq_len)
+            case "max":
+                importance_scores = per_head_importance_scores.max(dim=1).values # (batch, seq_len)
+            case _:
+                raise ValueError(f"Invalid head reduction: {head_reduction}")
+        results_list.append(importance_scores.detach().clone())
+        
+    return attention_score_hook
+
+def _compute_leverage_scores_right_sketch(k_tensor: torch.Tensor, sketch_dim: Optional[int] = None, lambda_reg: float = 1e-3) -> torch.Tensor:
+    """
+    Gemini's implementation of Compactor's right-sketch leverage score computation (replaces SVD with Cholesky decomp)
+    
+    Args:
+        k_tensor: (batch, num_heads, seq_len, head_dim) 
+        sketch_dim: int
+        lambda_reg: regularization parameter
+    """
+    B, H, N, D = k_tensor.shape
+    
+    # shared sketch matrix for all heads
+    
+    if sketch_dim is None:
+        sketch_dim = D
+        k_hat = k_tensor
+    else:
+        # (B, H, N, D) @ (D, k) -> (B, H, N, k)
+        phi = torch.randn((D, sketch_dim), device=k_tensor.device, dtype=k_tensor.dtype) * (sketch_dim ** -0.5)
+        k_hat = k_tensor @ phi
+    
+    # Compute Gram Matrix G = K_hat^T * K_hat
+    # (B, H, k, N) @ (B, H, N, k) -> (B, H, k, k)
+    G = k_hat.transpose(-1, -2) @ k_hat
+    
+    # Regularization (Ridge)
+    eye = torch.eye(sketch_dim, device=k_tensor.device, dtype=k_tensor.dtype)
+    G = G + lambda_reg * eye
+    
+    # Compute whitened vectors U = K_hat * G^(-1/2)
+    # Instead of explicit SVD (slow on batch), we can use Cholesky or Inverse since D is small (head dim).
+    # We want row_norms(K_hat @ G^-0.5)^2 = diag(K_hat @ G^-1 @ K_hat^T)
+    # Efficiently: sum((K_hat @ G^-1) * K_hat, dim=-1)
+    
+    G_inv = torch.linalg.inv(G) # (B, H, k, k)
+    
+    # Project K_hat by inverse covariance
+    k_whitened = torch.matmul(k_hat, G_inv) # (B, H, N, k)
+    
+    # Dot product with self to get squared Mahalanobis distance
+    scores = (k_whitened * k_hat).sum(dim=-1) # (B, H, N)
+    
+    return scores
+
+def make_leverage_score_hook(results_list: list[torch.Tensor], sketch_dim: Optional[int] = None, head_reduction: Literal["sum", "max"] = "sum") -> Callable[[nn.Module, tuple, tuple], None]:
+    def leverage_score_hook(module: nn.Module, input: tuple, output: tuple) -> None:
+        """
+        Inspired by Compactor (http://arxiv.org/abs/2507.08143)
+        Compute per-token leverage scores on K. If sketch_dim is provided, sketch down to sketch_dim to make it more efficient.
+        Scores are the sum of leverage scores for a token over all heads
+        """
+        hidden_states = input[0]
+        attention_mask = input[1] if len(input) > 1 else None
+        
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        num_heads = module.num_heads
+        head_dim = hidden_size // num_heads
+        
+        qkv = module.Wqkv(hidden_states)  # (batch, seq_len, 3*hidden_size)
+        qkv = qkv.view(batch_size, seq_len, 3, hidden_size)  # (batch, seq_len, 3, hidden_size)
+        q, k, v = qkv.chunk(3, dim=2)  # Each: (batch, seq_len, 1, hidden_size)
+        k = k.squeeze(2)  # (batch, seq_len, hidden_size)
+        k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
+        
+        leverage_scores = _compute_leverage_scores_right_sketch(k, sketch_dim, lambda_reg=1e-3) # (batch, num_heads, seq_len)
+
+        match head_reduction: # (batch, seq_len)
+            case "sum":
+                leverage_scores = leverage_scores.sum(dim=1)
+            case "max":
+                leverage_scores = leverage_scores.max(dim=1).values
+            case _:
+                raise ValueError(f"Invalid head reduction: {head_reduction}. Only 'sum' and 'max' are supported.")
+
+        results_list.append(leverage_scores.detach().clone())
+    return leverage_score_hook

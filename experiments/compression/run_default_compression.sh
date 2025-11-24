@@ -1,9 +1,9 @@
 #!/bin/bash
 
 #SBATCH --job-name=li-compression
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=24:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=li_compression_%j.out
 #SBATCH --error=li_compression_%j.err
 
@@ -29,7 +29,8 @@ COMMAND="""python -u experiments/compression/compression_experiment.py \
   --dataset_name "${DATASET_NAME}" \
   --model_name "${MODEL_NAME}" \
   --index_type "${INDEX_TYPE}" \
-  --experiment_output_dir "${OUTPUT_DIR}"
+  --experiment_output_dir "${OUTPUT_DIR}" \
+  --batch_size 1000
 """
 
 echo "${COMMAND}"

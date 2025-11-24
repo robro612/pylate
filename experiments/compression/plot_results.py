@@ -28,7 +28,10 @@ def _classify_method(config: dict) -> str:
     strategy_cfg = (strategy or {}).get("config", {})
 
     if strategy_type == "attention_pruning":
-        return "attention"
+        return f"attention-{strategy_cfg.get('head_reduction', "sum")}"
+    if strategy_type == "compactor_pruning":
+        sketch_str = "" if strategy_cfg.get('sketch_dim') is None else f"-sketch-{strategy_cfg.get('sketch_dim')}"
+        return f"compactor-attn-{strategy_cfg.get('attention_head_reduction', "sum")}-lev-{strategy_cfg.get('leverage_head_reduction', "sum")}-lambda-{strategy_cfg.get('lambda_mix')}{sketch_str}"
 
     if strategy_type == "idf_pruning":
         mode = strategy_cfg.get("mode")
@@ -132,7 +135,7 @@ def plot_results(results_path, metric, output_dir):
     ax.set_xlabel('Average Tokens per Document', fontsize=12)
     ax.set_ylabel(metric, fontsize=12)
     ax.set_title(f'{dataset_name} - {metric} vs Average Tokens per Document', fontsize=14)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     
