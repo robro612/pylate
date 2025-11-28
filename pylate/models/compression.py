@@ -334,6 +334,10 @@ class PoolingConfig(CompressionStrategyConfigBase):
     protected_tokens: int = 1
     clustering_method: Literal["hierarchical", "spherical"] = "hierarchical"
     show_progress_bar: bool = False
+    weight_by: Optional[Literal["attention", "leverage", "idf", "tfidf"]] = None
+    attention_head_reduction: Literal["sum", "max"] = "sum"
+    leverage_head_reduction: Literal["sum", "max"] = "sum"
+    leverage_sketch_dim: Optional[int] = None
 
     def serialize(self) -> dict:
         """
@@ -344,12 +348,19 @@ class PoolingConfig(CompressionStrategyConfigBase):
         dict
             JSON-serializable dictionary representation
         """
-        return {
+        result = {
             "pool_factor": self.pool_factor,
             "protected_tokens": self.protected_tokens,
             "clustering_method": self.clustering_method,
             "show_progress_bar": self.show_progress_bar,
+            "weight_by": self.weight_by,
         }
+        if self.weight_by == "attention":
+            result["attention_head_reduction"] = self.attention_head_reduction
+        elif self.weight_by == "leverage":
+            result["leverage_head_reduction"] = self.leverage_head_reduction
+            result["leverage_sketch_dim"] = self.leverage_sketch_dim
+        return result
     
     @property
     def strategy_type(self) -> str:
@@ -361,14 +372,16 @@ class CompressionStrategy(ABC):
     Base interface for compression strategies.
     
     Strategies apply compression to embeddings and maintain 1:1 mapping with shape-matched artifacts.
-    Each strategy should declare which artifacts it requires via the `required_artifacts` class variable.
+    Each strategy should declare which artifacts it requires via the `required_artifacts` instance attribute.
     
     Artifacts can be:
     - Shape-matched: `list[torch.Tensor]` - one tensor per document, must match embedding shape
     - Metadata: `Any` - corpus-level or document-level metadata (e.g., idf_stats)
     """
     
-    required_artifacts: list[str] = []  # Class variable: list of artifact keys required by this strategy
+    def __init__(self):
+        """Initialize the compression strategy."""
+        self.required_artifacts: list[str] = []  # Instance attribute: list of artifact keys required by this strategy
     
     def get_artifact_requirements(self) -> dict[str, dict[str, Any]]:
         """
@@ -558,8 +571,6 @@ class IDFPruningStrategy(CompressionStrategy):
     - "document": Prunes low-scoring tokens independently per document
     """
     
-    required_artifacts: list[str] = ["input_ids"]  # Requires input_ids to compute TF-IDF stats
-    
     def __init__(self, config: IDFPruningConfig):
         """
         Initialize the IDF pruning strategy.
@@ -569,7 +580,9 @@ class IDFPruningStrategy(CompressionStrategy):
         config
             IDF pruning configuration specifying mode, top_k/threshold, protected_tokens, etc.
         """
+        super().__init__()
         self.config = config
+        self.required_artifacts = ["input_ids"]  # Requires input_ids to compute TF-IDF stats
         self._pruned_tokens: Optional[list[list[int]]] = None  # Track pruned tokens if requested
     
     @property
@@ -1179,8 +1192,6 @@ class AttentionPruningStrategy(CompressionStrategy):
     the document representation.
     """
     
-    required_artifacts: list[str] = ["attention_scores"]  # Requires attention_scores to prune
-    
     def __init__(self, config: AttentionPruningConfig):
         """
         Initialize the attention pruning strategy.
@@ -1190,7 +1201,9 @@ class AttentionPruningStrategy(CompressionStrategy):
         config
             Attention pruning configuration specifying top_k/threshold, protected_tokens, etc.
         """
+        super().__init__()
         self.config = config
+        self.required_artifacts = ["attention_scores"]  # Requires attention_scores to prune
         self._pruned_tokens: Optional[list[list[int]]] = None  # Track pruned tokens if requested
     
     @property
@@ -1578,8 +1591,6 @@ class CompactorPruningStrategy(CompressionStrategy):
     where a is attention scores and o is leverage scores.
     """
     
-    required_artifacts: list[str] = ["attention_scores", "leverage_scores"]  # Requires both scores
-    
     def __init__(self, config: CompactorPruningConfig):
         """
         Initialize the Compactor pruning strategy.
@@ -1589,7 +1600,9 @@ class CompactorPruningStrategy(CompressionStrategy):
         config
             Compactor pruning configuration specifying top_k/threshold, lambda_mix, etc.
         """
+        super().__init__()
         self.config = config
+        self.required_artifacts = ["attention_scores", "leverage_scores"]  # Requires both scores
         self._pruned_tokens: Optional[list[list[int]]] = None  # Track pruned tokens if requested
     
     @property
@@ -2066,14 +2079,15 @@ class PoolingStrategy(CompressionStrategy):
     Pooling strategy that wraps the hierarchical/spherical pooling logic from ColBERT.
     
     This strategy pools embeddings by clustering similar token embeddings together
-    and averaging them, reducing the number of tokens per document while preserving
-    semantic information.
+    and averaging them (optionally weighted by scores), reducing the number of tokens
+    per document while preserving semantic information.
     
     The hierarchical method uses Ward's linkage clustering on cosine similarity distances.
     The spherical method uses fastkmeans clustering on the embeddings.
-    """
     
-    required_artifacts: list[str] = []  # Pooling doesn't require any artifacts
+    When weight_by is specified, embeddings within each cluster are weighted by the
+    specified score (attention, leverage, IDF, or TF-IDF) before averaging.
+    """
     
     def __init__(self, config: PoolingConfig):
         """
@@ -2082,19 +2096,32 @@ class PoolingStrategy(CompressionStrategy):
         Parameters
         ----------
         config
-            Pooling configuration specifying pool_factor, protected_tokens, and clustering_method
+            Pooling configuration specifying pool_factor, protected_tokens, clustering_method,
+            and optionally weight_by for weighted pooling.
         """
+        super().__init__()
         if config.pool_factor <= 0:
             raise ValueError("`pool_factor` must be a positive integer.")
         if config.protected_tokens < 0:
             raise ValueError("`protected_tokens` must be non-negative.")
         
         self.config = config
+        
+        # Set required artifacts based on weight_by
+        if config.weight_by == "attention":
+            self.required_artifacts = ["attention_scores"]
+        elif config.weight_by == "leverage":
+            self.required_artifacts = ["leverage_scores"]
+        elif config.weight_by in ["idf", "tfidf"]:
+            self.required_artifacts = ["input_ids"]
+        else:
+            self.required_artifacts = []  # No artifacts needed for unweighted pooling
     
     @property
     def name(self) -> str:
         """Name of this compression strategy."""
-        return f"pooling-{self.config.clustering_method}_k-{self.config.pool_factor}_p-{self.config.protected_tokens}"
+        weight_str = f"_weighted-{self.config.weight_by}" if self.config.weight_by else ""
+        return f"pooling-{self.config.clustering_method}_k-{self.config.pool_factor}_p-{self.config.protected_tokens}{weight_str}"
     
     @property
     def strategy_type(self) -> str:
@@ -2114,6 +2141,37 @@ class PoolingStrategy(CompressionStrategy):
             "type": self.strategy_type,
             "config": self.config.serialize(),
         }
+    
+    def get_artifact_requirements(self) -> dict[str, dict[str, Any]]:
+        """
+        Get artifact requirements with hook creation arguments.
+        
+        Returns
+        -------
+        dict[str, dict[str, Any]]
+            Dictionary mapping artifact names to their hook creation arguments.
+            For attention/leverage scores, includes head_reduction and sketch_dim as needed.
+            For input_ids (used by idf/tfidf), no arguments are needed.
+        """
+        if self.config.weight_by == "attention":
+            return {
+                "attention_scores": {
+                    "head_reduction": self.config.attention_head_reduction,
+                },
+            }
+        elif self.config.weight_by == "leverage":
+            return {
+                "leverage_scores": {
+                    "sketch_dim": self.config.leverage_sketch_dim,
+                    "head_reduction": self.config.leverage_head_reduction,
+                },
+            }
+        elif self.config.weight_by in ["idf", "tfidf"]:
+            return {
+                "input_ids": {},  # input_ids doesn't need hook creation arguments
+            }
+        else:
+            return {}
     
     @classmethod
     def from_dict(cls, data: dict) -> "PoolingStrategy":
@@ -2136,6 +2194,10 @@ class PoolingStrategy(CompressionStrategy):
             protected_tokens=config_data.get("protected_tokens", 1),
             clustering_method=config_data.get("clustering_method", "hierarchical"),
             show_progress_bar=config_data.get("show_progress_bar", False),
+            weight_by=config_data.get("weight_by"),
+            attention_head_reduction=config_data.get("attention_head_reduction", "sum"),
+            leverage_head_reduction=config_data.get("leverage_head_reduction", "sum"),
+            leverage_sketch_dim=config_data.get("leverage_sketch_dim"),
         )
         return cls(config)
     
@@ -2144,11 +2206,13 @@ class PoolingStrategy(CompressionStrategy):
         documents_embeddings: list[torch.Tensor],
         pool_factor: int,
         protected_tokens: int,
+        weights: Optional[list[torch.Tensor]] = None,
     ) -> tuple[list[torch.Tensor], list[list[int]]]:
         """
-        Pools the embeddings hierarchically by clustering and averaging them.
+        Pools the embeddings hierarchically by clustering and averaging them (optionally weighted).
         
-        This method wraps the exact same logic as ColBERT.pool_embeddings_hierarchical.
+        This method wraps the exact same logic as ColBERT.pool_embeddings_hierarchical,
+        with optional weighted averaging when weights are provided.
         
         Parameters
         ----------
@@ -2158,6 +2222,10 @@ class PoolingStrategy(CompressionStrategy):
             Factor to determine the number of clusters.
         protected_tokens
             Number of tokens to protect from pooling at the start of each document.
+        weights
+            Optional list of weight tensors (one per document) for weighted pooling.
+            Each weight tensor should have shape (seq_len,) matching the corresponding embeddings.
+            If None, uses unweighted averaging.
         
         Returns
         -------
@@ -2183,13 +2251,19 @@ class PoolingStrategy(CompressionStrategy):
         cluster_assignments = []
         
         iterator = tqdm(
-            documents_embeddings,
+            zip(documents_embeddings, weights) if weights else documents_embeddings,
             desc=f"Hierarchical pooling (factor={pool_factor})",
             disable=not self.config.show_progress_bar,
             leave=False,
         )
         
-        for document_embeddings in iterator:
+        for item in iterator:
+            if weights:
+                document_embeddings, doc_weights = item
+                doc_weights = doc_weights.to(device=device)
+            else:
+                document_embeddings = item
+                doc_weights = None
             document_embeddings = document_embeddings.to(device=device)
             
             # Separate protected tokens from the rest
@@ -2225,7 +2299,7 @@ class PoolingStrategy(CompressionStrategy):
             # Store cluster assignments for artifact mapping
             cluster_assignments.append(cluster_labels.tolist())
             
-            # Pool embeddings within each cluster
+            # Pool embeddings within each cluster (optionally weighted)
             pooled_document_embeddings = []
             for cluster_id in range(1, num_clusters + 1):
                 cluster_indices = torch.where(
@@ -2234,7 +2308,22 @@ class PoolingStrategy(CompressionStrategy):
                     )
                 )[0]
                 if cluster_indices.numel() > 0:
-                    cluster_embedding = embeddings_to_pool[cluster_indices].mean(dim=0)
+                    cluster_emb = embeddings_to_pool[cluster_indices]
+                    if doc_weights is not None:
+                        # Weighted average: extract weights for this cluster
+                        cluster_weights = doc_weights[actual_protected:][cluster_indices]
+                        # Normalize weights to sum to 1 (with safety check for zero sum)
+                        weight_sum = cluster_weights.sum()
+                        if weight_sum > 0:
+                            cluster_weights = cluster_weights / weight_sum
+                            # Weighted average
+                            cluster_embedding = (cluster_emb * cluster_weights.unsqueeze(1)).sum(dim=0)
+                        else:
+                            # Fallback to unweighted average if all weights are zero
+                            cluster_embedding = cluster_emb.mean(dim=0)
+                    else:
+                        # Unweighted average
+                        cluster_embedding = cluster_emb.mean(dim=0)
                     pooled_document_embeddings.append(cluster_embedding)
             
             # Re-append protected embeddings
@@ -2248,12 +2337,13 @@ class PoolingStrategy(CompressionStrategy):
         documents_embeddings: list[torch.Tensor],
         pool_factor: int,
         protected_tokens: int,
+        weights: Optional[list[torch.Tensor]] = None,
     ) -> tuple[list[torch.Tensor], list[list[int]]]:
         """
-        Pools the embeddings using spherical clustering via fastkmeans.
+        Pools the embeddings using spherical clustering via fastkmeans (optionally weighted).
         
         This method uses fastkmeans to perform k-means clustering on the embeddings,
-        then averages embeddings within each cluster to create pooled representations.
+        then averages embeddings within each cluster (optionally weighted) to create pooled representations.
         
         Parameters
         ----------
@@ -2263,6 +2353,10 @@ class PoolingStrategy(CompressionStrategy):
             Factor to determine the number of clusters.
         protected_tokens
             Number of tokens to protect from pooling at the start of each document.
+        weights
+            Optional list of weight tensors (one per document) for weighted pooling.
+            Each weight tensor should have shape (seq_len,) matching the corresponding embeddings.
+            If None, uses unweighted averaging.
         
         Returns
         -------
@@ -2299,13 +2393,19 @@ class PoolingStrategy(CompressionStrategy):
         cluster_assignments = []
         
         iterator = tqdm(
-            documents_embeddings,
+            zip(documents_embeddings, weights) if weights else documents_embeddings,
             desc=f"Spherical pooling (factor={pool_factor})",
             disable=not self.config.show_progress_bar,
             leave=False,
         )
         
-        for document_embeddings in iterator:
+        for item in iterator:
+            if weights:
+                document_embeddings, doc_weights = item
+                doc_weights = doc_weights.to(device=device)
+            else:
+                document_embeddings = item
+                doc_weights = None
             document_embeddings = document_embeddings.to(device=device)
             
             # Separate protected tokens from the rest
@@ -2380,14 +2480,28 @@ class PoolingStrategy(CompressionStrategy):
             # fastkmeans uses 0-indexed, but we need 1-indexed to match hierarchical format
             cluster_assignments.append([label + 1 for label in cluster_labels_list])
             
-            # Pool embeddings within each cluster by averaging
+            # Pool embeddings within each cluster (optionally weighted)
             pooled_document_embeddings = []
             for cluster_id in range(num_clusters):
                 # Find indices of embeddings belonging to this cluster
                 cluster_indices = torch.where(cluster_labels_tensor == cluster_id)[0]
                 if cluster_indices.numel() > 0:
-                    # Average the embeddings in this cluster
-                    cluster_embedding = embeddings_to_pool[cluster_indices].mean(dim=0)
+                    cluster_emb = embeddings_to_pool[cluster_indices]
+                    if doc_weights is not None:
+                        # Weighted average: extract weights for this cluster
+                        cluster_weights = doc_weights[actual_protected:][cluster_indices]
+                        # Normalize weights to sum to 1 (with safety check for zero sum)
+                        weight_sum = cluster_weights.sum()
+                        if weight_sum > 0:
+                            cluster_weights = cluster_weights / weight_sum
+                            # Weighted average
+                            cluster_embedding = (cluster_emb * cluster_weights.unsqueeze(1)).sum(dim=0)
+                        else:
+                            # Fallback to unweighted average if all weights are zero
+                            cluster_embedding = cluster_emb.mean(dim=0)
+                    else:
+                        # Unweighted average
+                        cluster_embedding = cluster_emb.mean(dim=0)
                     pooled_document_embeddings.append(cluster_embedding)
             
             # Re-append protected embeddings
@@ -2423,18 +2537,69 @@ class PoolingStrategy(CompressionStrategy):
         if self.config.pool_factor == 1:
             return embeddings, artifacts
         
+        # Extract or compute weights if weighted pooling is enabled
+        weights = None
+        if self.config.weight_by is not None:
+            if self.config.weight_by == "attention":
+                if "attention_scores" not in artifacts:
+                    raise ValueError(
+                        "PoolingStrategy requires 'attention_scores' artifact when weight_by='attention'. "
+                        "Ensure attention_scores are provided when encoding."
+                    )
+                weights = artifacts["attention_scores"]
+            elif self.config.weight_by == "leverage":
+                if "leverage_scores" not in artifacts:
+                    raise ValueError(
+                        "PoolingStrategy requires 'leverage_scores' artifact when weight_by='leverage'. "
+                        "Ensure leverage_scores are provided when encoding."
+                    )
+                weights = artifacts["leverage_scores"]
+            elif self.config.weight_by in ["idf", "tfidf"]:
+                if "input_ids" not in artifacts:
+                    raise ValueError(
+                        f"PoolingStrategy requires 'input_ids' artifact when weight_by='{self.config.weight_by}'. "
+                        "Ensure input_ids are provided when encoding."
+                    )
+                input_ids = artifacts["input_ids"]
+                
+                # Get or compute TF-IDF stats
+                if "tfidf_stats" in artifacts:
+                    stats = artifacts["tfidf_stats"]
+                else:
+                    # Compute TF-IDF stats from input_ids
+                    from .utils import TokenTFIDFStats
+                    tokenized_docs = [doc_input_ids.cpu().tolist() for doc_input_ids in input_ids]
+                    stats = TokenTFIDFStats(num_docs=len(tokenized_docs))
+                    stats.fit(tokenized_docs, show_progress=False)
+                
+                # Compute scores for each document
+                weights = []
+                for doc_idx, doc_input_ids in enumerate(input_ids):
+                    doc_tokens = doc_input_ids.cpu().tolist()
+                    doc_scores = []
+                    for token_id in doc_tokens:
+                        if self.config.weight_by == "idf":
+                            score = stats.get_idf(token_id)
+                        else:  # tfidf
+                            score = stats.get_tfidf(doc_idx, token_id)
+                        doc_scores.append(score)
+                    # Convert to tensor on same device as embeddings
+                    weights.append(torch.tensor(doc_scores, device=embeddings[doc_idx].device, dtype=embeddings[doc_idx].dtype))
+        
         # Apply pooling based on clustering method
         if self.config.clustering_method == "hierarchical":
             pooled_embeddings, cluster_assignments = self._pool_embeddings_hierarchical(
                 documents_embeddings=embeddings,
                 pool_factor=self.config.pool_factor,
                 protected_tokens=self.config.protected_tokens,
+                weights=weights,
             )
         elif self.config.clustering_method == "spherical":
             pooled_embeddings, cluster_assignments = self._pool_embeddings_spherical(
                 documents_embeddings=embeddings,
                 pool_factor=self.config.pool_factor,
                 protected_tokens=self.config.protected_tokens,
+                weights=weights,
             )
         else:
             raise ValueError(

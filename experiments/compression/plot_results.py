@@ -42,10 +42,11 @@ def _classify_method(config: dict) -> str:
         return "idf"
 
     if strategy_type == "pooling":
-        clustering = strategy_cfg.get("clustering_method")
-        if clustering:
-            return f"pooling-{clustering}"
-        return "pooling"
+        clustering = strategy_cfg.get("clustering_method", "hierarchical")
+        weight_by = strategy_cfg.get("weight_by")
+        if weight_by:
+            return f"pooling-{clustering}-weighted-{weight_by}"
+        return f"pooling-{clustering}"
 
     return strategy_type or "other"
 

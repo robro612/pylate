@@ -11,6 +11,7 @@ import time
 from tqdm.autonotebook import tqdm
 
 import pandas as pd
+import torch
 
 from pylate import evaluation, indexes, models, retrieve
 from pylate.models import ColBERT
@@ -142,6 +143,129 @@ def sanitize_name(name: str) -> str:
         .replace(":", "_")
         .replace("\\", "_")
     )
+
+
+def get_encoded_data_dir(
+    model_name: str,
+    dataset_name: str,
+    encoded_data_base_dir: Path | str | None = None,
+    encode_id: str | None = None,
+) -> Path:
+    """
+    Get the directory path for encoded data storage/loading.
+    
+    Parameters
+    ----------
+    model_name : str
+        Model name
+    dataset_name : str
+        Dataset name
+    encoded_data_base_dir : Path | str | None, optional
+        Base directory for encoded data. Defaults to "encoded_data"
+    encode_id : str | None, optional
+        Encoding run ID. If None, uses timestamp-based ID
+    
+    Returns
+    -------
+    Path
+        Path to encoded data directory
+    """
+    if encoded_data_base_dir is None:
+        encoded_data_base_dir = Path("encoded_data")
+    else:
+        encoded_data_base_dir = Path(encoded_data_base_dir)
+    
+    model_dir = sanitize_name(model_name.split("/")[-1])
+    dataset_dir = sanitize_name(dataset_name)
+    
+    if encode_id is None:
+        encode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    return encoded_data_base_dir / model_dir / dataset_dir / encode_id
+
+
+def save_encoded_data(
+    encoded_data_dir: Path,
+    documents_embeddings: list[torch.Tensor],
+    queries_embeddings: list[torch.Tensor],
+    artifacts: dict[str, Any],
+    metadata: dict[str, Any],
+) -> None:
+    """
+    Save encoded documents, queries, artifacts, and metadata to disk.
+    
+    Parameters
+    ----------
+    encoded_data_dir : Path
+        Directory to save encoded data
+    documents_embeddings : list[torch.Tensor]
+        Document embeddings
+    queries_embeddings : list[torch.Tensor]
+        Query embeddings
+    artifacts : dict[str, Any]
+        Compression artifacts
+    metadata : dict[str, Any]
+        Metadata about the encoding (model, dataset, etc.)
+    """
+    encoded_data_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nSaving encoded data to: {encoded_data_dir}")
+    
+    # Save embeddings
+    torch.save(documents_embeddings, encoded_data_dir / "documents_embeddings.pt")
+    torch.save(queries_embeddings, encoded_data_dir / "queries_embeddings.pt")
+    
+    # Save artifacts
+    torch.save(artifacts, encoded_data_dir / "artifacts.pt")
+    
+    # Save metadata as JSON
+    with open(encoded_data_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, default=str, indent=2)
+    
+    print(f"✓ Saved encoded data:")
+    print(f"  - Documents embeddings: {len(documents_embeddings):,} documents")
+    print(f"  - Queries embeddings: {len(queries_embeddings):,} queries")
+    print(f"  - Artifacts: {list(artifacts.keys())}")
+    print(f"  - Metadata: {metadata}")
+
+
+def load_encoded_data(encoded_data_dir: Path, device: torch.device = "cpu") -> tuple[list[torch.Tensor], list[torch.Tensor], dict[str, Any], dict[str, Any]]:
+    """
+    Load encoded documents, queries, artifacts, and metadata from disk.
+    
+    Parameters
+    ----------
+    encoded_data_dir : Path
+        Directory containing encoded data
+    
+    Returns
+    -------
+    tuple
+        (documents_embeddings, queries_embeddings, artifacts, metadata)
+    """
+    if not encoded_data_dir.exists():
+        raise FileNotFoundError(f"Encoded data directory not found: {encoded_data_dir}")
+    
+    print(f"\nLoading encoded data from: {encoded_data_dir}")
+    
+    # Load embeddings
+    documents_embeddings = torch.load(encoded_data_dir / "documents_embeddings.pt", map_location=device)
+    queries_embeddings = torch.load(encoded_data_dir / "queries_embeddings.pt", map_location=device)
+    
+    # Load artifacts
+    artifacts = torch.load(encoded_data_dir / "artifacts.pt", map_location="cpu")
+    
+    # Load metadata
+    with open(encoded_data_dir / "metadata.json", "r") as f:
+        metadata = json.load(f)
+    
+    print(f"✓ Loaded encoded data:")
+    print(f"  - Documents embeddings: {len(documents_embeddings):,} documents")
+    print(f"  - Queries embeddings: {len(queries_embeddings):,} queries")
+    print(f"  - Artifacts: {list(artifacts.keys())}")
+    print(f"  - Metadata: {metadata}")
+    
+    return documents_embeddings, queries_embeddings, artifacts, metadata
 
 
 def serialize_config_for_storage(config: CompressionConfig | None) -> dict[str, Any]:
@@ -279,22 +403,22 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
     }.get(dataset_name, [10, 20, 40, 80])
 
     # attention score pruning configs
-    for lambda_mix in [0.15, 0.3, 0.45, 0.6, 0.75]:
-        for k in ks:
-            compactor_config = CompactorPruningConfig(
-                top_k=k,
-                protected_tokens=1,
-                sketch_dim=None,
-                attention_head_reduction="sum",
-                leverage_head_reduction="sum",
-                lambda_mix=lambda_mix,
-            )
-            strategy = CompactorPruningStrategy(compactor_config)
-            config = CompressionConfig(
-                strategies=[strategy],
-                description=f"Compactor pruning k={k} lambda_mix={lambda_mix} head_reductions=sum",
-            )
-            configs.append(config)
+    # for lambda_mix in [0.15, 0.3, 0.45, 0.6, 0.75]:
+    #     for k in ks:
+    #         compactor_config = CompactorPruningConfig(
+    #             top_k=k,
+    #             protected_tokens=1,
+    #             sketch_dim=None,
+    #             attention_head_reduction="sum",
+    #             leverage_head_reduction="sum",
+    #             lambda_mix=lambda_mix,
+    #         )
+    #         strategy = CompactorPruningStrategy(compactor_config)
+    #         config = CompressionConfig(
+    #             strategies=[strategy],
+    #             description=f"Compactor pruning k={k} lambda_mix={lambda_mix} head_reductions=sum",
+    #         )
+    #         configs.append(config)
     # for k in ks:
     #     attention_config = AttentionPruningConfig(
     #         top_k=k,
@@ -343,21 +467,14 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
     #     )
     #     configs.append(config)
     
-    # # Pooling configs
-    # for method in ["spherical", "hierarchical"]:
-    #     for k in [2, 3, 4, 5]:
-    #         pooling_config = PoolingConfig(
-    #             pool_factor=k,
-    #             protected_tokens=1,
-    #             clustering_method=method,
-    #             show_progress_bar=True,
-    #         )
-    #         strategy = PoolingStrategy(pooling_config)
-    #         config = CompressionConfig(
-    #             strategies=[strategy],
-    #             description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1",
-    #         )
-    #         configs.append(config)
+    # Pooling configs
+    for method in ["hierarchical"]:
+        for k in [2, 3, 4, 5]:
+            for weight_by in ["attention", "leverage", "idf", "tfidf", None]:
+                pooling_config = PoolingConfig(pool_factor=k, protected_tokens=1, clustering_method=method, show_progress_bar=True, weight_by=weight_by)
+                strategy = PoolingStrategy(pooling_config)
+                config = CompressionConfig(strategies=[strategy], description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1 weight_by={weight_by}")
+                configs.append(config)
     
     return configs
 
@@ -704,7 +821,12 @@ def print_results_table(
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Compression experiment evaluation")
+    parser = argparse.ArgumentParser(
+        description="Compression experiment evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    
+    # Common arguments
     parser.add_argument(
         "--model_name",
         type=str,
@@ -717,45 +839,78 @@ def parse_args() -> argparse.Namespace:
         default="nfcorpus",
         help="Name of the dataset to evaluate on (default: 'nfcorpus')",
     )
+    
+    # Mode selection
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="both",
+        choices=["encode", "compress", "both"],
+        help="Execution mode: 'encode' (only encode and save), 'compress' (only load and compress), 'both' (default: encode then compress)",
+    )
+    
+    # Encoding group
+    encoding_group = parser.add_argument_group(
+        "Encoding options",
+        "Options for encoding documents and queries (used in 'encode' and 'both' modes)"
+    )
+    encoding_group.add_argument(
+        "--encoded_data_base_dir",
+        type=str,
+        default=None,
+        help="Base directory for storing encoded data. Defaults to results/compression_experiments/<model>/<dataset>/embeddings",
+    )
+    encoding_group.add_argument(
+        "--encode_id",
+        type=str,
+        default=None,
+        help="ID for this encoding run. If not provided, uses timestamp-based ID. Required when loading in 'compress' mode.",
+    )
+    encoding_group.add_argument(
+        "--batch_size",
+        type=int,
+        default=2400,
+        help="Batch size for encoding (default: 2400)",
+    )
+    
+    # Compression group
+    compression_group = parser.add_argument_group(
+        "Compression options",
+        "Options for compression and evaluation (used in 'compress' and 'both' modes)"
+    )
+    compression_group.add_argument(
         "--index_type",
         type=str,
         default="plaid",
         help="Index type to use (default: 'plaid')",
         choices=["flat", "plaid"],
     )
-    parser.add_argument(
+    compression_group.add_argument(
         "--experiment_output_dir",
         type=str,
         default=None,
         help="Output directory for compression experiment results. Defaults to results/compression_experiments/<model>/<dataset>",
     )
-    parser.add_argument(
+    compression_group.add_argument(
         "--configs_file",
         type=str,
         default=None,
         help="Path to JSONL file containing compression configs. If not provided, uses default configs matching beir_dataset.py",
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=2400,
-        help="Batch size for encoding (default: 2400)",
-    )
-    parser.add_argument(
+    compression_group.add_argument(
         "--num_workers",
         type=int,
         default=8,
         help="Number of workers for parallel compression (default: 8)",
     )
-    parser.add_argument(
+    compression_group.add_argument(
         "--metrics",
         type=str,
         nargs="+",
         default=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10"],
         help="Evaluation metrics to compute (default: ['map', 'ndcg@10', 'ndcg@100', 'recall@10', 'recall@100', 'mrr@10'])",
     )
-    parser.add_argument(
+    compression_group.add_argument(
         "--save_runfiles",
         action="store_true",
         help="Save ranx runfiles for each configuration (default: False)",
@@ -769,184 +924,321 @@ def main() -> None:
     args = parse_args()
     overall_start = time.time()
 
-    # Load model
+    # Determine which operations to perform
+    do_encode = args.mode in ["encode", "both"]
+    do_compress = args.mode in ["compress", "both"]
+    
+    if not do_encode and not do_compress:
+        raise ValueError("Invalid mode: must be 'encode', 'compress', or 'both'")
+
+    # Load model (needed for both encoding and compression)
     model: ColBERT = load_model(args.model_name, args.dataset_name)
 
-    # Load dataset
-    documents, queries, qrels = load_dataset(args.dataset_name)
-
-    # Set up experiment output directory
-    model_dir = sanitize_name(args.model_name.split("/")[-1])
-    dataset_dir = sanitize_name(args.dataset_name)
-    if args.experiment_output_dir is None:
-        experiment_output_dir = (
-            Path("results")
-            / "compression_experiments"
-            / model_dir
-            / dataset_dir
-        )
-    else:
-        experiment_output_dir = Path(args.experiment_output_dir)
-    experiment_output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate run_id for consistent naming and tracking
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Load compression configs
-    print("\n" + "=" * 80)
-    print("Loading compression configurations...")
-    print("=" * 80)
-    if args.configs_file:
-        configs = load_configs_from_jsonl(Path(args.configs_file), model)
-        print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
-    else:
-        configs = create_default_configs(model, args.dataset_name)
-        print(f"✓ Created {len(configs)} default configs")
-    
-    print("\nConfigurations:")
-    for i, config in enumerate(configs):
-        if config is None:
-            print(f"  [{i}] Baseline (no compression)")
-        else:
-            print(f"  [{i}] {config.description}")
-
-    compressors = [config.create_compressor() for config in configs]
-    artifacts_with_args = [compressor.strategies[0].get_artifact_requirements() for compressor in compressors]
-    artifact_flags = {artifact: arg if arg else True  for artifact_with_arg in artifacts_with_args for artifact, arg in artifact_with_arg.items()}
-    print(artifact_flags)
-
-    # Encode documents once with artifacts (input_ids needed for IDF pruning)
-    print("\n" + "=" * 80)
-    print("Encoding documents...")
-    print("=" * 80)
-    encoding_start = time.time()
-    documents_embeddings, artifacts = model.encode(
-        sentences=[document["text"] for document in documents],
-        batch_size=args.batch_size,
-        is_query=False,
-        show_progress_bar=True,
-        convert_to_tensor=True,
-        return_extra_artifacts=artifact_flags,
-    )
-    encoding_time = time.time() - encoding_start
-    print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
-
-    # Encode queries once
-    print("\n" + "=" * 80)
-    print("Encoding queries...")
-    print("=" * 80)
-    query_encoding_start = time.time()
-    queries_embeddings = model.encode(
-        sentences=list(queries.values()),
-        is_query=True,
-        show_progress_bar=True,
-        batch_size=args.batch_size,
-        convert_to_tensor=True,
-    )
-    query_encoding_time = time.time() - query_encoding_start
-
-    # Track statistics
-    stats = {
-        "num_documents": len(documents),
-        "encoding_time": encoding_time,
-        "query_encoding_time": query_encoding_time,
-        "config_token_counts": [],
-        "avg_tokens_per_doc": [],
-        "compression_times": [],
-        "num_configs": len(configs),
-    }
-
-    # Evaluate each compression config
-    print("\n" + "=" * 80)
-    print("EVALUATING COMPRESSION CONFIGS")
-    print("=" * 80)
-
-    all_evaluation_results = []
-    
-    # Set up runfile output directory if saving runfiles
-    runfile_output_dir = None
-    if args.save_runfiles:
-        runfile_output_dir = experiment_output_dir / "runfiles"
-        runfile_output_dir.mkdir(parents=True, exist_ok=True)
-
-    for config_idx, config in enumerate(configs):
-        compression_start = time.time()
+    # ENCODING PHASE
+    encoded_data_dir = None
+    if do_encode:
+        # Load dataset
+        documents, queries, qrels = load_dataset(args.dataset_name)
         
-        # Apply compression if config is not None (baseline)
-        if config is None:
-            compressed_embeddings = documents_embeddings
+        # Determine encoded data base directory
+        # Default to results/compression_experiments/<model>/<dataset>/embeddings
+        if args.encoded_data_base_dir is None:
+            model_dir = sanitize_name(args.model_name.split("/")[-1])
+            dataset_dir = sanitize_name(args.dataset_name)
+            encoded_data_base_dir = (
+                Path("results")
+                / "compression_experiments"
+                / model_dir
+                / dataset_dir
+                / "embeddings"
+            )
         else:
-            compressor = config.create_compressor()
-            compressed_embeddings, _ = compressor.compress_parallel(
-                embeddings=documents_embeddings,
-                artifacts=artifacts,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                show_progress=True,
+            encoded_data_base_dir = Path(args.encoded_data_base_dir)
+        
+        # Determine encoded data directory
+        # If encode_id not provided, generate one (will be used for compression phase too)
+        encode_id = args.encode_id
+        if encode_id is None:
+            encode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        encoded_data_dir = get_encoded_data_dir(
+            model_name=args.model_name,
+            dataset_name=args.dataset_name,
+            encoded_data_base_dir=encoded_data_base_dir,
+            encode_id=encode_id,
+        )
+        
+        # Load compression configs to determine artifact requirements
+        print("\n" + "=" * 80)
+        print("Loading compression configurations...")
+        print("=" * 80)
+        if args.configs_file:
+            configs = load_configs_from_jsonl(Path(args.configs_file), model)
+            print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
+        else:
+            configs = create_default_configs(model, args.dataset_name)
+            print(f"✓ Created {len(configs)} default configs")
+        
+        # Determine artifact requirements
+        compressors = [config.create_compressor() if config else None for config in configs]
+        artifacts_with_args = []
+        for compressor in compressors:
+            if compressor and compressor.strategies:
+                artifacts_with_args.append(compressor.strategies[0].get_artifact_requirements())
+            else:
+                artifacts_with_args.append({})
+        
+        artifact_flags = {}
+        for artifact_with_arg in artifacts_with_args:
+            for artifact, arg in artifact_with_arg.items():
+                if artifact not in artifact_flags:
+                    artifact_flags[artifact] = arg if arg else True
+        
+        print(f"Artifact requirements: {artifact_flags}")
+
+        # Encode documents once with artifacts (input_ids needed for IDF pruning)
+        print("\n" + "=" * 80)
+        print("Encoding documents...")
+        print("=" * 80)
+        encoding_start = time.time()
+        documents_embeddings, artifacts = model.encode(
+            sentences=[document["text"] for document in documents],
+            batch_size=args.batch_size,
+            is_query=False,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+            return_extra_artifacts=artifact_flags,
+        )
+        encoding_time = time.time() - encoding_start
+        print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
+        print(f"Artifacts collected: {list(artifacts.keys())}")
+
+        # Encode queries once
+        print("\n" + "=" * 80)
+        print("Encoding queries...")
+        print("=" * 80)
+        query_encoding_start = time.time()
+        queries_embeddings = model.encode(
+            sentences=list(queries.values()),
+            is_query=True,
+            show_progress_bar=True,
+            batch_size=args.batch_size,
+            convert_to_tensor=True,
+        )
+        query_encoding_time = time.time() - query_encoding_start
+        print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
+        
+        # Save encoded data
+        metadata = {
+            "model_name": args.model_name,
+            "dataset_name": args.dataset_name,
+            "encode_id": encoded_data_dir.name,
+            "timestamp": datetime.now().isoformat(),
+            "num_documents": len(documents),
+            "num_queries": len(queries),
+            "encoding_time": encoding_time,
+            "query_encoding_time": query_encoding_time,
+            "document_length": model.document_length,
+            "query_length": model.query_length,
+            "artifacts_collected": list(artifacts.keys()),
+        }
+        
+        save_encoded_data(
+            encoded_data_dir=encoded_data_dir,
+            documents_embeddings=documents_embeddings,
+            queries_embeddings=queries_embeddings,
+            artifacts=artifacts,
+            metadata=metadata,
+        )
+        
+        print(f"\n✓ Encoding complete. Encoded data saved to: {encoded_data_dir}")
+        print(f"  Use --encode_id={encoded_data_dir.name} to load this encoding in compress mode")
+        
+        # If only encoding, exit here
+        if not do_compress:
+            return
+    
+    # COMPRESSION PHASE
+    if do_compress:
+        # Load encoded data
+        # If we just encoded, use that directory; otherwise require encode_id
+        if encoded_data_dir is None:
+            if args.encode_id is None:
+                raise ValueError("--encode_id is required when using 'compress' mode (without encoding first)")
+            
+            # Determine encoded data base directory (same logic as encoding phase)
+            if args.encoded_data_base_dir is None:
+                model_dir = sanitize_name(args.model_name.split("/")[-1])
+                dataset_dir = sanitize_name(args.dataset_name)
+                encoded_data_base_dir = (
+                    Path("results")
+                    / "compression_experiments"
+                    / model_dir
+                    / dataset_dir
+                    / "embeddings"
+                )
+            else:
+                encoded_data_base_dir = Path(args.encoded_data_base_dir)
+            
+            encoded_data_dir = get_encoded_data_dir(
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                encoded_data_base_dir=encoded_data_base_dir,
+                encode_id=args.encode_id,
             )
         
-        compression_time = time.time() - compression_start
+        documents_embeddings, queries_embeddings, artifacts, metadata = load_encoded_data(encoded_data_dir, device="cuda")
         
-        # Calculate token statistics
-        num_tokens = sum(len(emb) for emb in compressed_embeddings)
-        avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
+        # Load dataset (needed for evaluation)
+        documents, queries, qrels = load_dataset(args.dataset_name)
         
-        stats["config_token_counts"].append(num_tokens)
-        stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
-        stats["compression_times"].append(compression_time)
+        # Verify metadata matches
+        if metadata["model_name"] != args.model_name:
+            print(f"Warning: Model name mismatch. Encoded: {metadata['model_name']}, Current: {args.model_name}")
+        if metadata["dataset_name"] != args.dataset_name:
+            print(f"Warning: Dataset name mismatch. Encoded: {metadata['dataset_name']}, Current: {args.dataset_name}")
         
-        # Evaluate this config
-        result = evaluate_config(
-            config_idx=config_idx,
-            config=config,
-            documents_embeddings=compressed_embeddings,
-            documents=documents,
-            queries=queries,
-            qrels=qrels,
-            queries_embeddings=queries_embeddings,
-            dataset_name=args.dataset_name,
+        # Set up experiment output directory
+        model_dir = sanitize_name(args.model_name.split("/")[-1])
+        dataset_dir = sanitize_name(args.dataset_name)
+        if args.experiment_output_dir is None:
+            experiment_output_dir = (
+                Path("results")
+                / "compression_experiments"
+                / model_dir
+                / dataset_dir
+            )
+        else:
+            experiment_output_dir = Path(args.experiment_output_dir)
+        experiment_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate run_id for consistent naming and tracking
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Load compression configs
+        print("\n" + "=" * 80)
+        print("Loading compression configurations...")
+        print("=" * 80)
+        if args.configs_file:
+            configs = load_configs_from_jsonl(Path(args.configs_file), model)
+            print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
+        else:
+            configs = create_default_configs(model, args.dataset_name)
+            print(f"✓ Created {len(configs)} default configs")
+        
+        print("\nConfigurations:")
+        for i, config in enumerate(configs):
+            if config is None:
+                print(f"  [{i}] Baseline (no compression)")
+            else:
+                print(f"  [{i}] {config.description}")
+
+        # Use encoding time from metadata if available
+        encoding_time = metadata.get("encoding_time", 0.0)
+        query_encoding_time = metadata.get("query_encoding_time", 0.0)
+
+        # Track statistics
+        stats = {
+            "num_documents": len(documents),
+            "encoding_time": encoding_time,
+            "query_encoding_time": query_encoding_time,
+            "config_token_counts": [],
+            "avg_tokens_per_doc": [],
+            "compression_times": [],
+            "num_configs": len(configs),
+        }
+
+        # Evaluate each compression config
+        print("\n" + "=" * 80)
+        print("EVALUATING COMPRESSION CONFIGS")
+        print("=" * 80)
+
+        all_evaluation_results = []
+        
+        # Set up runfile output directory if saving runfiles
+        runfile_output_dir = None
+        if args.save_runfiles:
+            runfile_output_dir = experiment_output_dir / "runfiles"
+            runfile_output_dir.mkdir(parents=True, exist_ok=True)
+
+        for config_idx, config in enumerate(configs):
+            compression_start = time.time()
+            
+            # Apply compression if config is not None (baseline)
+            if config is None:
+                compressed_embeddings = documents_embeddings
+            else:
+                compressor = config.create_compressor()
+                compressed_embeddings, _ = compressor.compress_parallel(
+                    embeddings=documents_embeddings,
+                    artifacts=artifacts,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    show_progress=True,
+                )
+            
+            compression_time = time.time() - compression_start
+            
+            # Calculate token statistics
+            num_tokens = sum(len(emb) for emb in compressed_embeddings)
+            avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
+            
+            stats["config_token_counts"].append(num_tokens)
+            stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
+            stats["compression_times"].append(compression_time)
+            
+            # Evaluate this config
+            result = evaluate_config(
+                config_idx=config_idx,
+                config=config,
+                documents_embeddings=compressed_embeddings,
+                documents=documents,
+                queries=queries,
+                qrels=qrels,
+                queries_embeddings=queries_embeddings,
+                dataset_name=args.dataset_name,
+                model_name=args.model_name,
+                index_type=args.index_type,
+                stats=stats,
+                metrics=args.metrics,
+                save_runfile=args.save_runfiles,
+                runfile_output_dir=runfile_output_dir,
+                run_id=run_id,
+            )
+            all_evaluation_results.append(result)
+
+        stats["total_time"] = time.time() - overall_start
+
+        # Print experiment statistics
+        print_experiment_statistics(stats, configs)
+
+        # Print summary table
+        df = print_results_table(all_evaluation_results, metrics=args.metrics)
+
+        # Save results to TSV
+        df.to_csv(experiment_output_dir / f"results_{run_id}.tsv", index=False, sep="\t")
+        save_results_jsonl(
+            output_dir=experiment_output_dir,
+            run_id=run_id,
             model_name=args.model_name,
-            index_type=args.index_type,
-            stats=stats,
-            metrics=args.metrics,
-            save_runfile=args.save_runfiles,
-            runfile_output_dir=runfile_output_dir,
-            run_id=run_id,
-        )
-        all_evaluation_results.append(result)
-
-    stats["total_time"] = time.time() - overall_start
-
-    # Print experiment statistics
-    print_experiment_statistics(stats, configs)
-
-    # Print summary table
-    df = print_results_table(all_evaluation_results, metrics=args.metrics)
-
-    # Save results to TSV
-    df.to_csv(experiment_output_dir / f"results_{run_id}.tsv", index=False, sep="\t")
-    save_results_jsonl(
-        output_dir=experiment_output_dir,
-        run_id=run_id,
-        model_name=args.model_name,
-        dataset_name=args.dataset_name,
-        args=args,
-        configs=configs,
-        stats=stats,
-        evaluation_results=all_evaluation_results,
-    )
-    
-    # Create or update runfile manifest if saving runfiles
-    if args.save_runfiles and runfile_output_dir is not None:
-        create_or_update_runfile_manifest(
-            runfile_output_dir=runfile_output_dir,
-            run_id=run_id,
-            stats=stats,
-            all_evaluation_results=all_evaluation_results,
-            configs=configs,
-            args=args,
             dataset_name=args.dataset_name,
+            args=args,
+            configs=configs,
+            stats=stats,
+            evaluation_results=all_evaluation_results,
         )
+        
+        # Create or update runfile manifest if saving runfiles
+        if args.save_runfiles and runfile_output_dir is not None:
+            create_or_update_runfile_manifest(
+                runfile_output_dir=runfile_output_dir,
+                run_id=run_id,
+                stats=stats,
+                all_evaluation_results=all_evaluation_results,
+                configs=configs,
+                args=args,
+                dataset_name=args.dataset_name,
+            )
 
 
 if __name__ == "__main__":
