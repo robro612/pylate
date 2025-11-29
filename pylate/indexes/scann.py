@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -78,19 +79,16 @@ class ScaNN(Base):
         self,
         name: str | None = "ScaNN_index",
         embedding_size: int = 128,
-        num_neighbors: int = 10,
-        num_leaves: int | None = None,
-        num_leaves_to_search: int | None = None,
-        training_sample_size: int = 10000,
+        num_neighbors: Optional[int] = 10,
+        num_leaves: Optional[int] = None,
+        num_leaves_to_search: Optional[int] = None,
+        training_sample_size: Optional[int] = None,
         verbose: bool = False,
     ) -> None:
         self.name = name
         self.embedding_size = embedding_size
         self.num_neighbors = num_neighbors
         self.verbose = verbose
-        
-        # Auto-tune parameters based on dataset size (will be set when we know the size)
-        # Defaults are conservative for small datasets
         self.num_leaves = num_leaves
         self.num_leaves_to_search = num_leaves_to_search
         self.training_sample_size = training_sample_size
@@ -124,39 +122,21 @@ class ScaNN(Base):
 
         # Auto-tune parameters if not set
         num_vectors = embeddings.shape[0]
-        if self.num_leaves is None:
-            # For small datasets, use fewer leaves for faster search
-            # For large datasets, use more leaves for better accuracy
-            if num_vectors < 100_000:
-                self.num_leaves = min(16, num_vectors // 1000)
-            elif num_vectors < 1_000_000:
-                self.num_leaves = min(64, num_vectors // 10000)
-            else:
-                self.num_leaves = 100
-            if self.verbose:
-                logger.info(f"[ScaNN] Auto-tuned num_leaves={self.num_leaves} for {num_vectors} vectors")
-        
-        if self.num_leaves_to_search is None:
-            # Search more leaves for better recall, but balance with speed
-            if num_vectors < 100_000:
-                self.num_leaves_to_search = min(4, self.num_leaves)
-            elif num_vectors < 1_000_000:
-                self.num_leaves_to_search = min(10, self.num_leaves // 2)
-            else:
-                self.num_leaves_to_search = min(20, self.num_leaves // 5)
-            if self.verbose:
-                logger.info(f"[ScaNN] Auto-tuned num_leaves_to_search={self.num_leaves_to_search}")
+        self.num_neighbors = self.num_neighbors if self.num_neighbors else min(10, num_vectors)
+        self.num_leaves = self.num_leaves if self.num_leaves else min(2_000, num_vectors)
+        self.num_leaves_to_search = self.num_leaves_to_search if self.num_leaves_to_search else 200
+        self.training_sample_size = self.training_sample_size if self.training_sample_size else min(250000, num_vectors)
+
+        if self.verbose:
+            logger.info(f"[ScaNN] Building ScaNN searcher with {embeddings.shape[0]} vectors...")
+            logger.info(f"[ScaNN]   Parameters: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, training_sample_size={self.training_sample_size}, num_neighbors={self.num_neighbors}")
 
         # Build ScaNN searcher
         step_start = time.time()
-        if self.verbose:
-            logger.info(f"[ScaNN] Building ScaNN searcher with {embeddings.shape[0]} vectors...")
-            logger.info(f"[ScaNN]   Parameters: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, num_neighbors={self.num_neighbors}")
         searcher = (
             scann.scann_ops_pybind.builder(embeddings, self.num_neighbors, "dot_product")
             .tree(num_leaves=self.num_leaves, num_leaves_to_search=self.num_leaves_to_search, training_sample_size=self.training_sample_size)
-            .score_ah(2, anisotropic_quantization_threshold=0.2)
-            .reorder(self.num_neighbors)
+            .score_ah(1, anisotropic_quantization_threshold=0.1)
             .build()
         )
         step_time = time.time() - step_start
@@ -335,6 +315,10 @@ class ScaNN(Base):
         # Query the index
         step_start = time.time()
         neighbors, distances = self.searcher.search_batched(flattened_queries, final_num_neighbors=k)
+        # replace NaN values with 0
+        if np.isnan(distances).any():
+            print(f"distances has {np.isnan(distances).sum()} NaN values out of {distances.size} total values")
+            distances = np.nan_to_num(distances, nan=0.0)
         step_time = time.time() - step_start
         if self.verbose:
             logger.info(f"[ScaNN] ScaNN search_batched for {n_tokens_total} tokens (k={k}): {step_time:.4f}s ({step_time/n_tokens_total*1000:.2f}ms per token)")
