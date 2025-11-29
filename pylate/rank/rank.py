@@ -155,3 +155,141 @@ def rerank(
         )
 
     return results
+
+def score_xtr(
+    query_doc_ids: list[list[str | int]],
+    query_scores: list[list[float]],
+    k: int,
+    device: str = "cpu",
+) -> list[RerankResult]:
+    """Score documents using XTR (eXact Token Retrieval) scoring.
+    
+    XTR scoring differs from ColBERT in that it doesn't do full reranking.
+    Instead, it only scores documents using initially retrieved tokens, and
+    imputes missing token scores with the minimum score per query token.
+    
+    Parameters
+    ----------
+    query_doc_ids
+        List of length q_tok, where each element is a list of k_token document IDs
+        retrieved for that query token. Document IDs can be strings or integers.
+    query_scores
+        List of length q_tok, where each element is a list of k_token scores
+        corresponding to the retrieved document IDs.
+    k
+        Number of top documents to return.
+    device
+        Device to use for computation ('cpu', 'cuda', etc.).
+    
+    Returns
+    -------
+    list[RerankResult]
+        Top-k documents sorted by score (descending).
+    
+    Notes
+    -----
+    The XTR scoring algorithm:
+    1. For each document, sum scores across all query tokens
+    2. If a document's token wasn't retrieved for a query token, use that 
+       query token's minimum score as imputation
+    3. If multiple tokens from the same document were retrieved for a query token,
+       use the maximum score
+    
+    Examples
+    --------
+    >>> from pylate.rank import score_xtr
+    >>> query_doc_ids = [
+    ...     ["doc1", "doc2", "doc3"],  # Retrieved for query token 0
+    ...     ["doc2", "doc3", "doc4"],  # Retrieved for query token 1
+    ... ]
+    >>> query_scores = [
+    ...     [0.9, 0.7, 0.5],  # Scores for query token 0
+    ...     [0.8, 0.6, 0.4],  # Scores for query token 1
+    ... ]
+    >>> results = score_xtr(query_doc_ids, query_scores, k=3)
+    >>> assert len(results) == 3
+    >>> assert results[0]["id"] == "doc2"  # Has high scores for both tokens
+    
+    """
+    q_tok = len(query_doc_ids)
+    
+    if q_tok == 0:
+        return []
+    
+    # Flatten all doc IDs and scores with their query token indices
+    all_doc_ids = []
+    all_scores = []
+    q_tok_indices = []
+    
+    for q_idx, (token_docs, token_scores) in enumerate(zip(query_doc_ids, query_scores)):
+        all_doc_ids.extend(token_docs)
+        all_scores.extend(token_scores)
+        q_tok_indices.extend([q_idx] * len(token_docs))
+    
+    # Convert to tensors
+    # Handle both string and integer document IDs
+    if len(all_doc_ids) == 0:
+        return []
+    
+    # Keep track of original doc IDs for final output
+    doc_id_is_string = isinstance(all_doc_ids[0], str)
+    if doc_id_is_string:
+        # Create a mapping from string IDs to integers
+        unique_doc_id_strings = list(set(all_doc_ids))
+        doc_id_to_int = {doc_id: idx for idx, doc_id in enumerate(unique_doc_id_strings)}
+        all_doc_ids_int = [doc_id_to_int[doc_id] for doc_id in all_doc_ids]
+        all_doc_ids_t = torch.tensor(all_doc_ids_int, dtype=torch.long, device=device)
+    else:
+        all_doc_ids_t = torch.tensor(all_doc_ids, dtype=torch.long, device=device)
+    
+    all_scores_t = torch.tensor(all_scores, dtype=torch.float32, device=device)
+    q_tok_indices_t = torch.tensor(q_tok_indices, dtype=torch.long, device=device)
+    
+    # Get unique document IDs
+    unique_doc_ids, inverse_indices = torch.unique(all_doc_ids_t, return_inverse=True)
+    num_docs = len(unique_doc_ids)
+    
+    # Compute minimum score per query token for imputation
+    # Can't use torch.tensor directly because sublists may have different lengths
+    min_scores = torch.tensor(
+        [min(scores) for scores in query_scores], 
+        dtype=torch.float32, 
+        device=device
+    )  # Shape: (q_tok,)
+    
+    # Initialize with minimum scores: shape (num_docs, q_tok)
+    doc_scores = min_scores.unsqueeze(0).expand(num_docs, q_tok).clone()
+    
+    # Flatten doc_scores for 1D scatter, then reshape
+    doc_scores_flat = doc_scores.reshape(-1)
+    flat_indices = inverse_indices * q_tok + q_tok_indices_t
+    
+    # Use scatter_reduce with reduce='amax' to keep max score when multiple tokens
+    # from the same document are retrieved for a single query token
+    doc_scores_flat.scatter_reduce_(
+        0, flat_indices, all_scores_t, reduce='amax', include_self=True
+    )
+    doc_scores = doc_scores_flat.reshape(num_docs, q_tok)
+    
+    # Sum across query tokens to get final document scores
+    final_scores = doc_scores.sum(dim=1)
+    
+    # Get top k documents
+    top_k_scores, top_k_indices = torch.topk(
+        final_scores, k=min(k, num_docs), largest=True
+    )
+    top_k_doc_ids = unique_doc_ids[top_k_indices]
+    
+    # Convert back to original document ID format
+    results = []
+    for doc_id_tensor, score in zip(top_k_doc_ids, top_k_scores):
+        if doc_id_is_string:
+            doc_id = unique_doc_id_strings[doc_id_tensor.item()]
+        else:
+            doc_id = doc_id_tensor.item()
+        
+        results.append(
+            RerankResult(id=doc_id, score=score.item())
+        )
+    
+    return results
