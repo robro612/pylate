@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import logging
 import os
 import pickle
 import time
-from typing import Any
+from typing import Any, List, Dict, Tuple, Optional
 from tqdm.auto import tqdm
 import torch
 import itertools
@@ -25,43 +26,53 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-if __name__ == "__main__":
-    query_len = {
-        "quora": 32,
-        "climate-fever": 64,
-        "nq": 32,
-        "msmarco": 32,
-        "hotpotqa": 32,
-        "nfcorpus": 32,
-        "scifact": 48,
-        "trec-covid": 48,
-        "fiqa": 32,
-        "arguana": 64,
-        "scidocs": 48,
-        "dbpedia-entity": 32,
-        "webis-touche2020": 32,
-        "fever": 32,
-        "cqadupstack/android": 32,
-        "cqadupstack/english": 32,
-        "cqadupstack/gaming": 32,
-        "cqadupstack/gis": 32,
-        "cqadupstack/mathematica": 32,
-        "cqadupstack/physics": 32,
-        "cqadupstack/programmers": 32,
-        "cqadupstack/stats": 32,
-        "cqadupstack/tex": 32,
-        "cqadupstack/unix": 32,
-        "cqadupstack/webmasters": 32,
-        "cqadupstack/wordpress": 32,
-    }
+# Query length configuration for different datasets
+QUERY_LEN = {
+    "quora": 32,
+    "climate-fever": 64,
+    "nq": 32,
+    "msmarco": 32,
+    "hotpotqa": 32,
+    "nfcorpus": 32,
+    "scifact": 48,
+    "trec-covid": 48,
+    "fiqa": 32,
+    "arguana": 64,
+    "scidocs": 48,
+    "dbpedia-entity": 32,
+    "webis-touche2020": 32,
+    "fever": 32,
+    "cqadupstack/android": 32,
+    "cqadupstack/english": 32,
+    "cqadupstack/gaming": 32,
+    "cqadupstack/gis": 32,
+    "cqadupstack/mathematica": 32,
+    "cqadupstack/physics": 32,
+    "cqadupstack/programmers": 32,
+    "cqadupstack/stats": 32,
+    "cqadupstack/tex": 32,
+    "cqadupstack/unix": 32,
+    "cqadupstack/webmasters": 32,
+    "cqadupstack/wordpress": 32,
+}
 
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Dataset name")
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Test BEIR index on a dataset")
+    parser.add_argument(
+        "--model_name_or_path",
+        type=str,
+        default=["robro612/xtr-base-en-pylate"],
+        help="Name or path of the model(s) to use. Can be a single model, multiple models (space-separated), or a glob pattern like 'output/model_name/checkpoint-*' (default: 'robro612/xtr-base-en-pylate')",
+        nargs="+",
+    )
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="nfcorpus",
-        help="Name of the dataset to evaluate on (default: 'nfcorpus')",
+        default=["nfcorpus"],
+        help="Name(s) of the dataset(s) to evaluate on. Can be a single dataset or multiple datasets (space-separated) (default: 'nfcorpus')",
+        nargs="+",
     )
     parser.add_argument(
         "--cache_embeddings",
@@ -118,7 +129,6 @@ if __name__ == "__main__":
         nargs="+",
         choices=["Flat", "ScaNN", "Voyager", "PLAID"],
     )
-
     parser.add_argument(
         "--limit_queries",
         type=int,
@@ -136,16 +146,42 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable verbose logging of timing and operations",
     )
-    args = parser.parse_args()
-    dataset_name = args.dataset_name
-    # model_name = "lightonai/GTE-ModernColBERT-v1"
-    model_name = "robro612/xtr-base-en-pylate"
-    model = models.ColBERT(
-        model_name_or_path=model_name,
-        document_length=300,
-        query_length=query_len.get(dataset_name),
+    parser.add_argument(
+        "--shard_size",
+        type=int,
+        default=10_000,
+        help="Number of documents per shard for encoding (default: 10000)",
     )
+    return parser.parse_args()
 
+
+def expand_model_paths(model_paths: List[str]) -> List[str]:
+    """Expand glob patterns in model paths."""
+    expanded = []
+    for path in model_paths:
+        # Check if it's a glob pattern
+        if '*' in path or '?' in path or '[' in path:
+            matches = sorted(glob.glob(path))
+            if not matches:
+                print(f"Warning: No matches found for glob pattern: {path}")
+            expanded.extend(matches)
+        else:
+            # Check if path exists (for local paths)
+            if os.path.exists(path) or '/' in path or path.startswith('robro612/') or path.startswith('colbert-ir/'):
+                expanded.append(path)
+            else:
+                print(f"Warning: Model path may not exist: {path}")
+                expanded.append(path)  # Still add it, might be a HuggingFace model name
+    return expanded
+
+
+def load_dataset(dataset_name: str) -> Tuple[List[Dict[str, str]], Dict[str, str], Any]:
+    """
+    Load dataset and return documents, queries, and qrels.
+    
+    Returns:
+        Tuple of (documents, queries, qrels), and the potentially modified dataset_name
+    """
     if "cqadupstack" in dataset_name:
         # Download dataset if not already downloaded
         from beir import util
@@ -164,8 +200,12 @@ if __name__ == "__main__":
             dataset_name=dataset_name,
             split="dev" if "msmarco" in dataset_name else "test",
         )
+    
+    return documents, queries, qrels, dataset_name
 
-    # casting to lowercase
+
+def preprocess_texts(documents: List[Dict[str, str]], queries: Dict[str, str]) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+    """Convert documents and queries to lowercase."""
     print("Casting documents and queries to lowercase...")
     documents = [
         {
@@ -178,44 +218,153 @@ if __name__ == "__main__":
     queries = {
         query_id: query.lower() for query_id, query in queries.items()
     }
+    
+    return documents, queries
 
 
+def setup_cache_directory(
+    model_name: str,
+    dataset_name: str,
+    documents: List[Dict[str, str]],
+    cache_dir: str,
+    cache_embeddings: bool,
+) -> Tuple[str, str, str, str]:
+    """
+    Set up cache directory structure and generate cache keys.
+    
+    Returns:
+        Tuple of (cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file)
+    """
+    # Generate cache directory structure: cache_dir/sanitized_model_name/dataset
+    sanitized_model_name = "_".join(model_name.split("/")[-2:])
+    cache_subdir = os.path.join(cache_dir, sanitized_model_name, dataset_name)
+    
     # Create cache directory if caching is enabled
-    if args.cache_embeddings:
-        os.makedirs(args.cache_dir, exist_ok=True)
+    if cache_embeddings:
+        os.makedirs(cache_subdir, exist_ok=True)
     
     # Generate cache filenames based on dataset, model, and document content hash
     # Use a hash of document IDs and texts to detect if dataset changed
     doc_hash_input = "".join([doc["id"] + doc["text"] for doc in documents[:100]])  # Sample for hash
     doc_hash = hashlib.md5(doc_hash_input.encode()).hexdigest()[:8]
-    cache_key = f"{dataset_name}_{model_name.split('/')[-1]}_{len(documents)}_{doc_hash}"
-    doc_embeddings_cache_file = os.path.join(args.cache_dir, f"{cache_key}_doc_embeddings.pkl")
-    query_embeddings_cache_file = os.path.join(args.cache_dir, f"{cache_key}_query_embeddings.pkl")
+    cache_key = f"{len(documents)}_{doc_hash}"
+    doc_embeddings_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings.pkl")
+    query_embeddings_cache_file = os.path.join(cache_subdir, f"{cache_key}_query_embeddings.pkl")
     
-    # Load or encode document embeddings
-    if args.cache_embeddings and os.path.exists(doc_embeddings_cache_file):
+    return cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file
+
+
+def encode_documents_with_sharding(
+    model: models.ColBERT,
+    documents: List[Dict[str, str]],
+    cache_subdir: str,
+    cache_key: str,
+    doc_embeddings_cache_file: str,
+    cache_embeddings: bool,
+    shard_size: int,
+    batch_size: int,
+) -> List[Any]:
+    """
+    Encode documents with sharding support, saving iteratively.
+    
+    Returns:
+        List of document embeddings
+    """
+    num_documents = len(documents)
+    num_shards = (num_documents + shard_size - 1) // shard_size
+    
+    # Calculate number of digits needed for zero-padding shard numbers
+    num_digits = len(str(num_shards - 1)) if num_shards > 0 else 1
+    
+    # Check for existing shards if caching is enabled
+    cached_shards = {}
+    if cache_embeddings:
+        for shard_idx in range(num_shards):
+            shard_num_str = f"{shard_idx:0{num_digits}d}"
+            shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
+            if os.path.exists(shard_cache_file):
+                cached_shards[shard_idx] = shard_cache_file
+    
+    # Check if we have the old single-file cache (for backward compatibility)
+    if cache_embeddings and os.path.exists(doc_embeddings_cache_file) and len(cached_shards) == 0:
         print(f"Loading cached document embeddings from {doc_embeddings_cache_file}...")
         with open(doc_embeddings_cache_file, "rb") as f:
             documents_embeddings = pickle.load(f)
         print(f"Loaded {len(documents_embeddings)} document embeddings from cache.")
-    else:
-        print("Encoding documents...")
-        documents_embeddings = model.encode(
-            sentences=[document["text"] for document in documents],
-            batch_size=args.batch_size,
-            is_query=False,
-            show_progress_bar=True,
-        )
         
-        # Save document embeddings if caching is enabled
-        if args.cache_embeddings:
-            print(f"Saving document embeddings to {doc_embeddings_cache_file}...")
-            with open(doc_embeddings_cache_file, "wb") as f:
-                pickle.dump(documents_embeddings, f)
-            print("Document embeddings saved.")
+        # Convert old cache to shard-based format for future use
+        if cache_embeddings:
+            print("Converting to shard-based cache format...")
+            for shard_idx in range(num_shards):
+                start_idx = shard_idx * shard_size
+                end_idx = min(start_idx + shard_size, num_documents)
+                shard_embeddings = documents_embeddings[start_idx:end_idx]
+                shard_num_str = f"{shard_idx:0{num_digits}d}"
+                shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
+                with open(shard_cache_file, "wb") as f:
+                    pickle.dump(shard_embeddings, f)
+            print("Conversion complete.")
+    else:
+        print(f"Encoding documents in shards of size {shard_size}...")
+        print(f"Total documents: {num_documents}, Number of shards: {num_shards}")
+        if cached_shards:
+            print(f"Found {len(cached_shards)} cached shards, will encode {num_shards - len(cached_shards)} missing shards.")
+        
+        documents_embeddings = []
+        
+        # Process shards in order (load cached or encode missing)
+        for shard_idx in range(num_shards):
+            if shard_idx in cached_shards:
+                # Load cached shard
+                shard_cache_file = cached_shards[shard_idx]
+                print(f"Loading cached shard {shard_idx + 1}/{num_shards} from {shard_cache_file}...")
+                with open(shard_cache_file, "rb") as f:
+                    shard_embeddings = pickle.load(f)
+                documents_embeddings.extend(shard_embeddings)
+                print(f"Loaded shard {shard_idx + 1}/{num_shards} ({len(shard_embeddings)} embeddings)")
+            else:
+                # Encode missing shard
+                start_idx = shard_idx * shard_size
+                end_idx = min(start_idx + shard_size, num_documents)
+                shard_documents = documents[start_idx:end_idx]
+                
+                print(f"Encoding shard {shard_idx + 1}/{num_shards} (documents {start_idx} to {end_idx - 1})...")
+                shard_embeddings = model.encode(
+                    sentences=[document["text"] for document in shard_documents],
+                    batch_size=batch_size,
+                    is_query=False,
+                    show_progress_bar=True,
+                )
+                documents_embeddings.extend(shard_embeddings)
+                
+                # Save shard immediately after encoding
+                if cache_embeddings:
+                    shard_num_str = f"{shard_idx:0{num_digits}d}"
+                    shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
+                    print(f"Saving shard {shard_idx + 1}/{num_shards} to {shard_cache_file}...")
+                    with open(shard_cache_file, "wb") as f:
+                        pickle.dump(shard_embeddings, f)
+                    print(f"Shard {shard_idx + 1}/{num_shards} saved.")
+        
+        print(f"Document encoding complete. Total embeddings: {len(documents_embeddings)}")
     
-    # Load or encode query embeddings
-    if args.cache_embeddings and os.path.exists(query_embeddings_cache_file):
+    return documents_embeddings
+
+
+def encode_queries(
+    model: models.ColBERT,
+    queries: Dict[str, str],
+    query_embeddings_cache_file: str,
+    cache_embeddings: bool,
+    batch_size: int,
+) -> List[Any]:
+    """
+    Encode queries, loading from cache if available.
+    
+    Returns:
+        List of query embeddings
+    """
+    if cache_embeddings and os.path.exists(query_embeddings_cache_file):
         print(f"Loading cached query embeddings from {query_embeddings_cache_file}...")
         with open(query_embeddings_cache_file, "rb") as f:
             queries_embeddings = pickle.load(f)
@@ -226,20 +375,32 @@ if __name__ == "__main__":
             sentences=list(queries.values()),
             is_query=True,
             show_progress_bar=True,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
         )
         
         # Save query embeddings if caching is enabled
-        if args.cache_embeddings:
+        if cache_embeddings:
             print(f"Saving query embeddings to {query_embeddings_cache_file}...")
             with open(query_embeddings_cache_file, "wb") as f:
                 pickle.dump(queries_embeddings, f)
             print("Query embeddings saved.")
+    
+    return queries_embeddings
 
-    # Get embedding size from the model's final layer
-    embedding_size = 128
 
-    # Define index configurations
+def get_index_configs(
+    dataset_name: str,
+    model_name: str,
+    embedding_size: int,
+    args: argparse.Namespace,
+    index_types: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Get index configurations for the specified index types.
+    
+    Returns:
+        List of index configuration dictionaries
+    """
     base_name = f"{dataset_name}_{model_name.split('/')[-1]}"
     all_index_configs = [
         {
@@ -283,17 +444,6 @@ if __name__ == "__main__":
             "add_documents_kwargs": {},
         },
         {
-            "name": "Voyager",
-            "index_class": indexes.Voyager,
-            "init_kwargs": {
-                "index_folder": "test_indexes",
-                "index_name": f"{base_name}_voyager",
-                "override": True,
-                "embedding_size": embedding_size,
-            },
-            "add_documents_kwargs": {},
-        },
-        {
             "name": "PLAID",
             "index_class": indexes.PLAID,
             "init_kwargs": {
@@ -304,241 +454,235 @@ if __name__ == "__main__":
         },
     ]
 
-    index_configs = [config for config in all_index_configs if config["name"] in args.index_types]
-    print(f"Testing {len(index_configs)} indexes: {args.index_types}")
-    print(f"Index configurations: {index_configs}")
+    index_configs = [config for config in all_index_configs if config["name"] in index_types]
+    return index_configs
 
+
+def convert_embeddings_to_tensors(
+    documents_embeddings: List[Any],
+    queries_embeddings: List[Any],
+    limit_queries: Optional[int],
+    limit_documents: Optional[int],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Convert embeddings to tensors on CUDA device and apply limits.
+    
+    Returns:
+        Tuple of (documents_embeddings_tensors, queries_embeddings_tensors)
+    """
     # convert documents_embeddings and queries_embeddings to lists of tensors on device
     documents_embeddings = [torch.tensor(doc_emb, device="cuda") for doc_emb in tqdm(documents_embeddings, desc="Converting documents embeddings to tensors")]
     queries_embeddings = [torch.tensor(query_emb, device="cuda") for query_emb in tqdm(queries_embeddings, desc="Converting queries embeddings to tensors")]
 
-    if args.limit_queries:
-        queries_embeddings = queries_embeddings[:args.limit_queries]
+    if limit_queries:
+        queries_embeddings = queries_embeddings[:limit_queries]
 
-    if args.limit_documents:
-        documents_embeddings = documents_embeddings[:args.limit_documents]
+    if limit_documents:
+        documents_embeddings = documents_embeddings[:limit_documents]
 
-    print(f"Embedding size: {embedding_size}")
-    print(f"Number of documents: {len(documents)}")
-    print(f"Doc 1 embedding shape: {documents_embeddings[0].shape}")
+    return documents_embeddings, queries_embeddings
 
-    # Create results directory
-    results_dir = f"results/{dataset_name}"
-    os.makedirs(results_dir, exist_ok=True)
+
+def test_index(
+    config: Dict[str, Any],
+    documents: List[Dict[str, str]],
+    documents_embeddings: List[torch.Tensor],
+    queries: Dict[str, str],
+    queries_embeddings: List[torch.Tensor],
+    qrels: Any,
+    dataset_name: str,
+    model_name: str,
+    k: int,
+    k_token: int,
+    verbose: bool,
+    results_dir: str,
+) -> None:
+    """
+    Test a single index: create, add documents, retrieve, evaluate, and save results.
+    """
+    index_name = config["name"]
+    print("\n" + "="*80)
+    print(f"Testing {index_name} index...")
+    print("="*80)
     
-    results = {}
+    # Initialize index
+    index = config["index_class"](**config["init_kwargs"])
+    retriever = retrieve.ColBERT(index=index, verbose=verbose)
+    
+    # Add documents
+    print(f"Adding documents to {index_name} index...")
+    start_time = time.time()
+    add_kwargs = {
+        "documents_ids": [document["id"] for document in documents],
+        "documents_embeddings": documents_embeddings,
+        **config["add_documents_kwargs"],
+    }
+    index.add_documents(**add_kwargs)
+    index_time = time.time() - start_time
+    print(f"{index_name} indexing time: {index_time:.2f} seconds")
+    
+    # Retrieve
+    print(f"Retrieving with {index_name}...")
+    start_time = time.time()
+    if isinstance(index, indexes.PLAID):
+        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k)
+    else:
+        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token)
+    retrieve_time = time.time() - start_time
+    print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
+    
+    # Remove query_id from scores, needed for FiQA dataset
+    for (query_id, query), query_scores in zip(queries.items(), scores):
+        for score in query_scores:
+            if score["id"] == query_id:
+                query_scores.remove(score)
+    
+    # Evaluate
+    evaluation_scores = evaluation.evaluate(
+        scores=scores,
+        qrels=qrels,
+        queries=list(queries.keys()),
+        metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+    )
+    
+    # Prepare index config info (excluding non-serializable class)
+    index_config_info = {
+        "name": config["name"],
+        "init_kwargs": config["init_kwargs"],
+        **({"add_documents_kwargs": config["add_documents_kwargs"]} if "add_documents_kwargs" in config else {}),
+    }
+    
+    # Create result entry for JSONL
+    jsonl_entry = {
+        "dataset": dataset_name,
+        "model": model_name,
+        "evaluation_scores": evaluation_scores,
+        "index_time": index_time,
+        "retrieve_time": retrieve_time,
+        "k": k,
+        "k_token": k_token,
+        "index_config": index_config_info,
+    }
+    
+    # Append to index-specific JSONL file
+    jsonl_file = os.path.join(results_dir, f"{index_name}.jsonl")
+    with open(jsonl_file, "a") as f:
+        f.write(json.dumps(jsonl_entry) + "\n")
+    
+    print(f"\n{index_name} Results:")
+    print(evaluation_scores)
+    print(f"Results appended to: {jsonl_file}")
 
-    # Test each index
-    for config in index_configs:
-        index_name = config["name"]
+
+def main() -> None:
+    """Main function that orchestrates the evaluation process."""
+    args = parse_arguments()
+    
+    # Expand glob patterns for model paths
+    all_model_paths = expand_model_paths(args.model_name_or_path)
+    all_dataset_names = args.dataset_name
+    
+    print(f"Models to test: {all_model_paths}")
+    print(f"Datasets to test: {all_dataset_names}")
+    print(f"Total combinations: {len(all_model_paths) * len(all_dataset_names)}")
+    
+    # Iterate over all combinations of datasets and models
+    for dataset_name, model_name in itertools.product(all_dataset_names, all_model_paths):
         print("\n" + "="*80)
-        print(f"Testing {index_name} index...")
+        print(f"Processing: Dataset={dataset_name}, Model={model_name}")
         print("="*80)
         
-        # Initialize index
-        index = config["index_class"](**config["init_kwargs"])
-        retriever = retrieve.ColBERT(index=index, verbose=args.verbose)
-        
-        # Add documents
-        print(f"Adding documents to {index_name} index...")
-        start_time = time.time()
-        add_kwargs = {
-            "documents_ids": [document["id"] for document in documents],
-            "documents_embeddings": documents_embeddings,
-            **config["add_documents_kwargs"],
-        }
-        index.add_documents(**add_kwargs)
-        index_time = time.time() - start_time
-        print(f"{index_name} indexing time: {index_time:.2f} seconds")
-        
-        # Retrieve
-        print(f"Retrieving with {index_name}...")
-        start_time = time.time()
-        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=args.k, k_token=args.k_token)
-        retrieve_time = time.time() - start_time
-        print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
-        
-        # Remove query_id from scores, needed for FiQA dataset
-        for (query_id, query), query_scores in zip(queries.items(), scores):
-            for score in query_scores:
-                if score["id"] == query_id:
-                    query_scores.remove(score)
-        
-        # Evaluate
-        evaluation_scores = evaluation.evaluate(
-            scores=scores,
-            qrels=qrels,
-            queries=list(queries.keys()),
-            metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+        model = models.ColBERT(
+            model_name_or_path=model_name,
+            document_length=300,
+            query_length=QUERY_LEN.get(dataset_name),
+        )
+        model.compile()
+
+        # Load dataset
+        documents, queries, qrels, dataset_name = load_dataset(dataset_name)
+
+        # Preprocess texts (lowercase)
+        documents, queries = preprocess_texts(documents, queries)
+
+        # Setup cache directory
+        cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file = setup_cache_directory(
+            model_name=model_name,
+            dataset_name=dataset_name,
+            documents=documents,
+            cache_dir=args.cache_dir,
+            cache_embeddings=args.cache_embeddings,
         )
         
-        # Store results
-        results[index_name] = {
-            "scores": evaluation_scores,
-            "index_time": index_time,
-            "retrieve_time": retrieve_time,
-        }
+        # Encode documents with sharding
+        documents_embeddings = encode_documents_with_sharding(
+            model=model,
+            documents=documents,
+            cache_subdir=cache_subdir,
+            cache_key=cache_key,
+            doc_embeddings_cache_file=doc_embeddings_cache_file,
+            cache_embeddings=args.cache_embeddings,
+            shard_size=args.shard_size,
+            batch_size=args.batch_size,
+        )
         
-        # Save retrieval results to file
-        results_file = os.path.join(results_dir, f"{index_name}_results.json")
-        with open(results_file, "w") as f:
-            # Convert scores to serializable format
-            serializable_scores = []
-            for query_id, query_scores_list in zip(queries.keys(), scores):
-                serializable_scores.append({
-                    "query_id": query_id,
-                    "scores": [
-                        {"id": score["id"], "score": float(score["score"])}
-                        for score in query_scores_list
-                    ]
-                })
-            
-            json.dump({
-                "index_name": index_name,
-                "dataset": dataset_name,
-                "model": model_name,
-                "evaluation_scores": evaluation_scores,
-                "index_time": index_time,
-                "retrieve_time": retrieve_time,
-                "retrieval_results": serializable_scores,
-            }, f, indent=2)
-        
-        # Prepare index config info (excluding non-serializable class)
-        index_config_info = {
-            "name": config["name"],
-            "init_kwargs": config["init_kwargs"],
-            **({"add_documents_kwargs": config["add_documents_kwargs"]} if "add_documents_kwargs" in config else {}),
-        }
-        
-        # Create result entry for JSONL
-        jsonl_entry = {
-            "dataset": dataset_name,
-            "model": model_name,
-            "evaluation_scores": evaluation_scores,
-            "index_time": index_time,
-            "retrieve_time": retrieve_time,
-            "k": 20,  # Number of documents to retrieve
-            "k_token": args.k_token,
-            "index_config": index_config_info,
-        }
-        
-        # Append to index-specific JSONL file
-        jsonl_file = os.path.join(results_dir, f"{index_name}.jsonl")
-        with open(jsonl_file, "a") as f:
-            f.write(json.dumps(jsonl_entry) + "\n")
-        
-        print(f"\n{index_name} Results:")
-        print(evaluation_scores)
-        print(f"\nResults saved to: {results_file}")
-        print(f"Results appended to: {jsonl_file}")
+        # Encode queries
+        queries_embeddings = encode_queries(
+            model=model,
+            queries=queries,
+            query_embeddings_cache_file=query_embeddings_cache_file,
+            cache_embeddings=args.cache_embeddings,
+            batch_size=args.batch_size,
+        )
 
-    # Print comparison
-    print("\n" + "="*80)
-    print("COMPARISON SUMMARY")
-    print("="*80)
-    print(f"\nDataset: {dataset_name}")
-    print(f"Model: {model_name}")
-    print(f"Number of documents: {len(documents)}")
-    print(f"Number of queries: {len(queries)}")
-    
-    if len(results) < 2:
-        print("\nOnly one index tested. Comparison requires at least 2 indexes.")
-        print("\n" + "="*80)
-        exit(0)
-    
-    # Get baseline (first index) for comparison
-    baseline_name = list(results.keys())[0]
-    baseline_results = results[baseline_name]
-    
-    print("\n" + "-"*80)
-    print("METRICS COMPARISON")
-    print("-"*80)
-    metrics = ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"]
-    
-    # Create header with all index names
-    index_names = list(results.keys())
-    header = f"{'Metric':<20}"
-    for idx_name in index_names:
-        header += f" {idx_name:<15}"
-    if len(index_names) == 2:
-        header += f" {'Difference':<15}"
-    print(f"\n{header}")
-    print("-" * (20 + 15 * len(index_names) + (15 if len(index_names) == 2 else 0)))
-    
-    for metric in metrics:
-        row = f"{metric:<20}"
-        baseline_val = baseline_results["scores"].get(metric, 0.0)
-        for idx_name in index_names:
-            val = results[idx_name]["scores"].get(metric, 0.0)
-            row += f" {val:<15.4f}"
+        # Get embedding size from the model's final layer
+        embedding_size = 128
+
+        # Get index configurations
+        index_configs = get_index_configs(
+            dataset_name=dataset_name,
+            model_name=model_name,
+            embedding_size=embedding_size,
+            args=args,
+            index_types=args.index_types,
+        )
         
-        if len(index_names) == 2:
-            # Show difference between two indexes
-            other_name = index_names[1] if index_names[0] == baseline_name else index_names[0]
-            other_val = results[other_name]["scores"].get(metric, 0.0)
-            diff = other_val - baseline_val
-            diff_pct = (diff / baseline_val * 100) if baseline_val > 0 else 0.0
-            row += f" {diff:+.4f} ({diff_pct:+.2f}%)"
-        
-        print(row)
-    
-    print("\n" + "-"*80)
-    print("PERFORMANCE COMPARISON")
-    print("-"*80)
-    
-    # Indexing time comparison
-    print(f"\n{'Operation':<20}", end="")
-    for idx_name in index_names:
-        print(f" {idx_name:<15}", end="")
-    if len(index_names) == 2:
-        print(f" {'Speedup':<15}", end="")
-    print()
-    print("-" * (20 + 15 * len(index_names) + (15 if len(index_names) == 2 else 0)))
-    
-    baseline_index_time = baseline_results["index_time"]
-    baseline_retrieve_time = baseline_results["retrieve_time"]
-    
-    # Indexing times
-    row = f"{'Indexing (s)':<20}"
-    for idx_name in index_names:
-        idx_time = results[idx_name]["index_time"]
-        row += f" {idx_time:<15.2f}"
-    if len(index_names) == 2:
-        other_name = index_names[1] if index_names[0] == baseline_name else index_names[0]
-        other_time = results[other_name]["index_time"]
-        speedup = baseline_index_time / other_time if other_time > 0 else 0.0
-        row += f" {speedup:.2f}x"
-    print(row)
-    
-    # Retrieval times
-    row = f"{'Retrieval (s)':<20}"
-    for idx_name in index_names:
-        ret_time = results[idx_name]["retrieve_time"]
-        row += f" {ret_time:<15.2f}"
-    if len(index_names) == 2:
-        other_name = index_names[1] if index_names[0] == baseline_name else index_names[0]
-        other_time = results[other_name]["retrieve_time"]
-        speedup = baseline_retrieve_time / other_time if other_time > 0 else 0.0
-        row += f" {speedup:.2f}x"
-    print(row)
-    
-    # Save comparison summary
-    comparison_file = os.path.join(results_dir, "comparison_summary.json")
-    with open(comparison_file, "w") as f:
-        json.dump({
-            "dataset": dataset_name,
-            "model": model_name,
-            "num_documents": len(documents),
-            "num_queries": len(queries),
-            "results": {
-                name: {
-                    "evaluation_scores": result["scores"],
-                    "index_time": result["index_time"],
-                    "retrieve_time": result["retrieve_time"],
-                }
-                for name, result in results.items()
-            }
-        }, f, indent=2)
-    
-    print(f"\nComparison summary saved to: {comparison_file}")
-    print("\n" + "="*80)
+        print(f"Testing {len(index_configs)} indexes: {args.index_types}")
+        print(f"Index configurations: {index_configs}")
+
+        # Convert embeddings to tensors
+        documents_embeddings, queries_embeddings = convert_embeddings_to_tensors(
+            documents_embeddings=documents_embeddings,
+            queries_embeddings=queries_embeddings,
+            limit_queries=args.limit_queries,
+            limit_documents=args.limit_documents,
+        )
+
+        print(f"Embedding size: {embedding_size}")
+        print(f"Number of documents: {len(documents)}")
+        print(f"Doc 1 embedding shape: {documents_embeddings[0].shape}")
+
+        # Create results directory
+        results_dir = f"results/{dataset_name}"
+        os.makedirs(results_dir, exist_ok=True)
+
+        # Test each index
+        for config in index_configs:
+            test_index(
+                config=config,
+                documents=documents,
+                documents_embeddings=documents_embeddings,
+                queries=queries,
+                queries_embeddings=queries_embeddings,
+                qrels=qrels,
+                dataset_name=dataset_name,
+                model_name=model_name,
+                k=args.k,
+                k_token=args.k_token,
+                verbose=args.verbose,
+                results_dir=results_dir,
+            )
+
+
+if __name__ == "__main__":
+    main()
