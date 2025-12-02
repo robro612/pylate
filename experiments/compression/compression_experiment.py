@@ -161,7 +161,9 @@ def get_encoded_data_dir(
     dataset_name : str
         Dataset name
     encoded_data_base_dir : Path | str | None, optional
-        Base directory for encoded data. Defaults to "encoded_data"
+        Base directory for encoded data. If None, defaults to "encoded_data".
+        If provided, should already include model/dataset structure (e.g., 
+        results/compression_experiments/<model>/<dataset>/embeddings).
     encode_id : str | None, optional
         Encoding run ID. If None, uses timestamp-based ID
     
@@ -170,18 +172,20 @@ def get_encoded_data_dir(
     Path
         Path to encoded data directory
     """
-    if encoded_data_base_dir is None:
-        encoded_data_base_dir = Path("encoded_data")
-    else:
-        encoded_data_base_dir = Path(encoded_data_base_dir)
-    
-    model_dir = sanitize_name(model_name.split("/")[-1])
-    dataset_dir = sanitize_name(dataset_name)
-    
     if encode_id is None:
         encode_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    return encoded_data_base_dir / model_dir / dataset_dir / encode_id
+    if encoded_data_base_dir is None:
+        # Default case: build full path from scratch
+        encoded_data_base_dir = Path("encoded_data")
+        model_dir = sanitize_name(model_name)
+        dataset_dir = sanitize_name(dataset_name)
+        return encoded_data_base_dir / model_dir / dataset_dir / encode_id
+    else:
+        # Base dir provided: assume it already includes model/dataset structure
+        # Just append the encode_id
+        encoded_data_base_dir = Path(encoded_data_base_dir)
+        return encoded_data_base_dir / encode_id
 
 
 def save_encoded_data(
@@ -468,9 +472,9 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
     #     configs.append(config)
     
     # Pooling configs
-    for method in ["hierarchical"]:
+    for method in ["window", "random"]: 
         for k in [2, 3, 4, 5]:
-            for weight_by in ["attention", "leverage", "idf", "tfidf", None]:
+            for weight_by in [None]:
                 pooling_config = PoolingConfig(pool_factor=k, protected_tokens=1, clustering_method=method, show_progress_bar=True, weight_by=weight_by)
                 strategy = PoolingStrategy(pooling_config)
                 config = CompressionConfig(strategies=[strategy], description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1 weight_by={weight_by}")
@@ -943,7 +947,7 @@ def main() -> None:
         # Determine encoded data base directory
         # Default to results/compression_experiments/<model>/<dataset>/embeddings
         if args.encoded_data_base_dir is None:
-            model_dir = sanitize_name(args.model_name.split("/")[-1])
+            model_dir = sanitize_name(args.model_name)
             dataset_dir = sanitize_name(args.dataset_name)
             encoded_data_base_dir = (
                 Path("results")
@@ -1001,7 +1005,7 @@ def main() -> None:
         print("Encoding documents...")
         print("=" * 80)
         encoding_start = time.time()
-        documents_embeddings, artifacts = model.encode(
+        model_outputs = model.encode(
             sentences=[document["text"] for document in documents],
             batch_size=args.batch_size,
             is_query=False,
@@ -1009,6 +1013,12 @@ def main() -> None:
             convert_to_tensor=True,
             return_extra_artifacts=artifact_flags,
         )
+        if len(model_outputs) == 2:
+            documents_embeddings, artifacts = model_outputs
+        else:
+            documents_embeddings = model_outputs
+            artifacts = {}
+
         encoding_time = time.time() - encoding_start
         print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
         print(f"Artifacts collected: {list(artifacts.keys())}")
@@ -1068,7 +1078,7 @@ def main() -> None:
             
             # Determine encoded data base directory (same logic as encoding phase)
             if args.encoded_data_base_dir is None:
-                model_dir = sanitize_name(args.model_name.split("/")[-1])
+                model_dir = sanitize_name(args.model_name)
                 dataset_dir = sanitize_name(args.dataset_name)
                 encoded_data_base_dir = (
                     Path("results")
@@ -1099,7 +1109,7 @@ def main() -> None:
             print(f"Warning: Dataset name mismatch. Encoded: {metadata['dataset_name']}, Current: {args.dataset_name}")
         
         # Set up experiment output directory
-        model_dir = sanitize_name(args.model_name.split("/")[-1])
+        model_dir = sanitize_name(args.model_name)
         dataset_dir = sanitize_name(args.dataset_name)
         if args.experiment_output_dir is None:
             experiment_output_dir = (

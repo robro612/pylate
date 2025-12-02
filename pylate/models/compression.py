@@ -329,15 +329,79 @@ class CompactorPruningConfig(CompressionStrategyConfigBase):
 
 
 @dataclass
+class RandomPruningConfig(CompressionStrategyConfigBase):
+    """
+    Configuration for random pruning.
+    
+    Prunes tokens randomly, selecting k tokens to remove from each document.
+    This is useful as a baseline for comparing other pruning strategies.
+    
+    Attributes
+    ----------
+    k
+        Number of tokens (after the protected prefix) to randomly prune/remove per document.
+    protected_tokens
+        Number of leading tokens to always retain (CLS / prefixes).
+    track_pruned_tokens
+        If True, tracks which tokens were pruned from each document. Access via
+        ``strategy.get_pruned_tokens()`` after encoding. Defaults to False.
+    show_progress_bar
+        If True, shows a progress bar during pruning. Defaults to False.
+    """
+    
+    k: int
+    protected_tokens: int = 1
+    track_pruned_tokens: bool = False
+    show_progress_bar: bool = False
+    
+    def __post_init__(self) -> None:
+        if self.k <= 0:
+            raise ValueError("`k` must be a positive integer.")
+    
+    def serialize(self) -> dict:
+        """
+        Serialize this configuration to a JSON-compatible dictionary.
+        
+        Returns
+        -------
+        dict
+            JSON-serializable dictionary representation
+        """
+        return {
+            "k": self.k,
+            "protected_tokens": self.protected_tokens,
+            "track_pruned_tokens": self.track_pruned_tokens,
+            "show_progress_bar": self.show_progress_bar,
+        }
+    
+    @property
+    def strategy_type(self) -> str:
+        return "random_pruning"
+
+
+@dataclass
 class PoolingConfig(CompressionStrategyConfigBase):
     pool_factor: int = 1
     protected_tokens: int = 1
-    clustering_method: Literal["hierarchical", "spherical"] = "hierarchical"
+    clustering_method: Literal["hierarchical", "spherical", "window", "random"] = "hierarchical"
     show_progress_bar: bool = False
     weight_by: Optional[Literal["attention", "leverage", "idf", "tfidf"]] = None
     attention_head_reduction: Literal["sum", "max"] = "sum"
     leverage_head_reduction: Literal["sum", "max"] = "sum"
     leverage_sketch_dim: Optional[int] = None
+    stride: Optional[int] = None
+
+    def __post_init__(self):
+        """
+        Validate configuration parameters.
+        """
+        if self.stride is not None and self.clustering_method != "window":
+            raise ValueError(
+                f"`stride` parameter is only valid for 'window' pooling method, "
+                f"but clustering_method is '{self.clustering_method}'."
+            )
+        if self.stride is not None and self.stride <= 0:
+            raise ValueError("`stride` must be a positive integer if provided.")
 
     def serialize(self) -> dict:
         """
@@ -360,6 +424,8 @@ class PoolingConfig(CompressionStrategyConfigBase):
         elif self.weight_by == "leverage":
             result["leverage_head_reduction"] = self.leverage_head_reduction
             result["leverage_sketch_dim"] = self.leverage_sketch_dim
+        if self.stride is not None:
+            result["stride"] = self.stride
         return result
     
     @property
@@ -2074,6 +2140,272 @@ class CompactorPruningStrategy(CompressionStrategy):
         return result_emb, result_art
 
 
+class RandomPruningStrategy(CompressionStrategy):
+    """
+    Random pruning strategy that removes tokens randomly.
+    
+    This strategy randomly selects k tokens to prune from each document,
+    which is useful as a baseline for comparing other pruning strategies.
+    """
+    
+    def __init__(self, config: RandomPruningConfig):
+        """
+        Initialize the random pruning strategy.
+        
+        Parameters
+        ----------
+        config
+            Random pruning configuration specifying k, protected_tokens, etc.
+        """
+        super().__init__()
+        self.config = config
+        self.required_artifacts = []  # No artifacts needed for random pruning
+        self._pruned_tokens: Optional[list[list[int]]] = None  # Track pruned tokens if requested
+    
+    @property
+    def name(self) -> str:
+        """Name of this compression strategy."""
+        return f"random_pruning_k-{self.config.k}"
+    
+    @property
+    def strategy_type(self) -> str:
+        """Strategy type identifier for serialization."""
+        return "random_pruning"
+    
+    def serialize(self) -> dict:
+        """
+        Serialize this strategy to a JSON-compatible dictionary.
+        
+        Returns
+        -------
+        dict
+            JSON-serializable dictionary representation
+        """
+        return {
+            "type": self.strategy_type,
+            "config": self.config.serialize(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "RandomPruningStrategy":
+        """
+        Create a strategy instance from a serialized dictionary.
+        
+        Parameters
+        ----------
+        data
+            Dictionary containing serialized strategy data
+            
+        Returns
+        -------
+        RandomPruningStrategy
+            Deserialized strategy instance
+        """
+        config_data = data.get("config", {})
+        config = RandomPruningConfig(
+            k=config_data.get("k"),
+            protected_tokens=config_data.get("protected_tokens", 1),
+            track_pruned_tokens=config_data.get("track_pruned_tokens", False),
+            show_progress_bar=config_data.get("show_progress_bar", False),
+        )
+        return cls(config)
+    
+    def get_pruned_tokens(self) -> Optional[list[list[int]]]:
+        """
+        Get the list of pruned token IDs for each document.
+        
+        Returns
+        -------
+        Optional[list[list[int]]]
+            List of pruned token ID lists (one per document), or None if tracking is disabled.
+            Each inner list contains the token IDs that were pruned from that document.
+        """
+        return self._pruned_tokens
+    
+    def _get_positions_to_prune(
+        self,
+        doc_embeddings: torch.Tensor,
+        doc_input_ids: Optional[torch.Tensor] = None,
+    ) -> set[int]:
+        """
+        Randomly select positions to prune from a document.
+        
+        Parameters
+        ----------
+        doc_embeddings
+            Embedding tensor for the document
+        doc_input_ids
+            Optional input IDs tensor for tracking pruned tokens
+        
+        Returns
+        -------
+        set[int]
+            Set of positions (indices) to prune
+        """
+        num_tokens = doc_embeddings.shape[0]
+        # Calculate how many tokens are available for pruning (excluding protected tokens)
+        num_available = max(0, num_tokens - self.config.protected_tokens)
+        
+        if num_available == 0:
+            return set()
+        
+        # Randomly select k positions from available tokens
+        num_to_prune = min(self.config.k, num_available)
+        
+        # Generate random indices (after protected tokens)
+        # Create a list of available positions
+        available_indices = list(range(self.config.protected_tokens, num_tokens))
+        # Randomly shuffle and take first num_to_prune
+        perm = torch.randperm(len(available_indices), device=doc_embeddings.device)
+        selected_indices = perm[:num_to_prune].cpu().tolist()
+        # Convert to actual positions
+        positions_to_prune = {available_indices[idx] for idx in selected_indices}
+        
+        return positions_to_prune
+    
+    def compress(
+        self,
+        embeddings: list[torch.Tensor],
+        artifacts: CompressionArtifacts,
+    ) -> tuple[list[torch.Tensor], CompressionArtifacts]:
+        """
+        Apply random pruning to embeddings and update artifacts.
+        
+        Parameters
+        ----------
+        embeddings
+            List of embedding tensors (one per document)
+        artifacts
+            Dictionary of artifacts. Shape-matched artifacts will be updated to match
+            the pruned embeddings. Metadata artifacts are passed through unchanged.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], CompressionArtifacts]
+            (pruned_embeddings, updated_artifacts)
+            Shape-matched artifacts maintain 1:1 mapping with pruned embeddings.
+            Metadata artifacts are passed through unchanged.
+        """
+        # Get input_ids if available (for tracking pruned tokens)
+        input_ids = artifacts.get("input_ids")
+        if input_ids is not None and not isinstance(input_ids, list):
+            raise ValueError("input_ids artifact must be a list of tensors if provided")
+        if input_ids is not None and len(input_ids) != len(embeddings):
+            raise ValueError(
+                f"Mismatch: {len(input_ids)} input_ids but {len(embeddings)} embeddings"
+            )
+        
+        # Initialize pruned tokens tracking if requested
+        # Check if we're in parallel mode (pruned_tokens already pre-allocated)
+        start_idx = artifacts.get("_batch_start_idx", 0)
+        is_parallel_mode = (
+            self.config.track_pruned_tokens and 
+            self._pruned_tokens is not None and 
+            isinstance(self._pruned_tokens, list) and
+            len(self._pruned_tokens) > len(embeddings)  # Pre-allocated for parallel
+        )
+        
+        if self.config.track_pruned_tokens and not is_parallel_mode:
+            # Sequential mode: start fresh
+            self._pruned_tokens = []
+        elif not self.config.track_pruned_tokens:
+            self._pruned_tokens = None
+        
+        # Prune tokens randomly
+        pruned_embeddings = []
+        updated_input_ids = []
+        
+        iterator = tqdm(
+            enumerate(embeddings),
+            desc=f"Random pruning (k={self.config.k})",
+            total=len(embeddings),
+            disable=not self.config.show_progress_bar,
+        )
+        
+        for batch_doc_idx, doc_embeddings in iterator:
+            # Get input_ids for this document if available
+            doc_input_ids = input_ids[batch_doc_idx] if input_ids is not None else None
+            
+            # Get positions to prune
+            positions_to_prune = self._get_positions_to_prune(doc_embeddings, doc_input_ids)
+            
+            # Create mask: keep tokens not in positions_to_prune
+            keep_mask = []
+            pruned_token_ids = []
+            
+            for pos in range(doc_embeddings.shape[0]):
+                if pos < self.config.protected_tokens:
+                    # Always keep protected tokens
+                    keep_mask.append(True)
+                elif pos in positions_to_prune:
+                    # Prune this token
+                    keep_mask.append(False)
+                    if self.config.track_pruned_tokens and doc_input_ids is not None:
+                        pruned_token_ids.append(doc_input_ids[pos].item())
+                else:
+                    # Keep this token
+                    keep_mask.append(True)
+            
+            # Apply mask to embeddings
+            keep_mask_tensor = torch.tensor(keep_mask, device=doc_embeddings.device, dtype=torch.bool)
+            pruned_doc_embeddings = doc_embeddings[keep_mask_tensor]
+            
+            pruned_embeddings.append(pruned_doc_embeddings)
+            
+            # Update input_ids if available
+            if doc_input_ids is not None:
+                pruned_doc_tokens = doc_input_ids[keep_mask_tensor]
+                updated_input_ids.append(pruned_doc_tokens)
+            
+            if self.config.track_pruned_tokens:
+                if is_parallel_mode:
+                    # Parallel mode: set at correct index
+                    self._pruned_tokens[start_idx + batch_doc_idx] = pruned_token_ids
+                else:
+                    # Sequential mode: append
+                    self._pruned_tokens.append(pruned_token_ids)
+        
+        # Update artifacts
+        updated_artifacts = {}
+        for artifact_name, artifact_value in artifacts.items():
+            if artifact_name == "input_ids" and input_ids is not None:
+                # Update input_ids to match pruned embeddings
+                updated_artifacts[artifact_name] = updated_input_ids
+            elif isinstance(artifact_value, list):
+                # Shape-matched artifact: apply same pruning mask
+                pruned_artifacts = []
+                for doc_idx, artifact_tokens in enumerate(artifact_value):
+                    doc_embeddings_for_mask = embeddings[doc_idx]
+                    
+                    # Get positions to prune (same logic as above)
+                    doc_input_ids_for_mask = input_ids[doc_idx] if input_ids is not None else None
+                    positions_to_prune = self._get_positions_to_prune(
+                        doc_embeddings_for_mask, doc_input_ids_for_mask
+                    )
+                    
+                    # Create keep mask
+                    keep_mask = []
+                    for pos in range(len(artifact_tokens)):
+                        if pos < self.config.protected_tokens:
+                            keep_mask.append(True)
+                        elif pos in positions_to_prune:
+                            keep_mask.append(False)
+                        else:
+                            keep_mask.append(True)
+                    
+                    # Apply mask to artifact
+                    keep_mask_tensor = torch.tensor(keep_mask, device=artifact_tokens.device, dtype=torch.bool)
+                    pruned_artifact = artifact_tokens[keep_mask_tensor]
+                    pruned_artifacts.append(pruned_artifact)
+                
+                updated_artifacts[artifact_name] = pruned_artifacts
+            else:
+                # Metadata artifact: pass through unchanged
+                updated_artifacts[artifact_name] = artifact_value
+        
+        return pruned_embeddings, updated_artifacts
+
+
 class PoolingStrategy(CompressionStrategy):
     """
     Pooling strategy that wraps the hierarchical/spherical pooling logic from ColBERT.
@@ -2198,9 +2530,329 @@ class PoolingStrategy(CompressionStrategy):
             attention_head_reduction=config_data.get("attention_head_reduction", "sum"),
             leverage_head_reduction=config_data.get("leverage_head_reduction", "sum"),
             leverage_sketch_dim=config_data.get("leverage_sketch_dim"),
+            stride=config_data.get("stride", config_data.get("pool_factor") if config_data.get("clustering_method") == "window" else None),
         )
         return cls(config)
-    
+
+    def _pool_embeddings_window(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int,
+        protected_tokens: int,
+        weights: Optional[list[torch.Tensor]] = None,
+        stride: Optional[int] = None,
+    ) -> tuple[list[torch.Tensor], list[list[int]]]:
+        """
+        Pools the embeddings by averaging sequential tokens using a sliding window approach.
+        
+        This method applies window-based pooling with a specified window size and stride.
+        Protected tokens at the start of each document are preserved and not pooled.
+        The pooling uses weighted averaging when weights are provided, and normalizes
+        the resulting embeddings at the end.
+        
+        Parameters
+        ----------
+        documents_embeddings
+            A list of embeddings for each document. Each tensor has shape (seq_len, embedding_dim).
+        pool_factor
+            Window size for pooling (number of tokens to average in each window).
+        protected_tokens
+            Number of tokens to protect from pooling at the start of each document.
+        weights
+            Optional list of weight tensors (one per document) for weighted pooling.
+            Each weight tensor should have shape (seq_len,) matching the corresponding embeddings.
+            If None, uses unweighted averaging.
+        stride
+            Stride for the sliding window. If None, defaults to pool_factor (no overlap).
+            If stride < pool_factor, windows will overlap.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], list[list[int]]]
+            A tuple of (pooled_embeddings, window_assignments).
+            pooled_embeddings: A list of pooled embeddings for each document.
+            window_assignments: A list of window assignment lists, one per document.
+                Each assignment list maps original token indices (after protected_tokens) to window IDs.
+        """
+        # Use pool_factor as window_size, and set stride default
+        window_size = pool_factor
+        if stride is None:
+            stride = window_size
+        
+        # Determine device from first embedding (respect original device)
+        # Only use CUDA if all embeddings are already on CUDA, otherwise use CPU
+        if documents_embeddings:
+            first_device = documents_embeddings[0].device
+            # Use CUDA only if CUDA is available AND all embeddings are already on CUDA
+            if torch.cuda.is_available() and first_device.type == "cuda":
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cpu")
+        
+        pooled_embeddings = []
+        window_assignments = []
+        
+        iterator = tqdm(
+            zip(documents_embeddings, weights) if weights else documents_embeddings,
+            desc=f"Window pooling (window={window_size}, stride={stride})",
+            disable=not self.config.show_progress_bar,
+            leave=False,
+        )
+        
+        for item in iterator:
+            if weights:
+                document_embeddings, doc_weights = item
+                doc_weights = doc_weights.to(device=device)
+            else:
+                document_embeddings = item
+                doc_weights = None
+            document_embeddings = document_embeddings.to(device=device)
+            
+            # Separate protected tokens from the rest
+            # Ensure protected_tokens doesn't exceed document length to avoid CUDA asserts
+            num_doc_tokens = document_embeddings.shape[0]
+            actual_protected = min(protected_tokens, num_doc_tokens)
+            protected_embeddings = document_embeddings[:actual_protected]
+            embeddings_to_pool = document_embeddings[actual_protected:]
+            
+            num_embeddings = len(embeddings_to_pool)
+            
+            # If no embeddings to pool, just return protected embeddings
+            if num_embeddings == 0:
+                pooled_embeddings.append(protected_embeddings)
+                window_assignments.append([])
+                continue
+            
+            # Apply window pooling with stride
+            pooled_window_embeddings = []
+            window_assignment = []
+            
+            # Slide window over embeddings_to_pool
+            start_idx = 0
+            window_id = 0
+            while start_idx < num_embeddings:
+                end_idx = min(start_idx + window_size, num_embeddings)
+                window_indices = torch.arange(start_idx, end_idx, device=device)
+                
+                if len(window_indices) > 0:
+                    window_emb = embeddings_to_pool[window_indices]
+                    
+                    if doc_weights is not None:
+                        # Weighted average: extract weights for this window
+                        # Adjust indices to account for protected tokens offset
+                        window_weights = doc_weights[actual_protected:][window_indices]
+                        # Normalize weights to sum to 1 (with safety check for zero sum)
+                        weight_sum = window_weights.sum()
+                        if weight_sum > 0:
+                            window_weights = window_weights / weight_sum
+                            # Weighted average
+                            window_embedding = (window_emb * window_weights.unsqueeze(1)).sum(dim=0)
+                        else:
+                            # Fallback to unweighted average if all weights are zero
+                            window_embedding = window_emb.mean(dim=0)
+                    else:
+                        # Unweighted average
+                        window_embedding = window_emb.mean(dim=0)
+                    
+                    pooled_window_embeddings.append(window_embedding)
+                    
+                    # Store window assignment: map each token in this window to the window_id (1-indexed)
+                    for idx in window_indices.cpu().tolist():
+                        window_assignment.append(window_id + 1)  # 1-indexed to match hierarchical
+                    
+                    window_id += 1
+                
+                # Move to next window
+                start_idx += stride
+            
+            # Combine: protected embeddings first, then pooled windows
+            if pooled_window_embeddings:
+                pooled_tensor = torch.stack(pooled_window_embeddings)
+                
+                if actual_protected > 0:
+                    final_embeddings = torch.cat([protected_embeddings, pooled_tensor], dim=0)
+                else:
+                    final_embeddings = pooled_tensor
+            else:
+                # No windows created, just return protected embeddings
+                final_embeddings = protected_embeddings
+            
+            # Normalize the entire final tensor (L2 normalization)
+            if final_embeddings.shape[0] > 0:
+                final_embeddings = torch.nn.functional.normalize(
+                    input=final_embeddings, p=2, dim=1
+                )
+            
+            pooled_embeddings.append(final_embeddings)
+            window_assignments.append(window_assignment)
+        
+        return pooled_embeddings, window_assignments
+        
+    def _pool_embeddings_random(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int,
+        protected_tokens: int,
+        weights: Optional[list[torch.Tensor]] = None,
+    ) -> tuple[list[torch.Tensor], list[list[int]]]:
+        """
+        Pools the embeddings by randomly partitioning tokens into equal-sized pools.
+        
+        This method randomly partitions embeddings into pools of approximately equal size,
+        then averages embeddings within each pool (optionally weighted). Each embedding
+        is assigned to exactly one pool. Protected tokens at the start of each document
+        are preserved and not pooled.
+        
+        Parameters
+        ----------
+        documents_embeddings
+            A list of embeddings for each document. Each tensor has shape (seq_len, embedding_dim).
+        pool_factor
+            Factor to determine the number of pools. If there are N embeddings to pool,
+            approximately N // pool_factor pools will be created, each with approximately
+            pool_factor embeddings.
+        protected_tokens
+            Number of tokens to protect from pooling at the start of each document.
+        weights
+            Optional list of weight tensors (one per document) for weighted pooling.
+            Each weight tensor should have shape (seq_len,) matching the corresponding embeddings.
+            If None, uses unweighted averaging.
+        
+        Returns
+        -------
+        tuple[list[torch.Tensor], list[list[int]]]
+            A tuple of (pooled_embeddings, pool_assignments).
+            pooled_embeddings: A list of pooled embeddings for each document.
+            pool_assignments: A list of pool assignment lists, one per document.
+                Each assignment list maps original token indices (after protected_tokens) to pool IDs.
+        """
+        # Determine device from first embedding (respect original device)
+        # Only use CUDA if all embeddings are already on CUDA, otherwise use CPU
+        if documents_embeddings:
+            first_device = documents_embeddings[0].device
+            # Use CUDA only if CUDA is available AND all embeddings are already on CUDA
+            if torch.cuda.is_available() and first_device.type == "cuda":
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cpu")
+        
+        pooled_embeddings = []
+        pool_assignments = []
+        
+        iterator = tqdm(
+            zip(documents_embeddings, weights) if weights else documents_embeddings,
+            desc=f"Random pooling (factor={pool_factor})",
+            disable=not self.config.show_progress_bar,
+            leave=False,
+        )
+        
+        for item in iterator:
+            if weights:
+                document_embeddings, doc_weights = item
+                doc_weights = doc_weights.to(device=device)
+            else:
+                document_embeddings = item
+                doc_weights = None
+            document_embeddings = document_embeddings.to(device=device)
+            
+            # Separate protected tokens from the rest
+            # Ensure protected_tokens doesn't exceed document length to avoid CUDA asserts
+            num_doc_tokens = document_embeddings.shape[0]
+            actual_protected = min(protected_tokens, num_doc_tokens)
+            protected_embeddings = document_embeddings[:actual_protected]
+            embeddings_to_pool = document_embeddings[actual_protected:]
+            
+            num_embeddings = len(embeddings_to_pool)
+            
+            # If no embeddings to pool, just return protected embeddings
+            if num_embeddings == 0:
+                pooled_embeddings.append(protected_embeddings)
+                pool_assignments.append([])
+                continue
+            
+            # Calculate number of pools and pool sizes
+            # We want approximately num_embeddings // pool_factor pools
+            num_pools = max(num_embeddings // pool_factor, 1)
+            
+            # Create random permutation of indices
+            indices = torch.randperm(num_embeddings, device=device)
+            
+            # Partition indices into pools of approximately equal size
+            pool_indices_list = []
+            pool_assignment = [-1] * num_embeddings  # Initialize with -1
+            
+            # Calculate how many embeddings per pool
+            base_pool_size = num_embeddings // num_pools
+            remainder = num_embeddings % num_pools
+            
+            # Distribute embeddings into pools
+            current_idx = 0
+            for pool_id in range(num_pools):
+                # Some pools get one extra embedding if there's a remainder
+                pool_size = base_pool_size + (1 if pool_id < remainder else 0)
+                
+                # Get indices for this pool
+                pool_indices = indices[current_idx:current_idx + pool_size]
+                pool_indices_list.append(pool_indices)
+                
+                # Update assignment mapping (map from original index to pool_id, 1-indexed)
+                for orig_idx in pool_indices.cpu().tolist():
+                    pool_assignment[orig_idx] = pool_id + 1  # 1-indexed to match hierarchical
+                
+                current_idx += pool_size
+            
+            # Pool embeddings within each pool (optionally weighted)
+            pooled_document_embeddings = []
+            for pool_id in range(num_pools):
+                pool_indices = pool_indices_list[pool_id]
+                if len(pool_indices) > 0:
+                    pool_emb = embeddings_to_pool[pool_indices]
+                    
+                    if doc_weights is not None:
+                        # Weighted average: extract weights for this pool
+                        pool_weights = doc_weights[actual_protected:][pool_indices]
+                        # Normalize weights to sum to 1 (with safety check for zero sum)
+                        weight_sum = pool_weights.sum()
+                        if weight_sum > 0:
+                            pool_weights = pool_weights / weight_sum
+                            # Weighted average
+                            pool_embedding = (pool_emb * pool_weights.unsqueeze(1)).sum(dim=0)
+                        else:
+                            # Fallback to unweighted average if all weights are zero
+                            pool_embedding = pool_emb.mean(dim=0)
+                    else:
+                        # Unweighted average
+                        pool_embedding = pool_emb.mean(dim=0)
+                    
+                    pooled_document_embeddings.append(pool_embedding)
+            
+            # Combine: protected embeddings first, then pooled pools
+            if pooled_document_embeddings:
+                pooled_tensor = torch.stack(pooled_document_embeddings)
+                
+                if actual_protected > 0:
+                    final_embeddings = torch.cat([protected_embeddings, pooled_tensor], dim=0)
+                else:
+                    final_embeddings = pooled_tensor
+            else:
+                # No pools created, just return protected embeddings
+                final_embeddings = protected_embeddings
+            
+            # Normalize the entire final tensor (L2 normalization)
+            if final_embeddings.shape[0] > 0:
+                final_embeddings = torch.nn.functional.normalize(
+                    input=final_embeddings, p=2, dim=1
+                )
+            
+            pooled_embeddings.append(final_embeddings)
+            pool_assignments.append(pool_assignment)
+        
+        return pooled_embeddings, pool_assignments
+        
     def _pool_embeddings_hierarchical(
         self,
         documents_embeddings: list[torch.Tensor],
@@ -2601,10 +3253,25 @@ class PoolingStrategy(CompressionStrategy):
                 protected_tokens=self.config.protected_tokens,
                 weights=weights,
             )
+        elif self.config.clustering_method == "window":
+            pooled_embeddings, cluster_assignments = self._pool_embeddings_window(
+                documents_embeddings=embeddings,
+                pool_factor=self.config.pool_factor,
+                protected_tokens=self.config.protected_tokens,
+                weights=weights,
+                stride=self.config.stride,
+            )
+        elif self.config.clustering_method == "random":
+            pooled_embeddings, cluster_assignments = self._pool_embeddings_random(
+                documents_embeddings=embeddings,
+                pool_factor=self.config.pool_factor,
+                protected_tokens=self.config.protected_tokens,
+                weights=weights,
+            )
         else:
             raise ValueError(
                 f"Unknown clustering method: {self.config.clustering_method}. "
-                f"Must be 'hierarchical' or 'spherical'."
+                f"Must be 'hierarchical', 'spherical', 'window', or 'random'."
             )
         
         # Update shape-matched artifacts to match pooled embeddings
@@ -2632,7 +3299,12 @@ class PoolingStrategy(CompressionStrategy):
                     
                     # Use cluster assignments to select representative tokens
                     doc_cluster_labels = cluster_assignments[doc_idx]
-                    num_clusters = max(len(doc_cluster_labels) // self.config.pool_factor, 1)
+                    if doc_cluster_labels:
+                        # Find the maximum cluster ID to determine number of clusters
+                        max_cluster_id = max(doc_cluster_labels)
+                        num_clusters = max_cluster_id
+                    else:
+                        num_clusters = 0
                     
                     # For each cluster, select the first token as representative
                     for cluster_id in range(1, num_clusters + 1):
