@@ -8,8 +8,8 @@ import hashlib
 import json
 import logging
 import os
-import pickle
 import time
+from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 from tqdm.auto import tqdm
 import torch
@@ -152,7 +152,79 @@ def parse_arguments() -> argparse.Namespace:
         default=10_000,
         help="Number of documents per shard for encoding (default: 10000)",
     )
+    parser.add_argument(
+        "--embedding_dtype",
+        type=str,
+        default="fp16",
+        choices=["fp32", "fp16", "bf16"],
+        help="Datatype to cast embeddings to after encoding (model still runs in fp32) for saving and retrieval. Options: fp32, fp16, bf16 (default: fp16). NOTE: bf16 is not supported by all index types (e.g. ScaNN).",
+    )
+    parser.add_argument(
+        "--lowercase",
+        action="store_true",
+        help="Convert documents and queries to lowercase before encoding (default: False)",
+    )
     return parser.parse_args()
+
+
+def get_torch_dtype(dtype_str: str) -> torch.dtype:
+    """Convert dtype string to torch dtype."""
+    dtype_map = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    return dtype_map.get(dtype_str)
+
+
+def cast_embeddings(embeddings: List[torch.Tensor], dtype: torch.dtype) -> List[torch.Tensor]:
+    """Cast embeddings to the specified dtype."""
+    current_dtype = embeddings[0].dtype
+    if dtype == current_dtype:
+        return embeddings  # No casting needed
+    return [emb.to(dtype) for emb in embeddings]
+
+
+def pack_embeddings(embeddings: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Pack a list of embeddings into a dict with concatenated embeddings and lengths.
+    
+    Returns:
+        Dict with 'embeddings' (concatenated tensor) and 'lengths' (tensor of sequence lengths)
+    """
+    if not embeddings:
+        return {"embeddings": torch.empty(0), "lengths": torch.empty(0, dtype=torch.long)}
+    
+    lengths = torch.tensor([emb.shape[0] for emb in embeddings], dtype=torch.long)
+    concatenated = torch.cat(embeddings, dim=0)
+    
+    return {"embeddings": concatenated, "lengths": lengths}
+
+
+def unpack_embeddings(packed: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
+    """
+    Unpack a dict of concatenated embeddings and lengths back into a list of tensors.
+    
+    Args:
+        packed: Dict with 'embeddings' (concatenated tensor) and 'lengths' (tensor of sequence lengths)
+    
+    Returns:
+        List of embedding tensors
+    """
+    if packed["lengths"].numel() == 0:
+        return []
+    
+    concatenated = packed["embeddings"]
+    lengths = packed["lengths"]
+    
+    embeddings = []
+    start_idx = 0
+    for length in lengths:
+        end_idx = start_idx + length.item()
+        embeddings.append(concatenated[start_idx:end_idx])
+        start_idx = end_idx
+    
+    return embeddings
 
 
 def expand_model_paths(model_paths: List[str]) -> List[str]:
@@ -204,20 +276,22 @@ def load_dataset(dataset_name: str) -> Tuple[List[Dict[str, str]], Dict[str, str
     return documents, queries, qrels, dataset_name
 
 
-def preprocess_texts(documents: List[Dict[str, str]], queries: Dict[str, str]) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
-    """Convert documents and queries to lowercase."""
-    print("Casting documents and queries to lowercase...")
-    documents = [
-        {
-            "id": document["id"],
-            "text": document["text"].lower(),
-        }
-        for document in documents
-    ]
+def preprocess_texts(documents: List[Dict[str, str]], queries: Dict[str, str], lowercase: bool = False) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+    """Optionally convert documents and queries to lowercase."""
+    if lowercase:
+        print("Casting documents and queries to lowercase...")
+        documents = [
+            {
+                "id": document["id"],
+                "text": document["text"].lower(),
+            }
+            for document in documents
+        ]
 
-    queries = {
-        query_id: query.lower() for query_id, query in queries.items()
-    }
+        queries = {
+            query_id: query.lower() if lowercase else query for query_id, query in queries.items()
+        }
+
     
     return documents, queries
 
@@ -228,28 +302,30 @@ def setup_cache_directory(
     documents: List[Dict[str, str]],
     cache_dir: str,
     cache_embeddings: bool,
-) -> Tuple[str, str, str, str]:
+    embedding_dtype: str,
+) -> Tuple[Path, str, Path, Path]:
     """
     Set up cache directory structure and generate cache keys.
     
     Returns:
         Tuple of (cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file)
     """
-    # Generate cache directory structure: cache_dir/sanitized_model_name/dataset
+    # Generate cache directory structure: cache_dir/sanitized_model_name/dataset/embedding_dtype
+    # Include dtype in path to prevent mixing shards from different dtypes
     sanitized_model_name = "_".join(model_name.split("/")[-2:])
-    cache_subdir = os.path.join(cache_dir, sanitized_model_name, dataset_name)
+    cache_subdir = Path(cache_dir) / sanitized_model_name / dataset_name / embedding_dtype
     
     # Create cache directory if caching is enabled
     if cache_embeddings:
-        os.makedirs(cache_subdir, exist_ok=True)
+        cache_subdir.mkdir(parents=True, exist_ok=True)
     
     # Generate cache filenames based on dataset, model, and document content hash
     # Use a hash of document IDs and texts to detect if dataset changed
     doc_hash_input = "".join([doc["id"] + doc["text"] for doc in documents[:100]])  # Sample for hash
     doc_hash = hashlib.md5(doc_hash_input.encode()).hexdigest()[:8]
     cache_key = f"{len(documents)}_{doc_hash}"
-    doc_embeddings_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings.pkl")
-    query_embeddings_cache_file = os.path.join(cache_subdir, f"{cache_key}_query_embeddings.pkl")
+    doc_embeddings_cache_file = cache_subdir / f"{cache_key}_doc_embeddings.pt"
+    query_embeddings_cache_file = cache_subdir / f"{cache_key}_query_embeddings.pt"
     
     return cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file
 
@@ -257,12 +333,13 @@ def setup_cache_directory(
 def encode_documents_with_sharding(
     model: models.ColBERT,
     documents: List[Dict[str, str]],
-    cache_subdir: str,
+    cache_subdir: Path,
     cache_key: str,
-    doc_embeddings_cache_file: str,
+    doc_embeddings_cache_file: Path,
     cache_embeddings: bool,
     shard_size: int,
     batch_size: int,
+    embedding_dtype: torch.dtype,
 ) -> List[Any]:
     """
     Encode documents with sharding support, saving iteratively.
@@ -281,72 +358,62 @@ def encode_documents_with_sharding(
     if cache_embeddings:
         for shard_idx in range(num_shards):
             shard_num_str = f"{shard_idx:0{num_digits}d}"
-            shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
-            if os.path.exists(shard_cache_file):
+            shard_cache_file = cache_subdir / f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pt"
+            if shard_cache_file.exists():
                 cached_shards[shard_idx] = shard_cache_file
     
-    # Check if we have the old single-file cache (for backward compatibility)
-    if cache_embeddings and os.path.exists(doc_embeddings_cache_file) and len(cached_shards) == 0:
-        print(f"Loading cached document embeddings from {doc_embeddings_cache_file}...")
-        with open(doc_embeddings_cache_file, "rb") as f:
-            documents_embeddings = pickle.load(f)
-        print(f"Loaded {len(documents_embeddings)} document embeddings from cache.")
-        
-        # Convert old cache to shard-based format for future use
-        if cache_embeddings:
-            print("Converting to shard-based cache format...")
-            for shard_idx in range(num_shards):
-                start_idx = shard_idx * shard_size
-                end_idx = min(start_idx + shard_size, num_documents)
-                shard_embeddings = documents_embeddings[start_idx:end_idx]
+    # Encode documents in shards
+    print(f"Encoding documents in shards of size {shard_size}...")
+    print(f"Total documents: {num_documents}, Number of shards: {num_shards}")
+    if cached_shards:
+        print(f"Found {len(cached_shards)} cached shards, will encode {num_shards - len(cached_shards)} missing shards.")
+    
+    documents_embeddings = []
+    
+    # Process shards in order (load cached or encode missing)
+    for shard_idx in range(num_shards):
+        if shard_idx in cached_shards:
+            # Load cached shard
+            shard_cache_file = cached_shards[shard_idx]
+            print(f"Loading cached shard {shard_idx + 1}/{num_shards} from {shard_cache_file}...")
+            
+            # Load torch format
+            packed = torch.load(shard_cache_file, map_location="cpu")
+            shard_embeddings = unpack_embeddings(packed)
+            # Cast embeddings to specified dtype
+            shard_embeddings = cast_embeddings(shard_embeddings, embedding_dtype)
+            
+            documents_embeddings.extend(shard_embeddings)
+            print(f"Loaded shard {shard_idx + 1}/{num_shards} ({len(shard_embeddings)} embeddings)")
+        else:
+            # Encode missing shard
+            start_idx = shard_idx * shard_size
+            end_idx = min(start_idx + shard_size, num_documents)
+            shard_documents = documents[start_idx:end_idx]
+            
+            print(f"Encoding shard {shard_idx + 1}/{num_shards} (documents {start_idx} to {end_idx - 1})...")
+            shard_embeddings = model.encode(
+                sentences=[document["text"] for document in shard_documents],
+                batch_size=batch_size,
+                is_query=False,
+                show_progress_bar=True,
+                convert_to_tensor=True,
+            )
+            # Cast embeddings to specified dtype after encoding
+            shard_embeddings = cast_embeddings(shard_embeddings, embedding_dtype)
+            documents_embeddings.extend(shard_embeddings)
+            
+            # Save shard immediately after encoding
+            if cache_embeddings:
                 shard_num_str = f"{shard_idx:0{num_digits}d}"
-                shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
-                with open(shard_cache_file, "wb") as f:
-                    pickle.dump(shard_embeddings, f)
-            print("Conversion complete.")
-    else:
-        print(f"Encoding documents in shards of size {shard_size}...")
-        print(f"Total documents: {num_documents}, Number of shards: {num_shards}")
-        if cached_shards:
-            print(f"Found {len(cached_shards)} cached shards, will encode {num_shards - len(cached_shards)} missing shards.")
-        
-        documents_embeddings = []
-        
-        # Process shards in order (load cached or encode missing)
-        for shard_idx in range(num_shards):
-            if shard_idx in cached_shards:
-                # Load cached shard
-                shard_cache_file = cached_shards[shard_idx]
-                print(f"Loading cached shard {shard_idx + 1}/{num_shards} from {shard_cache_file}...")
-                with open(shard_cache_file, "rb") as f:
-                    shard_embeddings = pickle.load(f)
-                documents_embeddings.extend(shard_embeddings)
-                print(f"Loaded shard {shard_idx + 1}/{num_shards} ({len(shard_embeddings)} embeddings)")
-            else:
-                # Encode missing shard
-                start_idx = shard_idx * shard_size
-                end_idx = min(start_idx + shard_size, num_documents)
-                shard_documents = documents[start_idx:end_idx]
-                
-                print(f"Encoding shard {shard_idx + 1}/{num_shards} (documents {start_idx} to {end_idx - 1})...")
-                shard_embeddings = model.encode(
-                    sentences=[document["text"] for document in shard_documents],
-                    batch_size=batch_size,
-                    is_query=False,
-                    show_progress_bar=True,
-                )
-                documents_embeddings.extend(shard_embeddings)
-                
-                # Save shard immediately after encoding
-                if cache_embeddings:
-                    shard_num_str = f"{shard_idx:0{num_digits}d}"
-                    shard_cache_file = os.path.join(cache_subdir, f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pkl")
-                    print(f"Saving shard {shard_idx + 1}/{num_shards} to {shard_cache_file}...")
-                    with open(shard_cache_file, "wb") as f:
-                        pickle.dump(shard_embeddings, f)
-                    print(f"Shard {shard_idx + 1}/{num_shards} saved.")
-        
-        print(f"Document encoding complete. Total embeddings: {len(documents_embeddings)}")
+                shard_cache_file = cache_subdir / f"{cache_key}_doc_embeddings_shard_{shard_num_str}.pt"
+                print(f"Saving shard {shard_idx + 1}/{num_shards} to {shard_cache_file}...")
+                # Pack embeddings before saving
+                packed = pack_embeddings(shard_embeddings)
+                torch.save(packed, shard_cache_file)
+                print(f"Shard {shard_idx + 1}/{num_shards} saved.")
+    
+    print(f"Document encoding complete. Total embeddings: {len(documents_embeddings)}")
     
     return documents_embeddings
 
@@ -354,9 +421,10 @@ def encode_documents_with_sharding(
 def encode_queries(
     model: models.ColBERT,
     queries: Dict[str, str],
-    query_embeddings_cache_file: str,
+    query_embeddings_cache_file: Path,
     cache_embeddings: bool,
     batch_size: int,
+    embedding_dtype: torch.dtype,
 ) -> List[Any]:
     """
     Encode queries, loading from cache if available.
@@ -364,11 +432,13 @@ def encode_queries(
     Returns:
         List of query embeddings
     """
-    if cache_embeddings and os.path.exists(query_embeddings_cache_file):
+    if cache_embeddings and query_embeddings_cache_file.exists():
         print(f"Loading cached query embeddings from {query_embeddings_cache_file}...")
-        with open(query_embeddings_cache_file, "rb") as f:
-            queries_embeddings = pickle.load(f)
+        packed = torch.load(query_embeddings_cache_file, map_location="cpu")
+        queries_embeddings = unpack_embeddings(packed)
         print(f"Loaded {len(queries_embeddings)} query embeddings from cache.")
+        # Cast embeddings to specified dtype
+        queries_embeddings = cast_embeddings(queries_embeddings, embedding_dtype)
     else:
         print("Encoding queries...")
         queries_embeddings = model.encode(
@@ -376,13 +446,17 @@ def encode_queries(
             is_query=True,
             show_progress_bar=True,
             batch_size=batch_size,
+            convert_to_tensor=True,
         )
+        # Cast embeddings to specified dtype after encoding
+        queries_embeddings = cast_embeddings(queries_embeddings, embedding_dtype)
         
         # Save query embeddings if caching is enabled
         if cache_embeddings:
             print(f"Saving query embeddings to {query_embeddings_cache_file}...")
-            with open(query_embeddings_cache_file, "wb") as f:
-                pickle.dump(queries_embeddings, f)
+            # Pack embeddings before saving
+            packed = pack_embeddings(queries_embeddings)
+            torch.save(packed, query_embeddings_cache_file)
             print("Query embeddings saved.")
     
     return queries_embeddings
@@ -412,7 +486,7 @@ def get_index_configs(
                 "num_neighbors": args.num_neighbors,
                 "num_leaves": args.num_leaves,
                 "num_leaves_to_search": args.num_leaves_to_search,
-                "verbose": False,
+                "verbose": True,
             },
             "add_documents_kwargs": {
                 "batch_size": args.batch_size,
@@ -458,31 +532,6 @@ def get_index_configs(
     return index_configs
 
 
-def convert_embeddings_to_tensors(
-    documents_embeddings: List[Any],
-    queries_embeddings: List[Any],
-    limit_queries: Optional[int],
-    limit_documents: Optional[int],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """
-    Convert embeddings to tensors on CUDA device and apply limits.
-    
-    Returns:
-        Tuple of (documents_embeddings_tensors, queries_embeddings_tensors)
-    """
-    # convert documents_embeddings and queries_embeddings to lists of tensors on device
-    documents_embeddings = [torch.tensor(doc_emb, device="cuda") for doc_emb in tqdm(documents_embeddings, desc="Converting documents embeddings to tensors")]
-    queries_embeddings = [torch.tensor(query_emb, device="cuda") for query_emb in tqdm(queries_embeddings, desc="Converting queries embeddings to tensors")]
-
-    if limit_queries:
-        queries_embeddings = queries_embeddings[:limit_queries]
-
-    if limit_documents:
-        documents_embeddings = documents_embeddings[:limit_documents]
-
-    return documents_embeddings, queries_embeddings
-
-
 def test_index(
     config: Dict[str, Any],
     documents: List[Dict[str, str]],
@@ -495,7 +544,9 @@ def test_index(
     k: int,
     k_token: int,
     verbose: bool,
-    results_dir: str,
+    results_dir: Path,
+    embedding_dtype: str,
+    lowercase: bool,
 ) -> None:
     """
     Test a single index: create, add documents, retrieve, evaluate, and save results.
@@ -527,7 +578,7 @@ def test_index(
     if isinstance(index, indexes.PLAID):
         scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k)
     else:
-        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token)
+        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=1)
     retrieve_time = time.time() - start_time
     print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
     
@@ -556,6 +607,8 @@ def test_index(
     jsonl_entry = {
         "dataset": dataset_name,
         "model": model_name,
+        "embedding_dtype": embedding_dtype,
+        "lowercase": lowercase,
         "evaluation_scores": evaluation_scores,
         "index_time": index_time,
         "retrieve_time": retrieve_time,
@@ -565,7 +618,7 @@ def test_index(
     }
     
     # Append to index-specific JSONL file
-    jsonl_file = os.path.join(results_dir, f"{index_name}.jsonl")
+    jsonl_file = Path(results_dir) / f"{index_name}.jsonl"
     with open(jsonl_file, "a") as f:
         f.write(json.dumps(jsonl_entry) + "\n")
     
@@ -577,6 +630,10 @@ def test_index(
 def main() -> None:
     """Main function that orchestrates the evaluation process."""
     args = parse_arguments()
+    
+    # Convert embedding dtype string to torch dtype
+    embedding_dtype = get_torch_dtype(args.embedding_dtype)
+    print(f"Embedding dtype: {args.embedding_dtype} ({embedding_dtype})")
     
     # Expand glob patterns for model paths
     all_model_paths = expand_model_paths(args.model_name_or_path)
@@ -602,8 +659,8 @@ def main() -> None:
         # Load dataset
         documents, queries, qrels, dataset_name = load_dataset(dataset_name)
 
-        # Preprocess texts (lowercase)
-        documents, queries = preprocess_texts(documents, queries)
+        # Preprocess texts (optionally lowercase)
+        documents, queries = preprocess_texts(documents, queries, lowercase=args.lowercase)
 
         # Setup cache directory
         cache_subdir, cache_key, doc_embeddings_cache_file, query_embeddings_cache_file = setup_cache_directory(
@@ -612,6 +669,7 @@ def main() -> None:
             documents=documents,
             cache_dir=args.cache_dir,
             cache_embeddings=args.cache_embeddings,
+            embedding_dtype=args.embedding_dtype,
         )
         
         # Encode documents with sharding
@@ -624,6 +682,7 @@ def main() -> None:
             cache_embeddings=args.cache_embeddings,
             shard_size=args.shard_size,
             batch_size=args.batch_size,
+            embedding_dtype=embedding_dtype,
         )
         
         # Encode queries
@@ -633,6 +692,7 @@ def main() -> None:
             query_embeddings_cache_file=query_embeddings_cache_file,
             cache_embeddings=args.cache_embeddings,
             batch_size=args.batch_size,
+            embedding_dtype=embedding_dtype,
         )
 
         # Get embedding size from the model's final layer
@@ -650,21 +710,18 @@ def main() -> None:
         print(f"Testing {len(index_configs)} indexes: {args.index_types}")
         print(f"Index configurations: {index_configs}")
 
-        # Convert embeddings to tensors
-        documents_embeddings, queries_embeddings = convert_embeddings_to_tensors(
-            documents_embeddings=documents_embeddings,
-            queries_embeddings=queries_embeddings,
-            limit_queries=args.limit_queries,
-            limit_documents=args.limit_documents,
-        )
+        if args.limit_queries:
+            queries_embeddings = queries_embeddings[:args.limit_queries]
+        if args.limit_documents:
+            documents_embeddings = documents_embeddings[:args.limit_documents]
 
         print(f"Embedding size: {embedding_size}")
         print(f"Number of documents: {len(documents)}")
         print(f"Doc 1 embedding shape: {documents_embeddings[0].shape}")
 
         # Create results directory
-        results_dir = f"results/{dataset_name}"
-        os.makedirs(results_dir, exist_ok=True)
+        results_dir = Path("results") / dataset_name
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         # Test each index
         for config in index_configs:
@@ -681,6 +738,8 @@ def main() -> None:
                 k_token=args.k_token,
                 verbose=args.verbose,
                 results_dir=results_dir,
+                embedding_dtype=args.embedding_dtype,
+                lowercase=args.lowercase,
             )
 
 

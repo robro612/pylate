@@ -7,6 +7,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from .base import Base
 
@@ -96,10 +97,9 @@ class ScaNN(Base):
         # In-memory data structures only (no file I/O)
         self.searcher = None
         self.all_embeddings = None
-        self.embedding_id_to_position = {}  # Map embedding ID to position in array
-        self.position_to_embedding_id = {}  # Reverse mapping: position to embedding ID
-        self.embeddings_to_documents_ids = {}  # In-memory mapping: embedding ID -> document ID
-        self.documents_ids_to_embeddings = {}  # In-memory mapping: document ID -> list of embedding IDs
+        # Note: embedding_id == position (sequential IDs), so no need for separate mappings
+        self.documents_ids_to_embeddings = {}  # In-memory mapping: document ID (str) -> list of embedding IDs
+        self.position_to_doc_id = None  # Direct mapping: position -> document ID (numpy array for vectorized indexing)
         self._documents_added = False  # Track if documents have been added
 
 
@@ -113,12 +113,6 @@ class ScaNN(Base):
                 'ScaNN is not installed. Please install it with: `pip install "pylate[scann]"` or `pip install scann`.'
             )
 
-        # Assume embeddings are already normalized
-        step_start = time.time()
-        embeddings = embeddings.astype(np.float32)
-        step_time = time.time() - step_start
-        if self.verbose:
-            logger.info(f"[ScaNN] Converting embeddings to float32 ({embeddings.shape[0]} vectors, {embeddings.shape[1]} dims): {step_time:.4f}s")
 
         # Auto-tune parameters if not set
         num_vectors = embeddings.shape[0]
@@ -185,9 +179,9 @@ class ScaNN(Base):
         
         # Convert to numpy array
         if isinstance(flattened_embeddings[0], list):
-            flattened_embeddings = np.array(flattened_embeddings, dtype=np.float32)
+            flattened_embeddings = np.array(flattened_embeddings)
         else:
-            flattened_embeddings = np.array(flattened_embeddings, dtype=np.float32)
+            flattened_embeddings = np.array(flattened_embeddings)
         step_time = time.time() - step_start
         if self.verbose:
             logger.info(f"[ScaNN] Flattening and converting to numpy array ({len(flattened_embeddings)} embeddings): {step_time:.4f}s")
@@ -199,34 +193,41 @@ class ScaNN(Base):
         if self.verbose:
             logger.info(f"[ScaNN] Assigning embedding IDs: {step_time:.4f}s")
 
-        # Store mappings in memory
+        # Store mappings in memory and build position->doc_id array directly
+        # Since embedding_id == position (sequential), we can build position_to_doc_id directly
         step_start = time.time()
+        position_to_doc_id_list = [None] * len(embedding_ids)
         total = 0
-        for doc_id, document_embeddings in zip(documents_ids, documents_embeddings):
+        iterator = tqdm(
+            zip(documents_ids, documents_embeddings),
+            desc="Adding documents to ScaNN index",
+            total=len(documents_ids),
+            disable=not self.verbose,
+        )
+        for doc_id, document_embeddings in iterator:
             num_tokens = len(document_embeddings)
             document_embeddings_ids = embedding_ids[total : total + num_tokens]
             self.documents_ids_to_embeddings[doc_id] = document_embeddings_ids
 
-            # Update in-memory mapping
+            # Build position->doc_id mapping directly (emb_id == pos, so use pos as index)
             for emb_id in document_embeddings_ids:
-                self.embeddings_to_documents_ids[str(emb_id)] = doc_id
+                position_to_doc_id_list[emb_id] = doc_id
             
             total += num_tokens
 
+        # Convert to numpy array for vectorized indexing (object dtype for strings)
+        self.position_to_doc_id = np.array(position_to_doc_id_list, dtype=object)
+        
         step_time = time.time() - step_start
         if self.verbose:
-            logger.info(f"[ScaNN] Storing ID mappings: {step_time:.4f}s")
+            logger.info(f"[ScaNN] Storing ID mappings and building position->doc_id array: {step_time:.4f}s")
 
         # Build the ScaNN index with all embeddings
         if len(flattened_embeddings) > 0:
             if self.verbose:
                 logger.info(f"[ScaNN] Building index with {len(flattened_embeddings)} embeddings...")
             
-            # Set position mappings sequentially (embedding ID == position for simplicity)
-            for pos, emb_id in enumerate(embedding_ids):
-                self.embedding_id_to_position[emb_id] = pos
-                self.position_to_embedding_id[pos] = emb_id
-
+            # Note: embedding_id == position (sequential), so no position mappings needed
             # Build searcher (in-memory only)
             self._build_searcher(flattened_embeddings)
             
@@ -291,9 +292,6 @@ class ScaNN(Base):
 
         total_start = time.time()
         
-        # Use in-memory mapping (already loaded, no need to load from SQLite)
-        embeddings_to_documents_ids = self.embeddings_to_documents_ids
-        
         # Reshape queries
         step_start = time.time()
         queries_embeddings = reshape_embeddings(embeddings=queries_embeddings)
@@ -305,7 +303,7 @@ class ScaNN(Base):
         # Flatten query embeddings (assume they are already normalized)
         step_start = time.time()
         flattened_queries = np.array(
-            list(itertools.chain(*queries_embeddings)), dtype=np.float32
+            list(itertools.chain(*queries_embeddings))
         )
         n_tokens_total = len(flattened_queries)
         step_time = time.time() - step_start
@@ -323,51 +321,32 @@ class ScaNN(Base):
         if self.verbose:
             logger.info(f"[ScaNN] ScaNN search_batched for {n_tokens_total} tokens (k={k}): {step_time:.4f}s ({step_time/n_tokens_total*1000:.2f}ms per token)")
 
-        # Map embedding indices back to document IDs
+        # Map embedding indices back to document IDs using fully vectorized numpy operations
         step_start = time.time()
         n_tokens_per_query = [len(q) for q in queries_embeddings]
         
+        # Vectorized lookup: process all tokens at once using numpy advanced indexing
+        # neighbors shape: (n_tokens_total, k), distances shape: (n_tokens_total, k)
+        all_neighbor_positions = neighbors[:, :k]  # Shape: (n_tokens_total, k)
+        all_doc_ids = self.position_to_doc_id[all_neighbor_positions]  # Vectorized lookup for all tokens
+        all_distances = distances[:, :k]  # Vectorized conversion
+        
+        # Reshape back into nested structure (queries -> tokens -> neighbors)
         documents = []
         distances_list = []
-        
-        mapping_time = 0
-        lookup_time = 0
-        validation_time = 0
-        
-        query_idx = 0
+        token_idx = 0
         for query_num, n_tokens in enumerate(n_tokens_per_query):
             query_documents = []
             query_distances = []
             
-            for token_idx in range(n_tokens):
-                token_start = time.time()
-                token_neighbors = neighbors[query_idx]
-                token_distances = distances[query_idx]
-                mapping_time += time.time() - token_start
+            for _ in range(n_tokens):
+                # Extract results for this token (already vectorized)
+                token_docs = all_doc_ids[token_idx]
+                token_dists = all_distances[token_idx]
                 
-                # Map embedding indices to document IDs
-                token_docs = []
-                token_dists = []
-                
-                for neighbor_pos, dist in zip(token_neighbors, token_distances):
-                    lookup_start = time.time()
-                    # neighbor_pos is a position in the array, map back to embedding ID using reverse mapping
-                    emb_id = self.position_to_embedding_id.get(neighbor_pos)
-                    lookup_time += time.time() - lookup_start
-                    
-                    validation_start = time.time()
-                    if emb_id is not None:
-                        # Direct lookup in in-memory dict (no validation needed - if it's in the dict, it's valid)
-                        emb_id_str = str(emb_id)
-                        doc_id = embeddings_to_documents_ids.get(emb_id_str)
-                        if doc_id is not None:
-                            token_docs.append(doc_id)
-                            token_dists.append(float(dist))
-                    validation_time += time.time() - validation_start
-                
-                query_documents.append(token_docs[:k])
-                query_distances.append(token_dists[:k])
-                query_idx += 1
+                query_documents.append(token_docs)
+                query_distances.append(token_dists)
+                token_idx += 1
             
             documents.append(query_documents)
             distances_list.append(query_distances)
@@ -375,9 +354,6 @@ class ScaNN(Base):
         step_time = time.time() - step_start
         if self.verbose:
             logger.info(f"[ScaNN] Mapping results to document IDs: {step_time:.4f}s")
-            logger.info(f"[ScaNN]   - Array indexing: {mapping_time:.4f}s")
-            logger.info(f"[ScaNN]   - Position->ID lookup: {lookup_time:.4f}s")
-            logger.info(f"[ScaNN]   - Validation & doc ID lookup: {validation_time:.4f}s")
         
         total_time = time.time() - total_start
         if self.verbose:
@@ -400,14 +376,14 @@ class ScaNN(Base):
             raise ValueError("Index is empty, add documents before retrieving embeddings.")
 
         # Retrieve embeddings from memory using their IDs
+        # Since embedding_id == position, we can use embedding_ids directly as positions
         reconstructed_embeddings = []
         for doc_group in documents_ids:
             group_embeddings = []
             for doc_id in doc_group:
                 doc_embedding_ids = self.documents_ids_to_embeddings[doc_id]
-                # Directly index into the array - no conversion needed
-                positions = [self.embedding_id_to_position[emb_id] for emb_id in doc_embedding_ids]
-                doc_embeddings = self.all_embeddings[positions]  # Shape: (seq_len, dim)
+                # embedding_id == position, so use embedding_ids directly as array indices
+                doc_embeddings = self.all_embeddings[doc_embedding_ids]  # Shape: (seq_len, dim)
                 group_embeddings.append(doc_embeddings)
             reconstructed_embeddings.append(group_embeddings)
 

@@ -20,8 +20,10 @@ parser.add_argument("--k_prime", type=int, default=100)
 parser.add_argument("--lr", type=float, default=3e-6)
 parser.add_argument("--k_prime_start", type=int, default=None, help="Starting k_prime for annealing (defaults to k_prime if not set)")
 parser.add_argument("--k_prime_anneal_steps", type=int, default=1000, help="Number of steps over which to anneal k_prime")
-parser.add_argument("--k_prime_schedule", type=str, default="linear", choices=["linear", "exponential", "constant"], help="Schedule type for k_prime annealing")
+parser.add_argument("--k_prime_schedule", type=str, default="constant", choices=["linear", "exponential", "constant"], help="Schedule type for k_prime annealing")
 parser.add_argument("--use_colbert", action="store_true", help="Use ColBERT score function instead of XTR (baseline)")
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--model_name", type=str, default="answerdotai/ModernBERT-base")
 parser.add_argument("--run_name", type=str, default=None, help="Override the default run name")
 args = parser.parse_args()
 
@@ -39,8 +41,8 @@ print(f"use_normalizer_Z: {use_normalizer_Z}, k_prime: {k_prime}, k_prime_start:
 
 # Define model parameters for contrastive training
 # model_name = "bert-base-uncased"  # Choose the pre-trained model you want to use as base
-model_name = "answerdotai/ModernBERT-base"
-batch_size = 128  # Larger batch size often improves results, but requires more memory
+model_name = args.model_name
+batch_size = args.batch_size  # Larger batch size often improves results, but requires more memory
 
 num_train_epochs = 1  # Adjust based on your requirements
 # Set the run name for logging and output directory
@@ -77,6 +79,8 @@ model = models.ColBERT(
     model_name_or_path=model_name,
     query_length=32,
     document_length=300,
+    do_query_expansion=True,
+    attend_to_expansion_tokens=True,
 )
 
 # Load dataset
@@ -141,11 +145,12 @@ training_args = SentenceTransformerTrainingArguments(
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
     bf16=True,
+    fp16=False,
     learning_rate=lr,
-    run_name=run_name,  # Will be used in W&B if `wandb` is installed
+    run_name=run_name,
     logging_steps=1,
     eval_strategy="steps",
-    eval_steps=50,
+    eval_steps=100,
     save_steps=1000,
 )
 
