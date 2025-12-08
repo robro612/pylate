@@ -1,36 +1,29 @@
 from __future__ import annotations
 
-from .colbert import ColBERT
+
+from .base import *
 from .compression import (
     CompressionArtifacts,
     CompressionConfig,
     CompressionStrategy,
     Compressor,
-    IDFPruningConfig,
-    IDFPruningStrategy,
-    PoolingConfig,
-    PoolingStrategy,
-    AttentionPruningConfig,
-    AttentionPruningStrategy,
-    LeverageScorePruningConfig,
-    LeverageScorePruningStrategy,
-    ImportancePruningConfig,
-    ImportancePruningStrategy,
-    ImportancePoolingConfig,
-    ImportancePoolingStrategy,
-    HybridPoolingConfig,
-    HybridImportanceClusteringPoolingStrategy,
-    RandomPruningConfig,
-    RandomPruningStrategy,
-    RandomPoolingConfig,
-    RandomPoolingStrategy,
     validate_compression_artifact_shape,
 )
+from .idf_pruning import IDFPruningConfig, IDFPruningStrategy
+from .pooling import PoolingConfig, PoolingStrategy
+from .attention_pruning import AttentionPruningConfig, AttentionPruningStrategy
+from .leverage_score_pruning import LeverageScorePruningConfig, LeverageScorePruningStrategy
+from .importance_pruning import ImportancePruningConfig, ImportancePruningStrategy
+from .importance_pooling import ImportancePoolingConfig, ImportancePoolingStrategy
+from .hybrid_importance_pooling import HybridPoolingConfig, HybridImportanceClusteringPoolingStrategy
+from .random_pruning import RandomPruningConfig, RandomPruningStrategy
+from .random_pooling import RandomPoolingConfig, RandomPoolingStrategy
 
-from .Dense import Dense
+
+
+from ..Dense import Dense
 
 __all__ = [
-    "ColBERT",
     "Dense",
     "CompressionArtifacts",
     "CompressionConfig",

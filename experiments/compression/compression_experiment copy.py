@@ -24,16 +24,6 @@ from pylate.models.compression import (
     AttentionPruningStrategy,
     LeverageScorePruningConfig,
     LeverageScorePruningStrategy,
-    ImportancePruningConfig,
-    ImportancePruningStrategy,
-    ImportancePoolingConfig,
-    ImportancePoolingStrategy,
-    HybridPoolingConfig,
-    HybridImportanceClusteringPoolingStrategy,
-    RandomPruningConfig,
-    RandomPruningStrategy,
-    RandomPoolingConfig,
-    RandomPoolingStrategy,
 )
 
 # Query length mapping for different datasets
@@ -280,160 +270,36 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
         List of compression configs (None for baseline)
     """
     configs = [None]  # Baseline (no compression)
-    # configs = []  # exclude Baseline (no compression)
-
-
-    # # # Importance-based pruning configs (keep_ratio approach)
-    # for keep_ratio in [0.1, 0.2, 0.33, 0.5,]:
-    #     importance_config = ImportancePruningConfig(
-    #         keep_ratio=keep_ratio,
-    #         protected_tokens=1,
-    #         min_tokens=8,
-    #         use_norm=True,
-    #         use_idf=False,  # Set to True if IDF artifacts are available
-    #         use_token_weights=False,  # Set to True if token_weights artifacts are available
-    #         norm_weight=1.0,
-    #     )
-    #     strategy = ImportancePruningStrategy(importance_config)
-    #     config = CompressionConfig(
-    #         strategies=[strategy],
-    #         description=f"Importance pruning keep_ratio={keep_ratio}",
-    #     )
-    #     configs.append(config)
-
-    #     # Importance-based pooling configs (keep_ratio approach)
-    #     pooling_config = ImportancePoolingConfig(
-    #         keep_ratio=keep_ratio,
-    #         protected_tokens=1,
-    #         min_tokens=8,
-    #         use_norm=True,
-    #         use_idf=False,  # Set to True if IDF artifacts are available
-    #         use_token_weights=False,  # Set to True if token_weights artifacts are available
-    #         norm_weight=1.0,
-    #     )
-    #     strategy = ImportancePoolingStrategy(pooling_config)
-    #     config = CompressionConfig(
-    #         strategies=[strategy],
-    #         description=f"Importance pooling keep_ratio={keep_ratio}",
-    #     )
-    #     configs.append(config)
-
-    # # Hybrid importance + clustering pooling (anchor-aware pooling within clusters)
-    # for pool_factor, keep_ratio in [
-    #     # (2, 0.5),
-    #     # (3, 0.33),
-    #     # (4, 0.25),
-    #     # (5, 0.2),
-    #     (2, 0.5*0.8),
-    #     (3, 0.33*0.8),
-    #     (5, 0.2*0.8),
-    #     (10, 0.1*0.8),
-    # ]:
-    #     hybrid_config = HybridPoolingConfig(
-    #         pool_factor=pool_factor,
-    #         keep_ratio=keep_ratio,
-    #         protected_tokens=1,
-    #         min_tokens=8,
-    #         clustering_method="hierarchical",
-    #         show_progress_bar=True,
-    #         use_norm=True,
-    #         use_idf=False,
-    #         use_token_weights=False,
-    #         norm_weight=1.0,
-    #         idf_weight=1.0,
-    #         token_weights_weight=1.0,
-    #     )
-    #     hybrid_strategy = HybridImportanceClusteringPoolingStrategy(hybrid_config)
-    #     configs.append(
-    #         CompressionConfig(
-    #             strategies=[hybrid_strategy],
-    #             description=f"Hybrid importance+clustering pooling pf={pool_factor} kr={keep_ratio}",
-    #         )
-    #     )
-
-    # Random pruning baseline
-    for keep_ratio in [0.1, 0.2, 0.33, 0.5]:
-        rand_prune_cfg = RandomPruningConfig(
-            keep_ratio=keep_ratio,
-            protected_tokens=1,
-            min_tokens=8,
-            seed=666,
-        )
-        rand_prune_strategy = RandomPruningStrategy(rand_prune_cfg)
-        configs.append(
-            CompressionConfig(
-                strategies=[rand_prune_strategy],
-                description=f"Random pruning keep_ratio={keep_ratio}",
-            )
-        )
-
-        # Random pooling baseline
-        rand_pool_cfg = RandomPoolingConfig(
-            keep_ratio=keep_ratio,
-            protected_tokens=1,
-            min_tokens=8,
-            seed=666,
-        )
-        rand_pool_strategy = RandomPoolingStrategy(rand_pool_cfg)
-        configs.append(
-            CompressionConfig(
-                strategies=[rand_pool_strategy],
-                description=f"Random pooling keep_ratio={keep_ratio}",
-            )
-        )
-
-        # attention score pruning configs
+    # attention score pruning configs
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
         attention_config = AttentionPruningConfig(
-            # top_k=k,
-            keep_ratio=keep_ratio,
+            top_k=k,
             protected_tokens=1,
             track_pruned_tokens=False,
         )
         strategy = AttentionPruningStrategy(attention_config)
         config = CompressionConfig(
             strategies=[strategy],
-            # description=f"Attention score pruning k={k}",
-            description=f"Attention score pruning keep_ratio={keep_ratio}",
+            description=f"Attention score pruning k={k}",
         )
         configs.append(config)
 
         leverage_config = LeverageScorePruningConfig(
-            # top_k=k,
-            keep_ratio=keep_ratio,
+            top_k=k,
             protected_tokens=1,
             track_pruned_tokens=False,
         )
         strategy = LeverageScorePruningStrategy(leverage_config)
         config = CompressionConfig(
             strategies=[strategy],
-            # description=f"Leverage score pruning k={k}",
-            description=f"Leverage score pruning keep_ratio={keep_ratio}",
+            description=f"Leverage score pruning k={k}",
         )
-        configs.append(config)
     
-        # # Global IDF pruning configs
-        # pruning_config = IDFPruningConfig(
-        #     mode="global",
-        #     # top_k=k,
-        #     keep_ratio=keep_ratio,
-        #     protected_tokens=1,
-        #     ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
-        #     use_tfidf=False,
-        #     track_pruned_tokens=False,
-        # )
-        # strategy = IDFPruningStrategy(pruning_config)
-        # config = CompressionConfig(
-        #     strategies=[strategy],
-        #     # description=f"Global IDF pruning k={k}",
-        #     description=f"Global IDF pruning keep_ratio={keep_ratio}",
-        # )
-        # configs.append(config)
-    
-        # Document-wise IDF pruning configs
+    # Global IDF pruning configs
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
         pruning_config = IDFPruningConfig(
-            mode="document",
-            # top_k=k,
-            keep_ratio=keep_ratio,
+            mode="global",
+            top_k=k,
             protected_tokens=1,
             ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
             use_tfidf=False,
@@ -442,14 +308,30 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
         strategy = IDFPruningStrategy(pruning_config)
         config = CompressionConfig(
             strategies=[strategy],
-            # description=f"Doc-wise IDF pruning k={k}",
-            description=f"Doc-wise IDF pruning keep_ratio={keep_ratio}",
+            description=f"Global IDF pruning k={k}",
+        )
+        configs.append(config)
+    
+    # Document-wise IDF pruning configs
+    for k in [5, 10, 20, 40, 80, 120, 160, 200]:
+        pruning_config = IDFPruningConfig(
+            mode="document",
+            top_k=k,
+            protected_tokens=1,
+            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
+            use_tfidf=False,
+            track_pruned_tokens=False,
+        )
+        strategy = IDFPruningStrategy(pruning_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"Doc-wise IDF pruning k={k}",
         )
         configs.append(config)
     
     # Pooling configs
     for method in ["spherical", "hierarchical"]:
-        for k in [2, 3, 5, 10]:
+        for k in [2, 3, 4, 5]:
             pooling_config = PoolingConfig(
                 pool_factor=k,
                 protected_tokens=1,
@@ -888,7 +770,6 @@ def main() -> None:
 
     # Generate run_id for consistent naming and tracking
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_jsonl_path = experiment_output_dir / f"results_{run_id}.jsonl"
 
     # Load compression configs
     print("\n" + "=" * 80)
@@ -909,9 +790,8 @@ def main() -> None:
             print(f"  [{i}] {config.description}")
 
     # Encode documents once with artifacts (input_ids needed for IDF pruning)
-    # Use normalize_embeddings=False to get unnormalized embeddings for importance scoring
     print("\n" + "=" * 80)
-    print("Encoding documents (unnormalized for importance scoring)...")
+    print("Encoding documents...")
     print("=" * 80)
     encoding_start = time.time()
     documents_embeddings, artifacts = model.encode(
@@ -920,12 +800,10 @@ def main() -> None:
         is_query=False,
         show_progress_bar=True,
         convert_to_tensor=True,
-        normalize_embeddings=False,  # Keep unnormalized for importance scoring
         return_extra_artifacts={"input_ids": True, "attention_scores": True},
     )
     encoding_time = time.time() - encoding_start
     print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
-    print(f"   Embeddings are UNNORMALIZED (for importance-based compression)")
 
     # Encode queries once
     print("\n" + "=" * 80)
@@ -952,31 +830,6 @@ def main() -> None:
         "num_configs": len(configs),
     }
 
-    # Write initial metadata so results file exists before per-config appends
-    metadata_entry = {
-        "type": "metadata",
-        "run_id": run_id,
-        "timestamp": datetime.now().isoformat(),
-        "model_name": args.model_name,
-        "dataset_name": args.dataset_name,
-        "num_documents": stats.get("num_documents"),
-        "num_configs": len(configs),
-        "args": {
-            "index_type": args.index_type,
-            "batch_size": args.batch_size,
-            "metrics": args.metrics,
-            "configs_file": args.configs_file,
-        },
-        "timing": {
-            "encoding_time": stats.get("encoding_time"),
-            "query_encoding_time": stats.get("query_encoding_time"),
-            "total_time": None,  # filled in after all configs
-        },
-        "configs": [serialize_config_for_storage(config) for config in configs],
-    }
-    with open(results_jsonl_path, "w") as f:
-        f.write(json.dumps(metadata_entry, default=str) + "\n")
-
     # Evaluate each compression config
     print("\n" + "=" * 80)
     print("EVALUATING COMPRESSION CONFIGS")
@@ -992,18 +845,12 @@ def main() -> None:
 
     for config_idx, config in enumerate(configs):
         compression_start = time.time()
-
+        
         # Apply compression if config is not None (baseline)
         if config is None:
-            # Baseline: normalize the unnormalized embeddings
-            import torch.nn.functional as F
-            compressed_embeddings = [
-                F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings
-            ]
+            compressed_embeddings = documents_embeddings
         else:
             compressor = config.create_compressor()
-
-            # Compress with unnormalized embeddings (for importance scoring)
             compressed_embeddings, _ = compressor.compress_parallel(
                 embeddings=documents_embeddings,
                 artifacts=artifacts,
@@ -1011,13 +858,7 @@ def main() -> None:
                 num_workers=8,
                 show_progress=True,
             )
-
-            # Normalize embeddings AFTER compression
-            import torch.nn.functional as F
-            compressed_embeddings = [
-                F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
-            ]
-
+        
         compression_time = time.time() - compression_start
         
         # Calculate token statistics
@@ -1047,23 +888,6 @@ def main() -> None:
             run_id=run_id,
         )
         all_evaluation_results.append(result)
-        # Stream the result to disk immediately
-        with open(results_jsonl_path, "a") as f:
-            f.write(json.dumps(
-                {
-                    "type": "result",
-                    "run_id": run_id,
-                    "config_idx": result["config_idx"],
-                    "config_name": result["config_name"],
-                    "config": serialize_config_for_storage(configs[result["config_idx"]]),
-                    "token_count": result["token_count"],
-                    "avg_tokens_per_doc": result["avg_tokens_per_doc"],
-                    "compression_time": stats["compression_times"][config_idx],
-                    "metrics": result["evaluation"],
-                    "runfile_path": result.get("runfile_path"),
-                },
-                default=str,
-            ) + "\n")
 
     stats["total_time"] = time.time() - overall_start
 
@@ -1075,29 +899,16 @@ def main() -> None:
 
     # Save results to TSV
     df.to_csv(experiment_output_dir / f"results_{run_id}.tsv", index=False, sep="\t")
-    # Rewrite JSONL with final metadata and all results for consistency
-    final_metadata = metadata_entry.copy()
-    final_metadata["timing"]["total_time"] = stats["total_time"]
-    final_metadata["timing"]["encoding_time"] = stats.get("encoding_time")
-    final_metadata["timing"]["query_encoding_time"] = stats.get("query_encoding_time")
-    with open(results_jsonl_path, "w") as f:
-        f.write(json.dumps(final_metadata, default=str) + "\n")
-        for result in all_evaluation_results:
-            f.write(json.dumps(
-                {
-                    "type": "result",
-                    "run_id": run_id,
-                    "config_idx": result["config_idx"],
-                    "config_name": result["config_name"],
-                    "config": serialize_config_for_storage(configs[result["config_idx"]]),
-                    "token_count": result["token_count"],
-                    "avg_tokens_per_doc": result["avg_tokens_per_doc"],
-                    "compression_time": stats["compression_times"][result["config_idx"]],
-                    "metrics": result["evaluation"],
-                    "runfile_path": result.get("runfile_path"),
-                },
-                default=str,
-            ) + "\n")
+    save_results_jsonl(
+        output_dir=experiment_output_dir,
+        run_id=run_id,
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        args=args,
+        configs=configs,
+        stats=stats,
+        evaluation_results=all_evaluation_results,
+    )
     
     # Create or update runfile manifest if saving runfiles
     if args.save_runfiles and runfile_output_dir is not None:
