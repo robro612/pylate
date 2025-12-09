@@ -7,7 +7,6 @@ from sentence_transformers import (
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
-from transformers import TrainerCallback
 
 from pylate import evaluation, losses, models, utils, scores
 
@@ -22,6 +21,8 @@ parser.add_argument("--k_prime_start", type=int, default=None, help="Starting k_
 parser.add_argument("--k_prime_anneal_steps", type=int, default=1000, help="Number of steps over which to anneal k_prime")
 parser.add_argument("--k_prime_schedule", type=str, default="constant", choices=["linear", "exponential", "constant"], help="Schedule type for k_prime annealing")
 parser.add_argument("--use_colbert", action="store_true", help="Use ColBERT score function instead of XTR (baseline)")
+parser.add_argument("--query_length", type=int, default=32, help="Query length for ColBERT model")
+parser.add_argument("--doc_length", type=int, default=300, help="Document length for ColBERT model")
 parser.add_argument("--batch_size", type=int, default=128)
 parser.add_argument("--model_name", type=str, default="answerdotai/ModernBERT-base")
 parser.add_argument("--run_name", type=str, default=None, help="Override the default run name")
@@ -36,12 +37,14 @@ k_prime_start = args.k_prime_start if args.k_prime_start is not None else k_prim
 k_prime_anneal_steps = args.k_prime_anneal_steps
 k_prime_schedule = args.k_prime_schedule
 use_colbert = args.use_colbert
+query_length = args.query_length
+doc_length = args.doc_length
 run_name_override = args.run_name
-print(f"use_normalizer_Z: {use_normalizer_Z}, k_prime: {k_prime}, k_prime_start: {k_prime_start}, k_prime_anneal_steps: {k_prime_anneal_steps}, schedule: {k_prime_schedule}, use_colbert: {use_colbert}")
+print(f"use_normalizer_Z: {use_normalizer_Z}, k_prime: {k_prime}, k_prime_start: {k_prime_start}, k_prime_anneal_steps: {k_prime_anneal_steps}, schedule: {k_prime_schedule}, use_colbert: {use_colbert}, query_length: {query_length}, doc_length: {doc_length}")
 
 # Define model parameters for contrastive training
 # model_name = "bert-base-uncased"  # Choose the pre-trained model you want to use as base
-model_name = args.model_name
+model_name = args.model_name.strip("/")
 batch_size = args.batch_size  # Larger batch size often improves results, but requires more memory
 
 num_train_epochs = 1  # Adjust based on your requirements
@@ -77,8 +80,8 @@ output_dir = f"output/{run_name}"
 # 1. Here we define our ColBERT model. If not a ColBERT model, will add a linear layer to the base encoder.
 model = models.ColBERT(
     model_name_or_path=model_name,
-    query_length=32,
-    document_length=300,
+    query_length=query_length,
+    document_length=doc_length,
     do_query_expansion=True,
     attend_to_expansion_tokens=True,
 )
@@ -118,7 +121,8 @@ else:
             raise ValueError(f"Unknown schedule type: {k_prime_schedule}")
 
     # Create the scheduled score function
-    score_fn = scores.ScheduledXTRContrastiveScore(
+    score_fn = scores.ScheduledXTRScore(
+        score_fn=scores.xtr_contrastive_training_scores,
         k_prime_scheduler=k_prime_scheduler,
         use_normalizer_Z=use_normalizer_Z,
         Z_clamp_value=Z_clamp_value,
@@ -150,22 +154,9 @@ training_args = SentenceTransformerTrainingArguments(
     run_name=run_name,
     logging_steps=1,
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=200,
     save_steps=1000,
 )
-
-# Callback to update k_prime scheduler with current training step (only needed for XTR)
-class KPrimeSchedulerCallback(TrainerCallback):
-    """Callback to update k_prime scheduler with current training step."""
-    
-    def __init__(self, scheduled_score_fn):
-        self.scheduled_score_fn = scheduled_score_fn
-    
-    def on_step_end(self, args, state, control, **kwargs):
-        """Update the step in the scheduled score function."""
-        if hasattr(self.scheduled_score_fn, 'update_step'):
-            self.scheduled_score_fn.update_step(state.global_step)
-        return control
 
 # Initialize the trainer for the contrastive training
 trainer = SentenceTransformerTrainer(
@@ -180,7 +171,9 @@ trainer = SentenceTransformerTrainer(
 
 # Add the callback to update k_prime (only needed for XTR, not ColBERT)
 if not use_colbert:
-    trainer.add_callback(KPrimeSchedulerCallback(score_fn))
+    trainer.add_callback(scores.KPrimeSchedulerCallback(score_fn))
 
 # Start the training process
 trainer.train()
+
+model.save_pretrained(f"{output_dir}/final")
