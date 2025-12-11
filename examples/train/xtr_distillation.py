@@ -132,16 +132,16 @@ else:
         else:
             run_name_parts.append(f"k_prime={k_prime}")
 
-    if use_normalizer_Z:
-        run_name_parts.append(f"use_normalizer_Z=True")
-        run_name_parts.append(f"Z_clamp_value={Z_clamp_value}")
-        run_name_parts.append(
-            f"start_normalizer_Z_at_step={start_normalizer_Z_at_step}"
-        )
-    else:
-        run_name_parts.append(f"use_normalizer_Z=False")
+        if use_normalizer_Z:
+            run_name_parts.append(f"use_normalizer_Z=True")
+            run_name_parts.append(f"Z_clamp_value={Z_clamp_value}")
+            run_name_parts.append(
+                f"start_normalizer_Z_at_step={start_normalizer_Z_at_step}"
+            )
+        else:
+            run_name_parts.append(f"use_normalizer_Z=False")
 
-    run_name = f"KD-[{']['.join(run_name_parts)}]"
+    run_name = f"{'ColBERT' if use_colbert else 'XTR'}-KD-[{']['.join(run_name_parts)}]"
 
 output_dir = f"output/{run_name}"
 
@@ -154,15 +154,15 @@ model = models.ColBERT(
     attend_to_expansion_tokens=True,
 )
 
-# dev_evaluator = evaluation.NanoBEIREvaluator()
+dev_evaluator = evaluation.NanoBEIREvaluator()
 # Configure the training arguments (e.g., epochs, batch size, learning rate)
 training_args = SentenceTransformerTrainingArguments(
     output_dir=output_dir,
     num_train_epochs=num_train_epochs,
     per_device_train_batch_size=batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
-    # eval_strategy="steps",
-    # eval_steps=eval_steps,
+    eval_strategy="steps",
+    eval_steps=eval_steps,
     save_steps=save_steps,
     logging_steps=1,
     fp16=False,
@@ -226,7 +226,7 @@ trainer = SentenceTransformerTrainer(
     args=training_args,
     train_dataset=train,
     loss=train_loss,
-    # evaluator=dev_evaluator,
+    evaluator=dev_evaluator,
     data_collator=utils.ColBERTCollator(tokenize_fn=model.tokenize),
 )
 

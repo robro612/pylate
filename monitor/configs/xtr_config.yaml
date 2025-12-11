@@ -1,0 +1,83 @@
+# Example Training Monitor Configuration
+# Copy this file and customize for your training run
+
+# REQUIRED: Directory containing training checkpoints to monitor
+# This should point to the output directory of your training job
+training_output_dir: "output/contrastive-XTR-mbert-base-1GPU-Z=False-lr-3e-5--BS=196-acc=1-steps-50k-kprime=128"
+
+# Pattern to match checkpoint directories (glob pattern)
+checkpoint_pattern: "checkpoint-*"
+
+# Polling interval in seconds (how often to check for new checkpoints)
+polling_interval: 60
+
+# Maximum number of concurrent evaluation jobs
+# Set to 1 to evaluate checkpoints sequentially
+# Increase if you have multiple GPUs available
+max_concurrent_jobs: 1
+
+# Maximum number of retries for failed jobs
+max_retries: 2
+
+# Prioritize latest checkpoints (true) or process in order (false)
+# true = evaluate newest checkpoints first (recommended)
+# false = evaluate in chronological order
+prioritize_latest: true
+
+# Log and script directories
+# Note: state_file and lock_file are auto-generated based on training_output_dir
+# to allow multiple monitors to run simultaneously for different directories
+log_dir: "monitor/logs"
+eval_scripts_dir: "monitor/eval_scripts"
+
+# SLURM configuration for evaluation jobs
+slurm:
+  time: "4:00:00"        # Time limit per evaluation job
+  gres: "gpu:a100:1"     # GPU resources (adjust to your cluster)
+  partition: ""          # Partition (leave empty for default)
+  mem: ""                # Memory (leave empty for default)
+
+# Evaluation configuration (passed to eval_model_irds.py)
+evaluation:
+  # Datasets to evaluate on
+  # Add or remove datasets as needed
+  datasets:
+    - "beir/nfcorpus/test"
+    - "beir/fiqa/test"
+    - "beir/scidocs"
+    - "beir/scifact/test"
+    - "beir/trec-covid"
+    - "lotte/lifestyle/dev/search"
+  
+  # Index types to test
+  # Options: Flat, ScaNN, Voyager, PLAID
+  index_types:
+    - "ScaNN"
+
+  k_token: 10000
+  num_leaves: 2000
+  num_leaves_to_search: 200
+  num_neighbors: 10
+  
+  # Batch size for encoding documents and queries
+  batch_size: 1000
+  
+  # Number of documents to retrieve per query
+  k: 100
+  
+  cache_embeddings: false
+  cache_dir: "test_embeddings"
+  
+  # Shard size for document encoding (documents per shard)
+  shard_size: 10000
+  
+  # Data types
+  # model_dtype: dtype to cast model to (fp32, fp16, bf16)
+  # embedding_dtype: dtype for embeddings (fp32, fp16, bf16)
+  model_dtype: "bf16"
+  embedding_dtype: "fp16"
+  
+  # Text preprocessing
+  lowercase: true
+  
+
