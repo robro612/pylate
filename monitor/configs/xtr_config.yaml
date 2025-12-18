@@ -43,9 +43,9 @@ evaluation:
   # Add or remove datasets as needed
   datasets:
     - "beir/nfcorpus/test"
-    - "beir/fiqa/test"
-    - "beir/scidocs"
-    - "beir/scifact/test"
+    # - "beir/fiqa/test"
+    # - "beir/scidocs"
+    # - "beir/scifact/test"
     - "beir/trec-covid"
     - "lotte/lifestyle/dev/search"
   
@@ -54,7 +54,7 @@ evaluation:
   index_types:
     - "ScaNN"
 
-  k_token: 10000
+  k_token: 40000
   num_leaves: 2000
   num_leaves_to_search: 200
   num_neighbors: 10
@@ -78,6 +78,6 @@ evaluation:
   embedding_dtype: "fp16"
   
   # Text preprocessing
-  lowercase: true
+  lowercase: false
   
 

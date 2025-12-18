@@ -43,9 +43,9 @@ evaluation:
   # Add or remove datasets as needed
   datasets:
     - "beir/nfcorpus/test"
-    - "beir/fiqa/test"
-    - "beir/scidocs"
-    - "beir/scifact/test"
+    # - "beir/fiqa/test"
+    # - "beir/scidocs"
+    # - "beir/scifact/test"
     - "beir/trec-covid"
     - "lotte/lifestyle/dev/search"
   
@@ -73,6 +73,6 @@ evaluation:
   embedding_dtype: "fp16"
   
   # Text preprocessing
-  lowercase: true
+  lowercase: false
   
 

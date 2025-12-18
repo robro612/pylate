@@ -223,6 +223,7 @@ def xtr_contrastive_training_scores(
     documents_mask: torch.Tensor | None = None,
     k_prime: int = 100,
     use_normalizer_Z : bool = False,
+    impute_scores_instead_of_zero: bool = False,
     Z_clamp_value: float = 1.0,
 ) -> torch.Tensor:
 
@@ -234,7 +235,7 @@ def xtr_contrastive_training_scores(
         documents_embeddings,
     )
 
-    # 2. Apply Padding Masking (User's original logic maintained)
+    # 2. Apply Padding Masking
     if queries_mask is not None:
         cross_batch_scores = cross_batch_scores * queries_mask.unsqueeze(1).unsqueeze(3)
     
@@ -265,7 +266,10 @@ def xtr_contrastive_training_scores(
     # 5. Compute Max Similarity for Retrieved Tokens
     # We use -inf for non-retrieved tokens so they don't affect the max.
     # (batch_size, batch_size, q_seq_len, d_seq_len)
-    masked_scores = cross_batch_scores.masked_fill(~is_retrieved, -float('inf'))
+    if impute_scores_instead_of_zero:
+        masked_scores = torch.where(is_retrieved, cross_batch_scores, thresholds)
+    else:
+        masked_scores = cross_batch_scores.masked_fill(~is_retrieved, -float('inf'))
 
     # Take max over document tokens (dim -1)
     # (batch_size, batch_size, q_seq_len)
@@ -661,12 +665,14 @@ class ScheduledXTRScore:
         use_normalizer_Z: bool = False,
         Z_clamp_value: float = 1.0,
         start_normalizer_Z_at_step: int = 0,
+        impute_scores_instead_of_zero: bool = False,
     ):
         self.score_fn = score_fn
         self.k_prime_scheduler = k_prime_scheduler
         self.use_normalizer_Z = use_normalizer_Z
         self.Z_clamp_value = Z_clamp_value
         self.start_normalizer_Z_at_step = start_normalizer_Z_at_step
+        self.impute_scores_instead_of_zero = impute_scores_instead_of_zero
         self.current_step = 0
         self.current_k_prime = None
     
@@ -718,6 +724,7 @@ class ScheduledXTRScore:
             k_prime=int(self.current_k_prime),  # Ensure it's an integer
             use_normalizer_Z=should_use_normalizer_Z,
             Z_clamp_value=self.Z_clamp_value,
+            impute_scores_instead_of_zero=self.impute_scores_instead_of_zero,
         )
     
     def update_step(self, step: int):

@@ -51,9 +51,23 @@ class CheckpointStatus:
 class TrainingMonitor:
     """Monitor training directory and launch evaluation jobs for new checkpoints."""
     
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, model_dir: Optional[str] = None):
         """Initialize the monitor with configuration."""
         self.config = self._load_config(config_path)
+        
+        # Override training_output_dir if model_dir is provided
+        if model_dir:
+            self.config['training_output_dir'] = model_dir
+            # Recalculate monitor hash with new directory
+            training_dir = Path(model_dir).resolve()
+            eval_config_str = json.dumps(self.config.get('evaluation', {}), sort_keys=True)
+            hash_input = f"{training_dir}_{eval_config_str}"
+            monitor_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+            self.config['monitor_hash'] = monitor_hash
+            # Update state and lock file paths with new hash
+            self.config['state_file'] = f'monitor/state/state_{monitor_hash}.json'
+            self.config['lock_file'] = f'monitor/state/monitor_{monitor_hash}.lock'
+        
         self.state_file = Path(self.config['state_file'])
         self.lock_file = Path(self.config['lock_file'])
         self.monitor_hash = self.config['monitor_hash']
@@ -106,8 +120,8 @@ class TrainingMonitor:
         monitor_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
         
         config['monitor_hash'] = monitor_hash
-        config.setdefault('state_file', f'monitor/state_{monitor_hash}.json')
-        config.setdefault('lock_file', f'monitor/monitor_{monitor_hash}.lock')
+        config.setdefault('state_file', f'monitor/state/state_{monitor_hash}.json')
+        config.setdefault('lock_file', f'monitor/state/monitor_{monitor_hash}.lock')
         config.setdefault('log_dir', 'monitor/logs')
         config.setdefault('eval_scripts_dir', 'monitor/eval_scripts')
         
@@ -117,6 +131,7 @@ class TrainingMonitor:
         """Create necessary directories."""
         Path(self.config['log_dir']).mkdir(parents=True, exist_ok=True)
         Path(self.config['eval_scripts_dir']).mkdir(parents=True, exist_ok=True)
+        # Ensure state directory exists (for lock and state files)
         Path(self.state_file).parent.mkdir(parents=True, exist_ok=True)
     
     def _acquire_lock(self):
@@ -654,11 +669,17 @@ def main():
         required=True,
         help='Path to configuration YAML file'
     )
+    parser.add_argument(
+        '--model-dir',
+        type=str,
+        default=None,
+        help='Override training_output_dir from config file'
+    )
     
     args = parser.parse_args()
     
     # Initialize monitor
-    monitor = TrainingMonitor(args.config)
+    monitor = TrainingMonitor(args.config, model_dir=args.model_dir)
     
     try:
         # Run monitoring loop

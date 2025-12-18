@@ -80,8 +80,8 @@ def parse_arguments():
     dataset_group.add_argument(
         "--contrastive_dataset_name",
         type=str,
-        default="triplet",
-        help="Dataset name/split for contrastive training",
+        default=None,
+        help="Dataset subset/name for contrastive training (optional, omit for datasets without subsets like bclavie/msmarco-10m-triplets)",
     )
     dataset_group.add_argument(
         "--eval_split_ratio",
@@ -121,6 +121,11 @@ def parse_arguments():
         default="constant",
         choices=["linear", "exponential", "constant"],
         help="Schedule type for k_prime annealing",
+    )
+    xtr_group.add_argument(
+        "--impute_scores_instead_of_zero",
+        action="store_true",
+        help="Impute scores instead of zero for XTR",
     )
     xtr_group.add_argument(
         "--use_normalizer_Z",
@@ -237,13 +242,23 @@ def load_distillation_datasets(train_dataset_path: str):
 
 
 def load_contrastive_datasets(
-    dataset_path: str, dataset_name: str, eval_split_ratio: float
+    dataset_path: str, dataset_name: str | None, eval_split_ratio: float
 ):
-    """Load datasets for contrastive training."""
-    dataset = load_dataset(dataset_path, dataset_name, split="train")
+    """Load datasets for contrastive training.
+    
+    Args:
+        dataset_path: Path to the dataset
+        dataset_name: Optional subset/name of the dataset. If None or empty, loads dataset without subset.
+        eval_split_ratio: Ratio for train/test split
+    """
+    if dataset_name and dataset_name.strip() and dataset_name.lower() != "none":
+        dataset = load_dataset(dataset_path, dataset_name, split="train")
+    else:
+        dataset = load_dataset(dataset_path, split="train")
     splits = dataset.train_test_split(test_size=eval_split_ratio)
     train_dataset = splits["train"]
     eval_dataset = splits["test"]
+    print(f"Loaded {len(train_dataset)} train samples and {len(eval_dataset)} eval samples")
     return train_dataset, eval_dataset
 
 
@@ -289,6 +304,7 @@ def create_score_function(
     use_normalizer_Z: bool,
     Z_clamp_value: float,
     start_normalizer_Z_at_step: int,
+    impute_scores_instead_of_zero: bool,
 ):
     """Create the appropriate score function based on training method and configuration."""
     if use_colbert:
@@ -315,6 +331,7 @@ def create_score_function(
             use_normalizer_Z=use_normalizer_Z,
             Z_clamp_value=Z_clamp_value,
             start_normalizer_Z_at_step=start_normalizer_Z_at_step,
+            impute_scores_instead_of_zero=impute_scores_instead_of_zero,
         )
 
 
@@ -410,6 +427,7 @@ def build_run_name(
     use_normalizer_Z: bool,
     Z_clamp_value: float,
     start_normalizer_Z_at_step: int,
+    impute_scores_instead_of_zero: bool,
     kd_minmax_normalize: bool = False,
     run_name_override: str = None,
 ):
@@ -446,6 +464,9 @@ def build_run_name(
         else:
             run_name_parts.append(f"use_normalizer_Z=False")
 
+    if impute_scores_instead_of_zero:
+        run_name_parts.append(f"impute_scores=True")
+
     run_name = f"{score_type}-{training_method}-[{']['.join(run_name_parts)}]"
     return run_name
 
@@ -471,6 +492,7 @@ def main():
     use_normalizer_Z = args.use_normalizer_Z
     Z_clamp_value = args.Z_clamp_value
     start_normalizer_Z_at_step = args.start_normalizer_Z_at_step
+    impute_scores_instead_of_zero = args.impute_scores_instead_of_zero
     lr = args.lr
     batch_size = args.batch_size
     gradient_accumulation_steps = args.grad_acc_steps
@@ -507,7 +529,10 @@ def main():
         print(f"Train Dataset: {train_dataset_path}")
         print(f"KD MinMax Normalize: {kd_minmax_normalize}")
     else:
-        print(f"Contrastive Dataset: {contrastive_dataset_path}/{contrastive_dataset_name}")
+        if contrastive_dataset_name and contrastive_dataset_name.strip() and contrastive_dataset_name.lower() != "none":
+            print(f"Contrastive Dataset: {contrastive_dataset_path}/{contrastive_dataset_name}")
+        else:
+            print(f"Contrastive Dataset: {contrastive_dataset_path}")
     print(f"Evaluators: Triplet={use_triplet_evaluator}, NanoBEIR={use_nanobeir_evaluator}")
     print("=" * 80)
 
@@ -541,6 +566,7 @@ def main():
         start_normalizer_Z_at_step=start_normalizer_Z_at_step,
         kd_minmax_normalize=kd_minmax_normalize,
         run_name_override=run_name_override,
+        impute_scores_instead_of_zero=impute_scores_instead_of_zero,
     )
 
     output_dir = f"output/{run_name}"
@@ -567,6 +593,7 @@ def main():
         use_normalizer_Z=use_normalizer_Z,
         Z_clamp_value=Z_clamp_value,
         start_normalizer_Z_at_step=start_normalizer_Z_at_step,
+        impute_scores_instead_of_zero=impute_scores_instead_of_zero,
     )
 
     # Create loss function
