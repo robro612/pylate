@@ -716,7 +716,8 @@ class ScheduledXTRScore:
             print(f"Starting normalizer Z at step {self.current_step}")
         
         # Call the wrapped score function with scheduled k_prime
-        return self.score_fn(
+
+        args = dict(
             queries_embeddings=queries_embeddings,
             documents_embeddings=documents_embeddings,
             queries_mask=queries_mask,
@@ -724,8 +725,11 @@ class ScheduledXTRScore:
             k_prime=int(self.current_k_prime),  # Ensure it's an integer
             use_normalizer_Z=should_use_normalizer_Z,
             Z_clamp_value=self.Z_clamp_value,
-            impute_scores_instead_of_zero=self.impute_scores_instead_of_zero,
         )
+        if self.impute_scores_instead_of_zero:
+            args["impute_scores_instead_of_zero"] = self.impute_scores_instead_of_zero
+        
+        return self.score_fn(**args)
     
     def update_step(self, step: int):
         """Update the current training step.

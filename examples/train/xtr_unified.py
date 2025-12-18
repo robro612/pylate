@@ -325,14 +325,17 @@ def create_score_function(
         else:
             base_score_fn = scores.xtr_contrastive_training_scores
 
-        return scores.ScheduledXTRScore(
+        scheduled_xtr_kwargs = dict(
             score_fn=base_score_fn,
             k_prime_scheduler=k_prime_scheduler_fn,
             use_normalizer_Z=use_normalizer_Z,
             Z_clamp_value=Z_clamp_value,
             start_normalizer_Z_at_step=start_normalizer_Z_at_step,
-            impute_scores_instead_of_zero=impute_scores_instead_of_zero,
         )
+        if training_method == "contrastive":
+            scheduled_xtr_kwargs["impute_scores_instead_of_zero"] = impute_scores_instead_of_zero
+
+        return scores.ScheduledXTRScore(**scheduled_xtr_kwargs)
 
 
 def create_loss_function(
