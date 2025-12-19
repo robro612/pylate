@@ -14,6 +14,7 @@ from typing import Any, List, Dict, Tuple, Optional
 from tqdm.auto import tqdm
 import torch
 import itertools
+from ranx import Run
 
 import numpy as np
 
@@ -129,6 +130,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of neighbors to use for the ScaNN index (default: None)",
     )
     parser.add_argument(
+        "--use_autopilot",
+        action="store_true",
+        help="Use ScaNN's autopilot() method for automatic parameter tuning. Overrides num_leaves, num_leaves_to_search, and training_sample_size (default: False)",
+    )
+    parser.add_argument(
         "--index_types",
         type=str,
         default=["Flat"],
@@ -190,6 +196,19 @@ def parse_arguments() -> argparse.Namespace:
         default=300,
         help="Document length to use (default: 300)",
     )
+    parser.add_argument(
+        "--move_embeddings_to_cpu",
+        dest="move_embeddings_to_cpu",
+        action="store_true",
+        default=False,
+        help="Move embeddings to CPU immediately after encoding to save GPU memory. Useful for large datasets to avoid OOM (default: False)",
+    )
+    parser.add_argument(
+        "--save_runfile",
+        action="store_true",
+        default=False,
+        help="Save ranx Run file for each evaluation run (default: False)",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +228,11 @@ def cast_embeddings(embeddings: List[torch.Tensor], dtype: torch.dtype) -> List[
     if dtype == current_dtype:
         return embeddings  # No casting needed
     return [emb.to(dtype) for emb in embeddings]
+
+
+def move_embeddings_to_cpu(embeddings: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Move embeddings to CPU."""
+    return [emb.cpu() for emb in embeddings]
 
 
 def pack_embeddings(embeddings: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -256,6 +280,10 @@ def unpack_embeddings(packed: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
 def sanitize_dataset_name(dataset_name: str) -> str:
     """Sanitize dataset name for use in file paths by replacing / with _."""
     return dataset_name.replace("/", "_")
+
+def sanitize_model_name(model_name: str) -> str:
+    # remove everything before output/
+    return model_name.split("output/")[-1].replace("/", "_")
 
 
 def expand_model_paths(model_paths: List[str]) -> List[str]:
@@ -406,6 +434,7 @@ def encode_documents_with_sharding(
     shard_size: int,
     batch_size: int,
     embedding_dtype: torch.dtype,
+    move_to_cpu: bool = False,
 ) -> List[Any]:
     """
     Encode documents with sharding support, saving iteratively.
@@ -443,9 +472,12 @@ def encode_documents_with_sharding(
             shard_cache_file = cached_shards[shard_idx]
             print(f"Loading cached shard {shard_idx + 1}/{num_shards} from {shard_cache_file}...")
             
-            # Load torch format
+            # Load torch format (explicitly to CPU)
             packed = torch.load(shard_cache_file, map_location="cpu")
             shard_embeddings = unpack_embeddings(packed)
+            # Ensure embeddings are on CPU (they should be already from map_location="cpu", but be explicit)
+            if move_to_cpu:
+                shard_embeddings = move_embeddings_to_cpu(shard_embeddings)
             # Cast embeddings to specified dtype
             shard_embeddings = cast_embeddings(shard_embeddings, embedding_dtype)
             
@@ -467,6 +499,9 @@ def encode_documents_with_sharding(
             )
             # Cast embeddings to specified dtype after encoding
             shard_embeddings = cast_embeddings(shard_embeddings, embedding_dtype)
+            # Move to CPU immediately after encoding to free GPU memory
+            if move_to_cpu:
+                shard_embeddings = move_embeddings_to_cpu(shard_embeddings)
             documents_embeddings.extend(shard_embeddings)
             
             # Save shard immediately after encoding
@@ -491,6 +526,7 @@ def encode_queries(
     cache_embeddings: bool,
     batch_size: int,
     embedding_dtype: torch.dtype,
+    move_to_cpu: bool = False,
 ) -> List[Any]:
     """
     Encode queries, loading from cache if available.
@@ -503,6 +539,9 @@ def encode_queries(
         packed = torch.load(query_embeddings_cache_file, map_location="cpu")
         queries_embeddings = unpack_embeddings(packed)
         print(f"Loaded {len(queries_embeddings)} query embeddings from cache.")
+        # Ensure embeddings are on CPU (they should be already from map_location="cpu", but be explicit)
+        if move_to_cpu:
+            queries_embeddings = move_embeddings_to_cpu(queries_embeddings)
         # Cast embeddings to specified dtype
         queries_embeddings = cast_embeddings(queries_embeddings, embedding_dtype)
     else:
@@ -516,6 +555,9 @@ def encode_queries(
         )
         # Cast embeddings to specified dtype after encoding
         queries_embeddings = cast_embeddings(queries_embeddings, embedding_dtype)
+        # Move to CPU immediately after encoding to free GPU memory
+        if move_to_cpu:
+            queries_embeddings = move_embeddings_to_cpu(queries_embeddings)
         
         # Save query embeddings if caching is enabled
         if cache_embeddings:
@@ -553,6 +595,7 @@ def get_index_configs(
                 "num_leaves": args.num_leaves,
                 "num_leaves_to_search": args.num_leaves_to_search,
                 "verbose": True,
+                "use_autopilot": args.use_autopilot,
             },
             "add_documents_kwargs": {
                 "batch_size": args.batch_size,
@@ -614,6 +657,7 @@ def test_index(
     model_dtype: str,
     embedding_dtype: str,
     lowercase: bool,
+    save_runfile: bool = False,
 ) -> None:
     """
     Test a single index: create, add documents, retrieve, evaluate, and save results.
@@ -626,7 +670,7 @@ def test_index(
     # Initialize index
     index = config["index_class"](**config["init_kwargs"])
     retriever = retrieve.ColBERT(index=index, verbose=verbose)
-    
+
     # Add documents
     print(f"Adding documents to {index_name} index...")
     start_time = time.time()
@@ -662,6 +706,47 @@ def test_index(
         queries=list(queries.keys()),
         metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "hit_rate@5"],
     )
+
+    if save_runfile:
+        # Create run_dict: {query_id: {doc_id: score, ...}, ...}
+        run_dict = {
+            query_id: {
+                match["id"]: match["score"]
+                for match in query_matches
+            }
+            for query_id, query_matches in zip(queries.keys(), scores)
+        }
+
+        run = Run(run=run_dict)
+        run.metadata = {
+            "index_type": config["name"],
+            **{k : v for k, v in config["init_kwargs"].items() if k != "index_class"},
+            "dataset": dataset_name,
+            "model": model_name,
+            "model_dtype": model_dtype,
+            "embedding_dtype": embedding_dtype,
+            "lowercase": lowercase,
+            "k": k,
+            "k_token": k_token,
+            "index_time": index_time,
+            "retrieve_time": retrieve_time,
+        }
+        
+        # Create runfiles subdirectory
+        runfiles_dir = results_dir / "runs"
+        runfiles_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate descriptive filename: model_index_k{k}_k_token{k_token}.json
+        # Sanitize model name for filesystem
+        sanitized_model_name = sanitize_model_name(model_name)
+        sanitized_dataset_name = sanitize_dataset_name(dataset_name)
+        run_filename = f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}.json"
+        run_filepath = runfiles_dir / run_filename
+        
+        # Save runfile
+        run.save(run_filepath.as_posix())
+        print(f"Runfile saved to: {run_filepath}")
+
     
     # Prepare index config info (excluding non-serializable class)
     index_config_info = {
@@ -800,6 +885,7 @@ def main() -> None:
             shard_size=args.shard_size,
             batch_size=args.batch_size,
             embedding_dtype=embedding_dtype,
+            move_to_cpu=args.move_embeddings_to_cpu,
         )
         
         # Encode queries
@@ -810,6 +896,7 @@ def main() -> None:
             cache_embeddings=args.cache_embeddings,
             batch_size=args.batch_size,
             embedding_dtype=embedding_dtype,
+            move_to_cpu=args.move_embeddings_to_cpu,
         )
 
         # Get embedding size from the model's final layer
@@ -857,6 +944,7 @@ def main() -> None:
                 model_dtype=args.model_dtype,
                 embedding_dtype=args.embedding_dtype,
                 lowercase=args.lowercase,
+                save_runfile=args.save_runfile,
             )
 
 

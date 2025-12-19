@@ -4,7 +4,7 @@ import itertools
 import logging
 import time
 from typing import Optional
-
+import os
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -71,6 +71,10 @@ class ScaNN(Base):
     verbose
         Whether to enable verbose logging of timing and operations.
         Defaults to False for cleaner output.
+    use_autopilot
+        Whether to use ScaNN's autopilot() method for automatic parameter tuning.
+        If True, overrides num_leaves, num_leaves_to_search, and training_sample_size.
+        Defaults to False.
 
 
 
@@ -85,6 +89,7 @@ class ScaNN(Base):
         num_leaves_to_search: Optional[int] = None,
         training_sample_size: Optional[int] = None,
         verbose: bool = False,
+        use_autopilot: bool = False,
     ) -> None:
         self.name = name
         self.embedding_size = embedding_size
@@ -93,6 +98,7 @@ class ScaNN(Base):
         self.num_leaves = num_leaves
         self.num_leaves_to_search = num_leaves_to_search
         self.training_sample_size = training_sample_size
+        self.use_autopilot = use_autopilot
 
         # In-memory data structures only (no file I/O)
         self.searcher = None
@@ -101,7 +107,6 @@ class ScaNN(Base):
         self.documents_ids_to_embeddings = {}  # In-memory mapping: document ID (str) -> list of embedding IDs
         self.position_to_doc_id = None  # Direct mapping: position -> document ID (numpy array for vectorized indexing)
         self._documents_added = False  # Track if documents have been added
-
 
     def _build_searcher(self, embeddings: np.ndarray) -> None:
         """Build the ScaNN searcher from embeddings (in-memory only)."""
@@ -113,26 +118,42 @@ class ScaNN(Base):
                 'ScaNN is not installed. Please install it with: `pip install "pylate[scann]"` or `pip install scann`.'
             )
 
-
-        # Auto-tune parameters if not set
+        # Auto-tune parameters if not set (only if not using autopilot)
         num_vectors = embeddings.shape[0]
         self.num_neighbors = self.num_neighbors if self.num_neighbors else min(10, num_vectors)
-        self.num_leaves = self.num_leaves if self.num_leaves else min(2_000, num_vectors)
-        self.num_leaves_to_search = self.num_leaves_to_search if self.num_leaves_to_search else 200
-        self.training_sample_size = self.training_sample_size if self.training_sample_size else min(250000, num_vectors)
+        
+        if self.use_autopilot:
+            # When using autopilot, it will auto-tune all parameters
+            if self.verbose:
+                logger.info(f"[ScaNN] Building ScaNN searcher with {embeddings.shape[0]} vectors using autopilot()...")
+                logger.info(f"[ScaNN]   NOTE: autopilot() overrides manual configuration (num_leaves, num_leaves_to_search, training_sample_size)")
+                if self.num_leaves is not None or self.num_leaves_to_search is not None or self.training_sample_size is not None:
+                    logger.warning(f"[ScaNN]   WARNING: Manual parameters provided but will be ignored: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, training_sample_size={self.training_sample_size}")
+        else:
+            # Auto-tune parameters if not set
+            self.num_leaves = self.num_leaves if self.num_leaves else min(2_000, num_vectors)
+            self.num_leaves_to_search = self.num_leaves_to_search if self.num_leaves_to_search else 200
+            self.training_sample_size = self.training_sample_size if self.training_sample_size else min(250000, num_vectors)
 
-        if self.verbose:
-            logger.info(f"[ScaNN] Building ScaNN searcher with {embeddings.shape[0]} vectors...")
-            logger.info(f"[ScaNN]   Parameters: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, training_sample_size={self.training_sample_size}, num_neighbors={self.num_neighbors}")
+            if self.verbose:
+                logger.info(f"[ScaNN] Building ScaNN searcher with {embeddings.shape[0]} vectors...")
+                logger.info(f"[ScaNN]   Parameters: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, training_sample_size={self.training_sample_size}, num_neighbors={self.num_neighbors}")
 
         # Build ScaNN searcher
         step_start = time.time()
-        searcher = (
-            scann.scann_ops_pybind.builder(embeddings, self.num_neighbors, "dot_product")
-            .tree(num_leaves=self.num_leaves, num_leaves_to_search=self.num_leaves_to_search, training_sample_size=self.training_sample_size)
-            .score_ah(1, anisotropic_quantization_threshold=0.1)
-            .build()
-        )
+        if self.use_autopilot:
+            searcher = (
+                scann.scann_ops_pybind.builder(embeddings, self.num_neighbors, "dot_product")
+                .autopilot()
+                .build()
+            )
+        else:
+            searcher = (
+                scann.scann_ops_pybind.builder(embeddings, self.num_neighbors, "dot_product")
+                .tree(num_leaves=self.num_leaves, num_leaves_to_search=self.num_leaves_to_search, training_sample_size=self.training_sample_size, spherical=True)
+                .score_ah(1, anisotropic_quantization_threshold=0.1)
+                .build()
+            )
         step_time = time.time() - step_start
         if self.verbose:
             logger.info(f"[ScaNN] ScaNN searcher built: {step_time:.4f}s")
@@ -168,7 +189,10 @@ class ScaNN(Base):
             logger.info(f"[ScaNN] Adding {len(documents_ids)} documents to index...")
         
         step_start = time.time()
-        documents_embeddings = reshape_embeddings(embeddings=documents_embeddings)
+        if isinstance(documents_embeddings[0], torch.Tensor):
+            documents_embeddings = [emb.float().numpy().astype(bfloat16) for emb in documents_embeddings]
+        else:
+            documents_embeddings = reshape_embeddings(embeddings=documents_embeddings)
         step_time = time.time() - step_start
         if self.verbose:
             logger.info(f"[ScaNN] Reshaping document embeddings: {step_time:.4f}s")
@@ -312,7 +336,7 @@ class ScaNN(Base):
 
         # Query the index
         step_start = time.time()
-        neighbors, distances = self.searcher.search_batched(flattened_queries, final_num_neighbors=k)
+        neighbors, distances = self.searcher.search_batched_parallel(flattened_queries, final_num_neighbors=k)
         # replace NaN values with 0
         if np.isnan(distances).any():
             print(f"distances has {np.isnan(distances).sum()} NaN values out of {distances.size} total values")
