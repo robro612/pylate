@@ -16,7 +16,7 @@ if not is_main_process():
     os.environ["WANDB_DISABLED"] = "true"
 
 from argparse import ArgumentParser
-from typing import Literal
+from typing import Literal, Optional
 
 from datasets import load_dataset
 from sentence_transformers import (
@@ -66,7 +66,7 @@ def parse_arguments():
     # Dataset Group
     dataset_group = parser.add_argument_group("Dataset Configuration")
     dataset_group.add_argument(
-        "--train_dataset",
+        "--distillation_train_dataset",
         type=str,
         default="lightonai/ms-marco-en-bge-gemma",
         help="Train dataset path (for distillation)",
@@ -78,10 +78,16 @@ def parse_arguments():
         help="Triplet dataset path (for contrastive)",
     )
     dataset_group.add_argument(
-        "--contrastive_dataset_name",
+        "--train_dataset_subset",
         type=str,
         default=None,
-        help="Dataset subset/name for contrastive training (optional, omit for datasets without subsets like bclavie/msmarco-10m-triplets)",
+        help="Dataset subset/name for contrastive/kd training (optional, omit for datasets without subsets like bclavie/msmarco-10m-triplets)",
+    )
+    dataset_group.add_argument(
+        "--nways",
+        type=int,
+        default=32,
+        help="Number of negatives per query for distillation training, defaults to 32",
     )
     dataset_group.add_argument(
         "--eval_split_ratio",
@@ -143,6 +149,12 @@ def parse_arguments():
         type=int,
         default=0,
         help="Step at which to start using normalizer Z",
+    )
+    xtr_group.add_argument(
+        "--score_fn",
+        type=str,
+        default=None,
+        help="Name of score function to use from pylate.scores (e.g., 'xtr_kd_training_scores', 'xtr_contrastive_training_scores', 'xtr_contrastive_training_scores_primeqa'). If not provided, defaults based on training_method.",
     )
 
     # Training Hyperparameters Group
@@ -233,9 +245,11 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def load_distillation_datasets(train_dataset_path: str):
+def load_distillation_datasets(train_dataset_path: str, name: Optional[str] = None):
     """Load datasets for knowledge distillation training."""
-    train = load_dataset(path=train_dataset_path, name="train")
+    if name is None:
+        name = "train"
+    train = load_dataset(path=train_dataset_path, name=name)
     queries = load_dataset(path=train_dataset_path, name="queries")
     documents = load_dataset(path=train_dataset_path, name="documents")
     return train, queries, documents
@@ -248,10 +262,10 @@ def load_contrastive_datasets(
     
     Args:
         dataset_path: Path to the dataset
-        dataset_name: Optional subset/name of the dataset. If None or empty, loads dataset without subset.
+        dataset_name: Optional subset/name of the dataset. If None, loads dataset without subset.
         eval_split_ratio: Ratio for train/test split
     """
-    if dataset_name and dataset_name.strip() and dataset_name.lower() != "none":
+    if dataset_name:
         dataset = load_dataset(dataset_path, dataset_name, split="train")
     else:
         dataset = load_dataset(dataset_path, split="train")
@@ -305,6 +319,7 @@ def create_score_function(
     Z_clamp_value: float,
     start_normalizer_Z_at_step: int,
     impute_scores_instead_of_zero: bool,
+    score_fn: Optional[str] = None,
 ):
     """Create the appropriate score function based on training method and configuration."""
     if use_colbert:
@@ -319,11 +334,20 @@ def create_score_function(
             k_prime_anneal_steps=k_prime_anneal_steps,
             k_prime_schedule=k_prime_schedule,
         )
-
-        if training_method == "distillation":
-            base_score_fn = scores.xtr_kd_training_scores
+        if score_fn is not None:
+            # Dynamically get the score function from the scores module
+            if not hasattr(scores, score_fn):
+                available_fns = [name for name in dir(scores) if not name.startswith('_') and callable(getattr(scores, name))]
+                raise ValueError(
+                    f"Score function '{score_fn}' not found in pylate.scores. "
+                    f"Available functions: {', '.join(available_fns)}"
+                )
+            base_score_fn = getattr(scores, score_fn)
         else:
-            base_score_fn = scores.xtr_contrastive_training_scores
+            if training_method == "distillation":
+                base_score_fn = scores.xtr_kd_training_scores
+            else:
+                base_score_fn = scores.xtr_contrastive_training_scores
 
         scheduled_xtr_kwargs = dict(
             score_fn=base_score_fn,
@@ -483,9 +507,9 @@ def main():
     model_name = args.model_name.strip("/")
     query_length = args.query_length
     doc_length = args.doc_length
-    train_dataset_path = args.train_dataset
+    distillation_train_dataset_path = args.distillation_train_dataset
+    train_dataset_subset = args.train_dataset_subset
     contrastive_dataset_path = args.contrastive_dataset
-    contrastive_dataset_name = args.contrastive_dataset_name
     eval_split_ratio = args.eval_split_ratio
     use_colbert = args.use_colbert
     k_prime = args.k_prime
@@ -496,6 +520,7 @@ def main():
     Z_clamp_value = args.Z_clamp_value
     start_normalizer_Z_at_step = args.start_normalizer_Z_at_step
     impute_scores_instead_of_zero = args.impute_scores_instead_of_zero
+    score_fn = args.score_fn
     lr = args.lr
     batch_size = args.batch_size
     gradient_accumulation_steps = args.grad_acc_steps
@@ -509,6 +534,7 @@ def main():
     eval_steps = args.eval_steps
     save_steps = args.save_steps
     run_name_override = args.run_name
+    nways = args.nways
 
     # Print configuration
     print("=" * 80)
@@ -528,28 +554,29 @@ def main():
         print(f"k_prime: {k_prime}, k_prime_start: {k_prime_start}")
         print(f"k_prime_schedule: {k_prime_schedule}, anneal_steps: {k_prime_anneal_steps}")
         print(f"use_normalizer_Z: {use_normalizer_Z}, Z_clamp: {Z_clamp_value}")
+        if score_fn:
+            print(f"Score Function: {score_fn} (custom)")
     if training_method == "distillation":
-        print(f"Train Dataset: {train_dataset_path}")
+        subset_display = train_dataset_subset if train_dataset_subset else "train (default)"
+        print(f"Train Dataset: {distillation_train_dataset_path} (subset: {subset_display})")
         print(f"KD MinMax Normalize: {kd_minmax_normalize}")
     else:
-        if contrastive_dataset_name and contrastive_dataset_name.strip() and contrastive_dataset_name.lower() != "none":
-            print(f"Contrastive Dataset: {contrastive_dataset_path}/{contrastive_dataset_name}")
-        else:
-            print(f"Contrastive Dataset: {contrastive_dataset_path}")
+        subset_display = f"/{train_dataset_subset}" if train_dataset_subset else " (no subset)"
+        print(f"Train Dataset: {contrastive_dataset_path}{subset_display}")
     print(f"Evaluators: Triplet={use_triplet_evaluator}, NanoBEIR={use_nanobeir_evaluator}")
     print("=" * 80)
 
     # Load datasets
     if training_method == "distillation":
-        train, queries, documents = load_distillation_datasets(train_dataset_path)
+        train, queries, documents = load_distillation_datasets(distillation_train_dataset_path, name=train_dataset_subset)
         train.set_transform(
-            utils.KDProcessing(queries=queries, documents=documents).transform
+            utils.KDProcessing(queries=queries, documents=documents, n_ways=nways).transform
         )
         train_dataset = train
         eval_dataset = None
     else:
         train_dataset, eval_dataset = load_contrastive_datasets(
-            contrastive_dataset_path, contrastive_dataset_name, eval_split_ratio
+            contrastive_dataset_path, dataset_name=train_dataset_subset, eval_split_ratio=eval_split_ratio
         )
 
     # Build run name
@@ -586,7 +613,7 @@ def main():
     )
 
     # Create score function
-    score_fn = create_score_function(
+    score_fn_obj = create_score_function(
         training_method=training_method,
         use_colbert=use_colbert,
         k_prime=k_prime,
@@ -597,13 +624,14 @@ def main():
         Z_clamp_value=Z_clamp_value,
         start_normalizer_Z_at_step=start_normalizer_Z_at_step,
         impute_scores_instead_of_zero=impute_scores_instead_of_zero,
+        score_fn=score_fn,
     )
 
     # Create loss function
     train_loss = create_loss_function(
         training_method=training_method,
         model=model,
-        score_fn=score_fn,
+        score_fn=score_fn_obj,
         kd_minmax_normalize=kd_minmax_normalize,
     )
 
@@ -662,7 +690,7 @@ def main():
 
     # Add k_prime callback for XTR
     if not use_colbert:
-        trainer.add_callback(scores.KPrimeSchedulerCallback(score_fn))
+        trainer.add_callback(scores.KPrimeSchedulerCallback(score_fn_obj))
 
     # Start training
     trainer.train()

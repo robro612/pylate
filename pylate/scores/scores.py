@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import wandb
 from transformers import TrainerCallback
+from scipy.stats import spearmanr
 
 from ..utils.tensor import convert_to_tensor
 
@@ -215,6 +216,177 @@ def colbert_kd_scores(
 
     scores = scores.max(axis=-1).values.sum(axis=-1)
     return scores
+
+def xtr_contrastive_training_scores_primeqa(
+    queries_embeddings: list | np.ndarray | torch.Tensor,
+    documents_embeddings: list | np.ndarray | torch.Tensor,
+    queries_mask: torch.Tensor | None = None,
+    documents_mask: torch.Tensor | None = None,
+    k_prime: int = 100,
+    use_normalizer_Z : bool = False,
+    impute_scores_instead_of_zero: bool = False,
+    Z_clamp_value: float = 1.0,
+) -> torch.Tensor:
+    """Computes the XTR scores for Contrastive Learning with PrimeQA dataset.
+    
+    Parameters
+    ----------
+    queries_embeddings
+        Shape: (batch_size, q_seq_len, embedding_size)
+    documents_embeddings
+        Shape: (batch_size, d_seq_len, embedding_size)
+    queries_mask
+        Shape: (batch_size, q_seq_len)
+    documents_mask
+        Shape: (batch_size, d_seq_len)
+    k_prime
+        The number of top tokens to consider for each query token.
+    use_normalizer_Z
+        Whether to use the normalizer Z in the score computation.
+    impute_scores_instead_of_zero
+        Whether to impute scores instead of zeroing them out (not currently used in this implementation).
+    Z_clamp_value
+        Minimum value to clamp Z to prevent division by zero.
+    
+    Returns
+    -------
+    scores
+        Shape: (batch_size, batch_size)
+    """
+    #inner product b/w doc and query token embeddings
+    Q = queries_embeddings
+    D = documents_embeddings
+
+    scores = Q.unsqueeze(1) @ D.transpose(1,2).unsqueeze(0) #bxqxdxs
+    
+    if documents_mask is not None:
+        D_mask = documents_mask.repeat(queries_embeddings.size(0), 1, 1)
+        #replace Doc <pad> scores with a large -ve number
+        scores.transpose(2,3)[~D_mask.bool()] = -99999
+
+    ##Qb, Db, Qt = max_scores.shape[:3]
+    Qb, Db, Qt, Dt = scores.shape
+    
+    clubbed_doc_scores = scores.permute(0,2,1,3).flatten(2,3) 
+    
+    topk_scores, topk_indices = clubbed_doc_scores.topk(k_prime, -1)
+
+    #create a boolen vector of True for all positions
+    alignment_mask = torch.ones_like(clubbed_doc_scores, dtype=torch.bool)
+
+    #mask Query <pad> scores and indices
+    if queries_mask is not None:
+        topk_scores = topk_scores * queries_mask.unsqueeze(2) 
+
+    #mask the topk positions to 0
+    alignment_mask.scatter_(-1, topk_indices, 0)
+    
+    #change to 0 all the non-topk position scores, leaving topk scores intact
+    clubbed_doc_scores.masked_fill(alignment_mask, 0)
+    
+    #change the clubbed scores to original shape of QbxQtxDbxDt
+    topk_scores_max = clubbed_doc_scores.view(Qb,Qt,Db,-1).max(-1).values
+
+    #get the normalizer for each doc score as the number of non-zeros scores per doc
+    # (batch_size, q_seq_len, batch_size) -> (batch_size, batch_size)
+    retrieved_counts = (topk_scores_max > 0.0).float().sum(1)
+    
+    # Compute Z (clamped version for normalization)
+    Z = retrieved_counts.clamp(min=Z_clamp_value)
+    
+    #normalize scores
+    numerator = topk_scores_max.sum(1)
+    
+    if use_normalizer_Z:
+        xtr_scores = (1/Z) * numerator
+    else:
+        xtr_scores = numerator
+
+    # log the stats for debugging / monitoring
+    # Create masks for positives (diagonals) and negatives (off-diagonals)
+    batch_size = numerator.shape[0]
+    diag_mask = torch.eye(batch_size, device=numerator.device, dtype=torch.bool)
+    off_diag_mask = ~diag_mask
+    
+    log_dict = {
+        "numerator_mean": numerator.mean().item(),
+        "numerator_std": numerator.std().item(),
+        "numerator_min": numerator.min().item(),
+        "numerator_max": numerator.max().item(),
+        "xtr_scores_mean": xtr_scores.mean().item(),
+        "xtr_scores_std": xtr_scores.std().item(),
+        "k_prime": k_prime,
+        "retrieved_counts_mean": retrieved_counts.mean().item(),
+        "retrieved_counts_std": retrieved_counts.std().item(),
+        "retrieved_counts_max": retrieved_counts.max().item(),
+        "numerator_mean_pos": numerator[diag_mask].mean().item(),
+        "numerator_std_pos": numerator[diag_mask].std().item(),
+        "numerator_min_pos": numerator[diag_mask].min().item(),
+        "numerator_max_pos": numerator[diag_mask].max().item(),
+        "xtr_scores_mean_pos": xtr_scores[diag_mask].mean().item(),
+        "xtr_scores_std_pos": xtr_scores[diag_mask].std().item(),
+        "retrieved_counts_mean_pos": retrieved_counts[diag_mask].mean().item(),
+        "retrieved_counts_std_pos": retrieved_counts[diag_mask].std().item(),
+        "retrieved_counts_max_pos": retrieved_counts[diag_mask].max().item(),
+        "numerator_mean_neg": numerator[off_diag_mask].mean().item(),
+        "numerator_std_neg": numerator[off_diag_mask].std().item(),
+        "numerator_min_neg": numerator[off_diag_mask].min().item(),
+        "numerator_max_neg": numerator[off_diag_mask].max().item(),
+        "xtr_scores_mean_neg": xtr_scores[off_diag_mask].mean().item(),
+        "xtr_scores_std_neg": xtr_scores[off_diag_mask].std().item(),
+        "retrieved_counts_mean_neg": retrieved_counts[off_diag_mask].mean().item(),
+        "retrieved_counts_std_neg": retrieved_counts[off_diag_mask].std().item(),
+        "retrieved_counts_max_neg": retrieved_counts[off_diag_mask].max().item(),
+    }
+    
+    # Add Z statistics (all pairs, positives, and negatives) if normalizer is used
+    if use_normalizer_Z:
+        log_dict.update({
+            "Z_mean": retrieved_counts.float().mean().item(),
+            "Z_std": retrieved_counts.float().std().item(),
+            "Z_min": retrieved_counts.min().item(),
+            "Z_max": retrieved_counts.max().item(),
+            "Z_mean_pos": retrieved_counts[diag_mask].float().mean().item(),
+            "Z_std_pos": retrieved_counts[diag_mask].float().std().item(),
+            "Z_min_pos": retrieved_counts[diag_mask].min().item(),
+            "Z_max_pos": retrieved_counts[diag_mask].max().item(),
+            "Z_mean_neg": retrieved_counts[off_diag_mask].float().mean().item(),
+            "Z_std_neg": retrieved_counts[off_diag_mask].float().std().item(),
+            "Z_min_neg": retrieved_counts[off_diag_mask].min().item(),
+            "Z_max_neg": retrieved_counts[off_diag_mask].max().item(),
+        })
+        
+        # Compute Spearman correlation between numerator and xtr_scores
+        numerator_np = numerator.detach().cpu().numpy()
+        xtr_scores_np = xtr_scores.detach().cpu().numpy()
+        
+        # Compute correlation for each query (row)
+        batch_size = numerator_np.shape[0]
+        rank_correlations = []
+        for i in range(batch_size):
+            corr, _ = spearmanr(numerator_np[i], xtr_scores_np[i])
+            rank_correlations.append(corr)
+        
+        mean_rank_correlation = sum(rank_correlations) / len(rank_correlations) if rank_correlations else 0.0
+        log_dict["Z_rank_correlation"] = mean_rank_correlation
+
+    # log whether Z changes the max document
+    # xtr_scores is (batch_size, batch_size)
+    top_idx = xtr_scores.argmax(dim=1)                # which doc is top for each query
+    pos_idx = torch.arange(xtr_scores.size(0), device=xtr_scores.device)
+    frac_pos_top = (top_idx == pos_idx).float().mean().item()
+    # how many queries have same argmax?
+    same_argmax_frac = (numerator.argmax(dim=1) == xtr_scores.argmax(dim=1)).float().mean().item()
+
+    log_dict.update({
+        "frac_pos_top": frac_pos_top,
+        "same_argmax_frac": same_argmax_frac,
+    })
+
+    if is_main_process():
+        wandb.log(log_dict)
+
+    return xtr_scores
 
 def xtr_contrastive_training_scores(
     queries_embeddings: list | np.ndarray | torch.Tensor,
@@ -461,16 +633,17 @@ def xtr_kd_training_scores(
     k_index = max(1, cross_batch_scores_flattened.size(-1) - k_prime + 1)
     
     # (batch_size, q_seq_len) -> (batch_size, 1, q_seq_len, 1)
-    thresholds = cross_batch_scores_flattened.kthvalue(k=k_index, dim=-1).values
-    thresholds = thresholds.unsqueeze(1).unsqueeze(-1)
+    thresholds = (
+        cross_batch_scores_flattened
+        .kthvalue(k=k_index, dim=-1)
+        .values
+        .unsqueeze(1)
+        .unsqueeze(-1)
+    )
 
     # 5. Determine Retrieval (Alignment Matrix A)
     # (batch_size, total_docs, q_seq_len, d_seq_len)
     is_retrieved = cross_batch_scores >= thresholds
-
-    # -------------------------------------------------------------------------
-    # KD SPECIFIC EXTRACTION
-    # -------------------------------------------------------------------------
 
     # Reshape back to separate batch and n_ways
     # (batch_size, batch_size, n_ways, q_seq_len, d_seq_len)
@@ -521,10 +694,6 @@ def xtr_kd_training_scores(
         xtr_scores = torch.where(normalizer_Z > 0, scores, torch.zeros_like(scores, dtype=scores.dtype))
     else:
         xtr_scores = numerator
-
-    # -------------------------------------------------------------------------
-    # WANDB LOGGING
-    # -------------------------------------------------------------------------
     
     # Define masks for Positives (index 0) and Negatives (indices 1..n_ways)
     # (batch_size, n_ways)
@@ -594,10 +763,24 @@ def xtr_kd_training_scores(
     
     # Check if argmax of numerator aligns with argmax of final score
     same_argmax_frac = (numerator.argmax(dim=1) == top_idx).float().mean().item()
+    
+    # Convert to numpy for scipy
+    numerator_np = numerator.detach().cpu().numpy()
+    xtr_scores_np = xtr_scores.detach().cpu().numpy()
+    
+    # Compute Spearman correlation for each batch element
+    batch_size = numerator_np.shape[0]
+    rank_correlations = []
+    for i in range(batch_size):
+        corr, _ = spearmanr(numerator_np[i], xtr_scores_np[i])
+        rank_correlations.append(corr)
+    
+    mean_rank_correlation = sum(rank_correlations) / len(rank_correlations)
 
     log_dict.update({
         "frac_pos_top": frac_pos_top,
         "same_argmax_frac": same_argmax_frac,
+        "Z_rank_correlation": mean_rank_correlation,
         "k_index": k_index,
     })
 

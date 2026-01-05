@@ -668,8 +668,20 @@ def test_index(
     print("="*80)
     
     # Initialize index
-    index = config["index_class"](**config["init_kwargs"])
+    index : indexes.Base = config["index_class"](**config["init_kwargs"])
     retriever = retrieve.ColBERT(index=index, verbose=verbose)
+
+    # convert documents_embeddings to numpy array
+    print(f"Converting documents_embeddings and queries_embeddings to {embedding_dtype}...")
+    match embedding_dtype:
+        case "bf16":
+            from ml_dtypes import bfloat16
+            documents_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in documents_embeddings]
+            queries_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in queries_embeddings]
+        case _:
+            documents_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in documents_embeddings]
+            queries_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in queries_embeddings]
+
 
     # Add documents
     print(f"Adding documents to {index_name} index...")
@@ -797,9 +809,9 @@ def main() -> None:
     
     # Convert model dtype and embedding dtype strings to torch dtypes
     model_dtype_torch = get_torch_dtype(args.model_dtype)
-    embedding_dtype = get_torch_dtype(args.embedding_dtype)
+    embedding_dtype_torch = get_torch_dtype(args.embedding_dtype)
     print(f"Model dtype: {args.model_dtype} ({model_dtype_torch})")
-    print(f"Embedding dtype: {args.embedding_dtype} ({embedding_dtype})")
+    print(f"Embedding dtype: {args.embedding_dtype} ({embedding_dtype_torch})")
     
     # Expand glob patterns for model paths
     all_model_paths = expand_model_paths(args.model_name_or_path)
@@ -884,7 +896,7 @@ def main() -> None:
             cache_embeddings=args.cache_embeddings,
             shard_size=args.shard_size,
             batch_size=args.batch_size,
-            embedding_dtype=embedding_dtype,
+            embedding_dtype=embedding_dtype_torch,
             move_to_cpu=args.move_embeddings_to_cpu,
         )
         
@@ -895,7 +907,7 @@ def main() -> None:
             query_embeddings_cache_file=query_embeddings_cache_file,
             cache_embeddings=args.cache_embeddings,
             batch_size=args.batch_size,
-            embedding_dtype=embedding_dtype,
+            embedding_dtype=embedding_dtype_torch,
             move_to_cpu=args.move_embeddings_to_cpu,
         )
 
