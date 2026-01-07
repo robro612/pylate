@@ -6,6 +6,7 @@ class PoolingConfig(CompressionStrategyConfigBase):
     protected_tokens: int = 1
     clustering_method: Literal["hierarchical", "spherical"] = "hierarchical"
     show_progress_bar: bool = False
+    kmeans_gpu: bool = False  # Enable GPU for fastkmeans (experimental, will fallback to CPU on error)
 
     def serialize(self) -> dict:
         """
@@ -21,6 +22,7 @@ class PoolingConfig(CompressionStrategyConfigBase):
             "protected_tokens": self.protected_tokens,
             "clustering_method": self.clustering_method,
             "show_progress_bar": self.show_progress_bar,
+            "kmeans_gpu": self.kmeans_gpu,
         }
 
     @property
@@ -102,6 +104,7 @@ class PoolingStrategy(CompressionStrategy):
             protected_tokens=config_data.get("protected_tokens", 1),
             clustering_method=config_data.get("clustering_method", "hierarchical"),
             show_progress_bar=config_data.get("show_progress_bar", False),
+            kmeans_gpu=config_data.get("kmeans_gpu", False),
         )
         return cls(config)
     
@@ -172,10 +175,12 @@ class PoolingStrategy(CompressionStrategy):
                 pooled_embeddings.append(protected_embeddings)
                 cluster_assignments.append([])
                 continue
-            
+
             # Compute cosine similarity and convert to distance matrix
+            # Cast to float32 for torch.mm compatibility (BFloat16 not supported on all platforms)
+            embeddings_float32 = embeddings_to_pool.float()
             cosine_similarities = torch.mm(
-                input=embeddings_to_pool, mat2=embeddings_to_pool.t()
+                input=embeddings_float32, mat2=embeddings_float32.t()
             )
             distance_matrix = 1 - cosine_similarities.cpu().numpy()
             
@@ -317,24 +322,51 @@ class PoolingStrategy(CompressionStrategy):
             # Convert to numpy for fastkmeans (it expects numpy arrays)
             embeddings_np = embeddings_normalized.cpu().float().numpy()
             embedding_dim = embeddings_np.shape[1]
-            
-            # Initialize and train fastkmeans
-            # TODO: Using GPU causes some weird issues I haven't been able to debug. 
-            # Given that we're only throwing ~300 (max doclen) embeddings in any given clustering, it's not worth the hassle to figure out why.
-            kmeans = fastkmeans.FastKMeans(
-                embedding_dim,
-                num_clusters,
-                niter=10,  # Number of iterations
-                gpu=False,
-                verbose=False,
-                seed=42,
-            )
-            
-            # Train the kmeans model
-            kmeans.train(embeddings_np)
-            
-            # Get cluster assignments for each embedding
-            cluster_labels_np = kmeans.predict(embeddings_np)
+
+            # Determine if we should try GPU
+            use_gpu = self.config.kmeans_gpu and torch.cuda.is_available()
+
+            # Initialize and train fastkmeans with GPU fallback
+            cluster_labels_np = None
+            if use_gpu:
+                try:
+                    # Sync CUDA before clustering to ensure clean state
+                    torch.cuda.synchronize()
+
+                    kmeans = fastkmeans.FastKMeans(
+                        embedding_dim,
+                        num_clusters,
+                        niter=10,
+                        gpu=True,
+                        verbose=False,
+                        seed=42,
+                    )
+                    kmeans.train(embeddings_np)
+                    cluster_labels_np = kmeans.predict(embeddings_np)
+                except RuntimeError as e:
+                    # GPU failed, will fallback to CPU below
+                    if "CUDA" in str(e) or "cuda" in str(e).lower():
+                        import warnings
+                        warnings.warn(
+                            f"fastkmeans GPU failed with CUDA error, falling back to CPU: {e}",
+                            RuntimeWarning,
+                        )
+                        cluster_labels_np = None
+                    else:
+                        raise
+
+            # CPU fallback (or if GPU was not requested)
+            if cluster_labels_np is None:
+                kmeans = fastkmeans.FastKMeans(
+                    embedding_dim,
+                    num_clusters,
+                    niter=10,
+                    gpu=False,
+                    verbose=False,
+                    seed=42,
+                )
+                kmeans.train(embeddings_np)
+                cluster_labels_np = kmeans.predict(embeddings_np)
             
             # Convert cluster labels to torch tensor for indexing
             cluster_labels_tensor = torch.from_numpy(cluster_labels_np).to(device=device)

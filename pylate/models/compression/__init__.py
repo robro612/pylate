@@ -10,8 +10,10 @@ from .compression import (
     validate_compression_artifact_shape,
 )
 from .idf_pruning import IDFPruningConfig, IDFPruningStrategy
+from .idf_pooling import IDFPoolingConfig, IDFPoolingStrategy
 from .pooling import PoolingConfig, PoolingStrategy
 from .attention_pruning import AttentionPruningConfig, AttentionPruningStrategy
+from .attention_pooling import AttentionPoolingConfig, AttentionPoolingStrategy
 from .leverage_score_pruning import LeverageScorePruningConfig, LeverageScorePruningStrategy
 from .importance_pruning import ImportancePruningConfig, ImportancePruningStrategy
 from .importance_pooling import ImportancePoolingConfig, ImportancePoolingStrategy
@@ -31,10 +33,14 @@ __all__ = [
     "Compressor",
     "IDFPruningConfig",
     "IDFPruningStrategy",
+    "IDFPoolingConfig",
+    "IDFPoolingStrategy",
     "PoolingConfig",
     "PoolingStrategy",
     "AttentionPruningConfig",
     "AttentionPruningStrategy",
+    "AttentionPoolingConfig",
+    "AttentionPoolingStrategy",
     "LeverageScorePruningConfig",
     "LeverageScorePruningStrategy",
     "ImportancePruningConfig",

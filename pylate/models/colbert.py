@@ -463,8 +463,62 @@ class ColBERT(SentenceTransformer):
         )
     
     def _get_model_last_attention_layer(self) -> nn.Module:
-        # TODO: add cases for models other than lightonai/GTE-ModernColBERT-v1
-        return self[0].auto_model.layers[-1].attn
+        """
+        Get the last attention layer from the model, handling different architectures.
+
+        Returns
+        -------
+        nn.Module
+            The last attention layer module.
+        """
+        auto_model = self[0].auto_model
+
+        # Try different model architectures
+        # ModernBERT and similar models use .layers at the top level
+        if hasattr(auto_model, 'layers'):
+            return auto_model.layers[-1].attn
+
+        # Models with encoder
+        elif hasattr(auto_model, 'encoder'):
+            encoder = auto_model.encoder
+
+            # Standard BERT, RoBERTa, XLMRoBERTa use .encoder.layer (singular)
+            if hasattr(encoder, 'layer'):
+                return encoder.layer[-1].attention.self
+
+            # Some custom implementations (like jinaai/jina-colbert-v2) use .encoder.layers (plural)
+            elif hasattr(encoder, 'layers'):
+                last_layer = encoder.layers[-1]
+                # Check if it has a mixer (custom architecture)
+                if hasattr(last_layer, 'mixer'):
+                    return last_layer.mixer
+                # Otherwise try attention
+                elif hasattr(last_layer, 'attention'):
+                    if hasattr(last_layer.attention, 'self'):
+                        return last_layer.attention.self
+                    else:
+                        return last_layer.attention
+                # Or attn
+                elif hasattr(last_layer, 'attn'):
+                    return last_layer.attn
+
+            # T5 and similar models use .encoder.block
+            elif hasattr(encoder, 'block'):
+                return encoder.block[-1].layer[0].SelfAttention
+
+        # GPT-2 and similar models use .h
+        elif hasattr(auto_model, 'h'):
+            return auto_model.h[-1].attn
+
+        # If we get here, we couldn't find the attention layer
+        raise AttributeError(
+            f"Could not find attention layers for model architecture: {type(auto_model).__name__}. "
+            f"Model has encoder: {hasattr(auto_model, 'encoder')}. "
+            f"Encoder type: {type(auto_model.encoder).__name__ if hasattr(auto_model, 'encoder') else 'N/A'}. "
+            f"Encoder has 'layer': {hasattr(auto_model.encoder, 'layer') if hasattr(auto_model, 'encoder') else 'N/A'}. "
+            f"Encoder has 'layers': {hasattr(auto_model.encoder, 'layers') if hasattr(auto_model, 'encoder') else 'N/A'}. "
+            f"Available model attributes: {[a for a in dir(auto_model) if not a.startswith('_')]}"
+        )
 
     def _setup_attention_score_hook(
         self, captured_attention_scores: list[torch.Tensor]
@@ -494,10 +548,14 @@ class ColBERT(SentenceTransformer):
         def attention_hook(module, input, output):
             # Try to extract attention scores from output
             attention_scores = None
-            
+
             if isinstance(output, tuple) and len(output) > 1:
                 # If output is a tuple, attention scores might be at index 1
-                attention_scores = output[1]
+                # But we need to check if it's actually attention scores (4D tensor)
+                potential_scores = output[1]
+                if hasattr(potential_scores, 'dim') and potential_scores.dim() == 4:
+                    # Looks like attention scores: (batch, num_heads, seq_len, seq_len)
+                    attention_scores = potential_scores
             elif hasattr(module, '_last_attention_scores'):
                 # Some implementations store attention scores in module state
                 attention_scores = module._last_attention_scores
@@ -511,28 +569,49 @@ class ColBERT(SentenceTransformer):
                 else:
                     hidden_states = input
                     attention_mask = None
-                
-                # Compute attention scores manually for ModernBertAttention
+
+                # Compute attention scores manually - handle different architectures
                 batch_size, seq_len, hidden_size = hidden_states.shape
-                
-                # Get num_heads from config
-                num_heads = module.num_heads
+
+                # Get num_heads - different attributes for different architectures
+                if hasattr(module, 'num_heads'):
+                    num_heads = module.num_heads
+                elif hasattr(module, 'num_attention_heads'):
+                    num_heads = module.num_attention_heads
+                else:
+                    # Can't compute attention scores without knowing num_heads
+                    return
+
                 head_dim = hidden_size // num_heads
-                
-                # Get Q, K, V from Wqkv projection
-                qkv = module.Wqkv(hidden_states)  # (batch, seq_len, 3*hidden_size)
-                qkv = qkv.view(batch_size, seq_len, 3, hidden_size)  # (batch, seq_len, 3, hidden_size)
-                q, k, v = qkv.chunk(3, dim=2)  # Each: (batch, seq_len, 1, hidden_size)
-                q = q.squeeze(2)  # (batch, seq_len, hidden_size)
-                k = k.squeeze(2)  # (batch, seq_len, hidden_size)
-                
+
+                # Get Q, K, V - different methods for different architectures
+                if hasattr(module, 'Wqkv'):
+                    # ModernBERT and MHA use Wqkv projection
+                    qkv_output = module.Wqkv(hidden_states)
+                    # Some implementations (like MHA) return (qkv, residual) tuple
+                    if isinstance(qkv_output, tuple):
+                        qkv = qkv_output[0]  # (batch, seq_len, 3*hidden_size)
+                    else:
+                        qkv = qkv_output  # (batch, seq_len, 3*hidden_size)
+                    qkv = qkv.view(batch_size, seq_len, 3, hidden_size)  # (batch, seq_len, 3, hidden_size)
+                    q, k, v = qkv.chunk(3, dim=2)  # Each: (batch, seq_len, 1, hidden_size)
+                    q = q.squeeze(2)  # (batch, seq_len, hidden_size)
+                    k = k.squeeze(2)  # (batch, seq_len, hidden_size)
+                elif hasattr(module, 'query') and hasattr(module, 'key'):
+                    # BERT/RoBERTa/XLMRoBERTa use separate query, key, value projections
+                    q = module.query(hidden_states)  # (batch, seq_len, hidden_size)
+                    k = module.key(hidden_states)    # (batch, seq_len, hidden_size)
+                else:
+                    # Can't compute attention scores without Q, K projections
+                    return
+
                 # Reshape for multi-head attention
                 q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
                 k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
-                
+
                 # Compute attention scores: QK^T / sqrt(d_k)
                 attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-                
+
                 # Apply attention mask if provided
                 if attention_mask is not None:
                     if attention_mask.dim() == 2:
@@ -542,7 +621,7 @@ class ColBERT(SentenceTransformer):
                     else:
                         mask = attention_mask
                     attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
-                
+
                 # Apply softmax to get attention probabilities
                 attention_scores = torch.softmax(attention_scores, dim=-1)
             

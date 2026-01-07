@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,10 +19,14 @@ from pylate.models.compression import (
     CompressionConfig,
     IDFPruningConfig,
     IDFPruningStrategy,
+    IDFPoolingConfig,
+    IDFPoolingStrategy,
     PoolingConfig,
     PoolingStrategy,
     AttentionPruningConfig,
     AttentionPruningStrategy,
+    AttentionPoolingConfig,
+    AttentionPoolingStrategy,
     LeverageScorePruningConfig,
     LeverageScorePruningStrategy,
     ImportancePruningConfig,
@@ -67,7 +72,7 @@ QUERY_LEN = {
 }
 
 
-def load_model(model_name: str, dataset_name: str) -> ColBERT:
+def load_model(model_name: str, dataset_name: str, document_length: int | None = None) -> ColBERT:
     """
     Load and initialize the ColBERT model.
 
@@ -75,6 +80,8 @@ def load_model(model_name: str, dataset_name: str) -> ColBERT:
     ----------
     model_name : str
         Name/path of the model to load
+    document_length : int | None
+        Maximum document length. If None, uses model's max length.
     dataset_name : str
         Dataset name to determine query length
 
@@ -87,10 +94,21 @@ def load_model(model_name: str, dataset_name: str) -> ColBERT:
     print("Loading model...")
     print("=" * 80)
 
+    # First load model to get its max_length if document_length not specified
+    if document_length is None:
+        # Load tokenizer to get max_length
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        max_len = getattr(tokenizer, 'model_max_length', 8192)
+        # Cap at reasonable limit (some models report very large values like 1e30)
+        document_length = min(max_len, 8192)
+        print(f"  Using model's max length: {document_length}")
+
     model = models.ColBERT(
         model_name_or_path=model_name,
-        document_length=300,
+        document_length=document_length,
         query_length=QUERY_LEN.get(dataset_name, 32),
+        trust_remote_code=True,
     )
 
     print(f"✓ Loaded model: {model_name}")
@@ -107,7 +125,9 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict]:
     Parameters
     ----------
     dataset_name : str
-        Name of the dataset to load
+        Name of the dataset to load. Can be:
+        - A BEIR dataset name (e.g., "nfcorpus", "scifact")
+        - A path to a custom dataset directory (e.g., "amazon_dataset/beir_format")
 
     Returns
     -------
@@ -118,7 +138,23 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict]:
     print(f"Loading dataset: {dataset_name}")
     print("=" * 80)
 
-    if "cqadupstack" in dataset_name:
+    # Check if dataset_name is a path to a local directory
+    # Resolve relative paths and check for corpus.jsonl to confirm it's a valid BEIR dataset
+    dataset_path = Path(dataset_name).resolve()
+    is_local_dataset = (
+        dataset_path.exists()
+        and dataset_path.is_dir()
+        and (dataset_path / "corpus.jsonl").exists()
+    )
+
+    if is_local_dataset:
+        # Load custom dataset from local directory
+        print(f"Loading custom dataset from: {dataset_path}")
+        documents, queries, qrels = evaluation.load_custom_dataset(
+            str(dataset_path),
+            split="test",
+        )
+    elif "cqadupstack" in dataset_name:
         # Download dataset if not already downloaded
         from beir import util
 
@@ -131,6 +167,7 @@ def load_dataset(dataset_name: str) -> tuple[list[dict], dict, dict]:
             split="test",
         )
     else:
+        # Load BEIR dataset
         documents, queries, qrels = evaluation.load_beir(
             dataset_name=dataset_name,
             split="dev" if "msmarco" in dataset_name else "test",
@@ -265,15 +302,17 @@ def load_configs_from_jsonl(jsonl_path: Path, model: ColBERT) -> list[Compressio
     return configs
 
 
-def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
+def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[CompressionConfig | None]:
     """
     Create default compression configurations matching beir_dataset.py.
-    
+
     Parameters
     ----------
     model : ColBERT
         Model instance (needed for tokenizer.all_special_ids)
-        
+    kmeans_gpu : bool
+        Enable GPU for fastkmeans in spherical pooling (experimental)
+
     Returns
     -------
     list[CompressionConfig | None]
@@ -352,7 +391,7 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
     #     )
 
     # Random pruning baseline
-    for keep_ratio in [0.1, 0.2, 0.33, 0.5]:
+    for keep_ratio in [0.1, 0.2, 0.33, 0.5, ]:
         rand_prune_cfg = RandomPruningConfig(
             keep_ratio=keep_ratio,
             protected_tokens=1,
@@ -382,6 +421,7 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
             )
         )
 
+
         # attention score pruning configs
         attention_config = AttentionPruningConfig(
             # top_k=k,
@@ -396,6 +436,20 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
             description=f"Attention score pruning keep_ratio={keep_ratio}",
         )
         configs.append(config)
+
+        # attention score pooling configs
+        attention_pool_config = AttentionPoolingConfig(
+            keep_ratio=keep_ratio,
+            protected_tokens=1,
+            min_tokens=8,
+            show_progress_bar=True,
+        )
+        attention_pool_strategy = AttentionPoolingStrategy(attention_pool_config)
+        attention_pool_compression_config = CompressionConfig(
+            strategies=[attention_pool_strategy],
+            description=f"Attention score pooling keep_ratio={keep_ratio}",
+        )
+        configs.append(attention_pool_compression_config)
 
         leverage_config = LeverageScorePruningConfig(
             # top_k=k,
@@ -446,7 +500,23 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
             description=f"Doc-wise IDF pruning keep_ratio={keep_ratio}",
         )
         configs.append(config)
-    
+
+        # IDF Pooling configs (document mode)
+        idf_pooling_config = IDFPoolingConfig(
+            keep_ratio=keep_ratio,
+            protected_tokens=1,
+            min_tokens=8,
+            use_tfidf=False,
+            ignore_token_ids=model.tokenizer.added_tokens_decoder.keys(),
+            show_progress_bar=False,
+        )
+        strategy = IDFPoolingStrategy(idf_pooling_config)
+        config = CompressionConfig(
+            strategies=[strategy],
+            description=f"IDF Pooling keep_ratio={keep_ratio}",
+        )
+        configs.append(config)
+
     # Pooling configs
     for method in ["spherical", "hierarchical"]:
         for k in [2, 3, 5, 10]:
@@ -455,6 +525,7 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
                 protected_tokens=1,
                 clustering_method=method,
                 show_progress_bar=True,
+                kmeans_gpu=kmeans_gpu if method == "spherical" else False,
             )
             strategy = PoolingStrategy(pooling_config)
             config = CompressionConfig(
@@ -462,7 +533,7 @@ def create_default_configs(model: ColBERT) -> list[CompressionConfig | None]:
                 description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1",
             )
             configs.append(config)
-    
+
     return configs
 
 
@@ -522,6 +593,8 @@ def evaluate_config(
     save_runfile: bool = False,
     runfile_output_dir: Path | None = None,
     run_id: str | None = None,
+    save_retrieval_results: bool = False,
+    retrieval_results_output_dir: Path | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate a single compression configuration.
@@ -552,13 +625,17 @@ def evaluate_config(
         Experiment statistics
     metrics : list[str] | None, optional
         List of evaluation metrics to compute. If None, defaults to
-        ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10"]
+        ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10", "precision@10"]
     save_runfile : bool, optional
-        Whether to save the runfile. Defaults to False.
+        Whether to save the ranx runfile (for evaluation). Defaults to False.
     runfile_output_dir : Path | None, optional
         Directory to save runfiles. Required if save_runfile is True.
     run_id : str | None, optional
         Unique run ID for this experiment. Required if save_runfile is True.
+    save_retrieval_results : bool, optional
+        Whether to save the raw retrieval results (all scores). Defaults to False.
+    retrieval_results_output_dir : Path | None, optional
+        Directory to save retrieval results. Required if save_retrieval_results is True.
 
     Returns
     -------
@@ -605,7 +682,7 @@ def evaluate_config(
 
     # Evaluate
     if metrics is None:
-        metrics = ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10"]
+        metrics = ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10", "precision@10"]
     
     from ranx import Qrels, Run, evaluate as ranx_evaluate
     
@@ -645,6 +722,32 @@ def evaluate_config(
         run.save(str(runfile_path), kind="json")
         print(f"Saved runfile to: {runfile_path}")
 
+    # Save retrieval results if requested
+    retrieval_results_path = None
+    if save_retrieval_results and retrieval_results_output_dir is not None and run_id is not None:
+        # Save the raw retrieval scores (before evaluation)
+        retrieval_results_path = retrieval_results_output_dir / f"retrieval-{run_id}.config-{config_idx}.json"
+
+        # Create a structured format with query IDs and their retrieved documents
+        retrieval_data = {
+            "run_id": run_id,
+            "config_idx": config_idx,
+            "config_name": config_name,
+            "dataset_name": dataset_name,
+            "model_name": model_name,
+            "num_queries": len(query_list),
+            "k": 20,  # Number of retrieved documents per query
+            "results": {
+                query_id: query_scores
+                for query_id, query_scores in zip(query_list, scores)
+            }
+        }
+
+        with open(retrieval_results_path, "w") as f:
+            json.dump(retrieval_data, f, indent=2)
+
+        print(f"Saved retrieval results to: {retrieval_results_path}")
+
     # Store results
     result_entry = {
         "config_idx": config_idx,
@@ -653,6 +756,7 @@ def evaluate_config(
         "avg_tokens_per_doc": stats["avg_tokens_per_doc"][config_idx],
         "evaluation": evaluation_scores,
         "runfile_path": str(runfile_path) if runfile_path else None,
+        "retrieval_results_path": str(retrieval_results_path) if retrieval_results_path else None,
     }
 
     print(f"Token count: {stats['config_token_counts'][config_idx]:,}")
@@ -850,13 +954,41 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         type=str,
         nargs="+",
-        default=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10"],
-        help="Evaluation metrics to compute (default: ['map', 'ndcg@10', 'ndcg@100', 'recall@10', 'recall@100', 'mrr@10'])",
+        default=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10", "precision@10"],
+        help="Evaluation metrics to compute (default: ['map', 'ndcg@10', 'ndcg@100', 'recall@10', 'recall@100', 'mrr@10', 'precision@10'])",
     )
     parser.add_argument(
         "--save_runfiles",
         action="store_true",
         help="Save ranx runfiles for each configuration (default: False)",
+    )
+    parser.add_argument(
+        "--save_retrieval_results",
+        action="store_true",
+        help="Save raw retrieval results (all query-document scores) for each configuration (default: False)",
+    )
+    parser.add_argument(
+        "--kmeans_gpu",
+        action="store_true",
+        help="Enable GPU for fastkmeans in spherical pooling (experimental, will fallback to CPU on error)",
+    )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="Number of configs to skip (for resuming experiments). Skips configs 0 to skip-1.",
+    )
+    parser.add_argument(
+        "--append_to",
+        type=str,
+        default=None,
+        help="Path to existing results JSONL file to append to (for resuming experiments).",
+    )
+    parser.add_argument(
+        "--document_length",
+        type=int,
+        default=None,
+        help="Maximum document length in tokens. If not specified, uses model's max length (capped at 8192).",
     )
     return parser.parse_args()
 
@@ -867,28 +999,40 @@ def main() -> None:
     overall_start = time.time()
 
     # Load model
-    model: ColBERT = load_model(args.model_name, args.dataset_name)
+    model: ColBERT = load_model(args.model_name, args.dataset_name, args.document_length)
 
     # Load dataset
     documents, queries, qrels = load_dataset(args.dataset_name)
 
-    # Set up experiment output directory
-    model_dir = sanitize_name(args.model_name.split("/")[-1])
-    dataset_dir = sanitize_name(args.dataset_name)
-    if args.experiment_output_dir is None:
-        experiment_output_dir = (
-            Path("results")
-            / "compression_experiments"
-            / model_dir
-            / dataset_dir
-        )
+    # Set up experiment output directory and results file path
+    if args.append_to:
+        # Resume mode: append to existing file
+        results_jsonl_path = Path(args.append_to).resolve()
+        if not results_jsonl_path.exists():
+            print(f"Error: --append_to file not found: {results_jsonl_path}")
+            sys.exit(1)
+        experiment_output_dir = results_jsonl_path.parent
+        # Extract run_id from existing filename (e.g., results_20251221_194501.jsonl)
+        run_id = results_jsonl_path.stem.replace("results_", "")
+        print(f"\n✓ Appending to existing results file: {results_jsonl_path}")
     else:
-        experiment_output_dir = Path(args.experiment_output_dir)
-    experiment_output_dir.mkdir(parents=True, exist_ok=True)
+        # Normal mode: create new experiment
+        model_dir = sanitize_name(args.model_name.split("/")[-1])
+        dataset_dir = sanitize_name(args.dataset_name)
+        if args.experiment_output_dir is None:
+            experiment_output_dir = (
+                Path("results")
+                / "compression_experiments"
+                / model_dir
+                / dataset_dir
+            )
+        else:
+            experiment_output_dir = Path(args.experiment_output_dir)
+        experiment_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate run_id for consistent naming and tracking
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_jsonl_path = experiment_output_dir / f"results_{run_id}.jsonl"
+        # Generate run_id for consistent naming and tracking
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_jsonl_path = experiment_output_dir / f"results_{run_id}.jsonl"
 
     # Load compression configs
     print("\n" + "=" * 80)
@@ -898,8 +1042,10 @@ def main() -> None:
         configs = load_configs_from_jsonl(Path(args.configs_file), model)
         print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
     else:
-        configs = create_default_configs(model)
+        configs = create_default_configs(model, kmeans_gpu=args.kmeans_gpu)
         print(f"✓ Created {len(configs)} default configs")
+        if args.kmeans_gpu:
+            print("  (GPU enabled for spherical pooling kmeans)")
     
     print("\nConfigurations:")
     for i, config in enumerate(configs):
@@ -952,30 +1098,31 @@ def main() -> None:
         "num_configs": len(configs),
     }
 
-    # Write initial metadata so results file exists before per-config appends
-    metadata_entry = {
-        "type": "metadata",
-        "run_id": run_id,
-        "timestamp": datetime.now().isoformat(),
-        "model_name": args.model_name,
-        "dataset_name": args.dataset_name,
-        "num_documents": stats.get("num_documents"),
-        "num_configs": len(configs),
-        "args": {
-            "index_type": args.index_type,
-            "batch_size": args.batch_size,
-            "metrics": args.metrics,
-            "configs_file": args.configs_file,
-        },
-        "timing": {
-            "encoding_time": stats.get("encoding_time"),
-            "query_encoding_time": stats.get("query_encoding_time"),
-            "total_time": None,  # filled in after all configs
-        },
-        "configs": [serialize_config_for_storage(config) for config in configs],
-    }
-    with open(results_jsonl_path, "w") as f:
-        f.write(json.dumps(metadata_entry, default=str) + "\n")
+    # Write initial metadata only if not appending to existing file
+    if not args.append_to:
+        metadata_entry = {
+            "type": "metadata",
+            "run_id": run_id,
+            "timestamp": datetime.now().isoformat(),
+            "model_name": args.model_name,
+            "dataset_name": args.dataset_name,
+            "num_documents": stats.get("num_documents"),
+            "num_configs": len(configs),
+            "args": {
+                "index_type": args.index_type,
+                "batch_size": args.batch_size,
+                "metrics": args.metrics,
+                "configs_file": args.configs_file,
+            },
+            "timing": {
+                "encoding_time": stats.get("encoding_time"),
+                "query_encoding_time": stats.get("query_encoding_time"),
+                "total_time": None,  # filled in after all configs
+            },
+            "configs": [serialize_config_for_storage(config) for config in configs],
+        }
+        with open(results_jsonl_path, "w") as f:
+            f.write(json.dumps(metadata_entry, default=str) + "\n")
 
     # Evaluate each compression config
     print("\n" + "=" * 80)
@@ -983,14 +1130,30 @@ def main() -> None:
     print("=" * 80)
 
     all_evaluation_results = []
-    
+
     # Set up runfile output directory if saving runfiles
     runfile_output_dir = None
     if args.save_runfiles:
         runfile_output_dir = experiment_output_dir / "runfiles"
         runfile_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set up retrieval results output directory if saving retrieval results
+    retrieval_results_output_dir = None
+    if args.save_retrieval_results:
+        retrieval_results_output_dir = experiment_output_dir / "retrieval_results"
+        retrieval_results_output_dir.mkdir(parents=True, exist_ok=True)
+
     for config_idx, config in enumerate(configs):
+        # Skip configs if --skip is specified (for resuming experiments)
+        if config_idx < args.skip:
+            config_name = "Baseline (no compression)" if config is None else config.description
+            print(f"\n[{config_idx}] Skipping: {config_name}")
+            # Add placeholder stats for skipped configs
+            stats["config_token_counts"].append(0)
+            stats["avg_tokens_per_doc"].append(0)
+            stats["compression_times"].append(0)
+            continue
+
         compression_start = time.time()
 
         # Apply compression if config is not None (baseline)
@@ -1045,6 +1208,8 @@ def main() -> None:
             save_runfile=args.save_runfiles,
             runfile_output_dir=runfile_output_dir,
             run_id=run_id,
+            save_retrieval_results=args.save_retrieval_results,
+            retrieval_results_output_dir=retrieval_results_output_dir,
         )
         all_evaluation_results.append(result)
         # Stream the result to disk immediately
