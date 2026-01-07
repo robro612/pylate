@@ -209,6 +209,13 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Save ranx Run file for each evaluation run (default: False)",
     )
+    parser.add_argument(
+        "--retrieval_mode",
+        type=str,
+        default="XTR",
+        choices=["ColBERT", "XTR"],
+        help="Retrieval mode: 'ColBERT' for full ColBERT reranking (requires store_embeddings=True for ScaNN), 'XTR' for XTR scoring (default: 'XTR')",
+    )
     return parser.parse_args()
 
 
@@ -596,6 +603,7 @@ def get_index_configs(
                 "num_leaves_to_search": args.num_leaves_to_search,
                 "verbose": True,
                 "use_autopilot": args.use_autopilot,
+                "store_embeddings": args.retrieval_mode == "ColBERT",  # Only store if using ColBERT retrieval
             },
             "add_documents_kwargs": {
                 "batch_size": args.batch_size,
@@ -643,7 +651,7 @@ def get_index_configs(
 
 def test_index(
     config: Dict[str, Any],
-    documents: List[Dict[str, str]],
+    documents_ids: List[str],
     documents_embeddings: List[torch.Tensor],
     queries: Dict[str, str],
     queries_embeddings: List[torch.Tensor],
@@ -657,6 +665,7 @@ def test_index(
     model_dtype: str,
     embedding_dtype: str,
     lowercase: bool,
+    retrieval_mode: str = "XTR",
     save_runfile: bool = False,
 ) -> None:
     """
@@ -671,15 +680,15 @@ def test_index(
     index : indexes.Base = config["index_class"](**config["init_kwargs"])
     retriever = retrieve.ColBERT(index=index, verbose=verbose)
 
-    # convert documents_embeddings to numpy array
+    # # convert documents_embeddings to numpy array
     print(f"Converting documents_embeddings and queries_embeddings to {embedding_dtype}...")
     match embedding_dtype:
         case "bf16":
             from ml_dtypes import bfloat16
-            documents_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in documents_embeddings]
+            # documents_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in documents_embeddings]
             queries_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in queries_embeddings]
         case _:
-            documents_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in documents_embeddings]
+            # documents_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in documents_embeddings]
             queries_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in queries_embeddings]
 
 
@@ -687,7 +696,7 @@ def test_index(
     print(f"Adding documents to {index_name} index...")
     start_time = time.time()
     add_kwargs = {
-        "documents_ids": [document["id"] for document in documents],
+        "documents_ids": documents_ids,
         "documents_embeddings": documents_embeddings,
         **config["add_documents_kwargs"],
     }
@@ -696,11 +705,13 @@ def test_index(
     print(f"{index_name} indexing time: {index_time:.2f} seconds")
     
     # Retrieve
-    print(f"Retrieving with {index_name}...")
+    print(f"Retrieving with {index_name} using {retrieval_mode} mode...")
     start_time = time.time()
-    if isinstance(index, indexes.PLAID):
-        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k)
+    if retrieval_mode == "ColBERT":
+        # ColBERT-style retrieval (works for PLAID, ScaNN with store_embeddings=True, Flat, Voyager)
+        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=1)
     else:
+        # XTR-style retrieval (works for all indexes)
         scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=1)
     retrieve_time = time.time() - start_time
     print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
@@ -899,6 +910,10 @@ def main() -> None:
             embedding_dtype=embedding_dtype_torch,
             move_to_cpu=args.move_embeddings_to_cpu,
         )
+
+        # from here on in the loop we only need the documents_ids and queries
+        documents_ids = [document["id"] for document in documents]
+        del documents
         
         # Encode queries
         queries_embeddings = encode_queries(
@@ -932,7 +947,7 @@ def main() -> None:
             documents_embeddings = documents_embeddings[:args.limit_documents]
 
         print(f"Embedding size: {embedding_size}")
-        print(f"Number of documents: {len(documents)}")
+        print(f"Number of documents: {len(documents_ids)}")
         print(f"Doc 1 embedding shape: {documents_embeddings[0].shape}")
 
         # Create results directory (use sanitized name)
@@ -942,7 +957,7 @@ def main() -> None:
         for config in index_configs:
             test_index(
                 config=config,
-                documents=documents,
+                documents_ids=documents_ids,
                 documents_embeddings=documents_embeddings,
                 queries=queries,
                 queries_embeddings=queries_embeddings,
@@ -956,6 +971,7 @@ def main() -> None:
                 model_dtype=args.model_dtype,
                 embedding_dtype=args.embedding_dtype,
                 lowercase=args.lowercase,
+                retrieval_mode=args.retrieval_mode,
                 save_runfile=args.save_runfile,
             )
 

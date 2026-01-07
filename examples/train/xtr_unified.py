@@ -37,11 +37,16 @@ def parse_arguments():
     method_group.add_argument(
         "--training_method",
         type=str,
-        choices=["distillation", "contrastive"],
+        choices=["distillation", "contrastive", "xtr_mixedbread"],
         default="distillation",
-        help="Training method: 'distillation' or 'contrastive'",
+        help="Training method: 'distillation' or 'contrastive' or 'xtr_mixedbread'",
     )
-
+    method_group.add_argument(
+        "--auxillary_loss_weight",
+        type=float,
+        default=None,
+        help="Weight for auxillary loss",
+    )
     # Model Group
     model_group = parser.add_argument_group("Model Configuration")
     model_group.add_argument(
@@ -309,7 +314,7 @@ def create_k_prime_scheduler(
 
 
 def create_score_function(
-    training_method: Literal["distillation", "contrastive"],
+    training_method: Literal["distillation", "contrastive", "xtr_mixedbread"],
     use_colbert: bool,
     k_prime: int,
     k_prime_start: int,
@@ -322,6 +327,10 @@ def create_score_function(
     score_fn: Optional[str] = None,
 ):
     """Create the appropriate score function based on training method and configuration."""
+    # XTR loss doesn't use a score function - it computes scores internally
+    if training_method == "xtr_mixedbread":
+        return None
+    
     if use_colbert:
         if training_method == "distillation":
             return scores.colbert_kd_scores
@@ -363,27 +372,38 @@ def create_score_function(
 
 
 def create_loss_function(
-    training_method: Literal["distillation", "contrastive"],
+    training_method: Literal["distillation", "contrastive", "xtr_mixedbread"],
     model: models.ColBERT,
     score_fn,
     kd_minmax_normalize: bool = False,
+    k_prime: int = 100,
+    auxillary_loss_weight: Optional[float] = None,
 ):
     """Create the appropriate loss function based on training method."""
-    if training_method == "distillation":
-        return losses.Distillation(
-            model=model,
-            score_metric=score_fn,
-            normalize_scores=kd_minmax_normalize,
-        )
-    else:
-        return losses.Contrastive(
-            model=model,
-            score_metric=score_fn,
-        )
+    match training_method:
+        case "distillation":
+            return losses.Distillation(
+                model=model,
+                score_metric=score_fn,
+                normalize_scores=kd_minmax_normalize,
+            )
+        case "contrastive":
+            return losses.Contrastive(
+                model=model,
+                score_metric=score_fn,
+                do_auxillary_loss=(k_prime, auxillary_loss_weight) if auxillary_loss_weight is not None else None,
+            )
+        case "xtr_mixedbread":
+            return losses.XTR(
+                model=model,
+                k_prime=k_prime,
+            )
+        case _:
+            raise ValueError(f"Unknown training method: {training_method}")
 
 
 def create_evaluators(
-    training_method: Literal["distillation", "contrastive"],
+    training_method: Literal["distillation", "contrastive", "xtr_mixedbread"],
     use_triplet_evaluator: bool,
     use_nanobeir_evaluator: bool,
     eval_dataset=None,
@@ -401,7 +421,7 @@ def create_evaluators(
         evaluators.append(evaluation.NanoBEIREvaluator(**evaluator_kwargs))
 
     if use_triplet_evaluator:
-        if training_method == "contrastive" and eval_dataset is not None:
+        if training_method in ("contrastive", "xtr_mixedbread") and eval_dataset is not None:
             evaluators.append(
                 evaluation.ColBERTTripletEvaluator(
                     anchors=eval_dataset["query"],
@@ -420,7 +440,7 @@ def create_evaluators(
     if not evaluators:
         if training_method == "distillation":
             evaluators.append(evaluation.NanoBEIREvaluator(batch_size=batch_size))
-        elif training_method == "contrastive" and eval_dataset is not None:
+        elif training_method in ("contrastive", "xtr_mixedbread") and eval_dataset is not None:
             evaluators.append(
                 evaluation.ColBERTTripletEvaluator(
                     anchors=eval_dataset["query"],
@@ -441,7 +461,7 @@ def create_evaluators(
 
 
 def build_run_name(
-    training_method: Literal["distillation", "contrastive"],
+    training_method: Literal["distillation", "contrastive", "xtr_mixedbread"],
     model_name: str,
     use_colbert: bool,
     lr: float,
@@ -504,6 +524,7 @@ def main():
 
     # Extract arguments
     training_method = args.training_method
+    auxillary_loss_weight = args.auxillary_loss_weight
     model_name = args.model_name.strip("/")
     query_length = args.query_length
     doc_length = args.doc_length
@@ -541,6 +562,8 @@ def main():
     print("Training Configuration")
     print("=" * 80)
     print(f"Training Method: {training_method}")
+    if auxillary_loss_weight is not None:
+        print(f"Auxillary Loss Weight: {auxillary_loss_weight}")
     print(f"Model: {model_name}")
     print(f"Query Length: {query_length}, Doc Length: {doc_length}")
     print(f"Learning Rate: {lr}")
@@ -560,9 +583,11 @@ def main():
         subset_display = train_dataset_subset if train_dataset_subset else "train (default)"
         print(f"Train Dataset: {distillation_train_dataset_path} (subset: {subset_display})")
         print(f"KD MinMax Normalize: {kd_minmax_normalize}")
-    else:
+    else:  # contrastive or xtr_mixedbread
         subset_display = f"/{train_dataset_subset}" if train_dataset_subset else " (no subset)"
         print(f"Train Dataset: {contrastive_dataset_path}{subset_display}")
+        if training_method == "xtr_mixedbread":
+            print(f"k_prime: {k_prime}")
     print(f"Evaluators: Triplet={use_triplet_evaluator}, NanoBEIR={use_nanobeir_evaluator}")
     print("=" * 80)
 
@@ -574,7 +599,7 @@ def main():
         )
         train_dataset = train
         eval_dataset = None
-    else:
+    else:  # contrastive or xtr_mixedbread - both use contrastive dataset format
         train_dataset, eval_dataset = load_contrastive_datasets(
             contrastive_dataset_path, dataset_name=train_dataset_subset, eval_split_ratio=eval_split_ratio
         )
@@ -612,7 +637,7 @@ def main():
         attend_to_expansion_tokens=True,
     )
 
-    # Create score function
+    # Create score function (returns None for xtr_mixedbread)
     score_fn_obj = create_score_function(
         training_method=training_method,
         use_colbert=use_colbert,
@@ -633,6 +658,8 @@ def main():
         model=model,
         score_fn=score_fn_obj,
         kd_minmax_normalize=kd_minmax_normalize,
+        k_prime=k_prime,
+        auxillary_loss_weight=auxillary_loss_weight,
     )
 
     # Create evaluators
@@ -667,8 +694,8 @@ def main():
         torch_compile=True,
     )        
 
-    # Add eval batch size for contrastive training
-    if training_method == "contrastive":
+    # Add eval batch size for contrastive and xtr_mixedbread training
+    if training_method in ("contrastive", "xtr_mixedbread"):
         training_args.per_device_eval_batch_size = batch_size
 
     # Initialize trainer
@@ -680,7 +707,7 @@ def main():
         "data_collator": utils.ColBERTCollator(tokenize_fn=model.tokenize),
     }
 
-    if training_method == "contrastive":
+    if training_method in ("contrastive", "xtr_mixedbread"):
         trainer_kwargs["eval_dataset"] = eval_dataset
 
     if evaluator is not None:
@@ -688,8 +715,8 @@ def main():
 
     trainer = SentenceTransformerTrainer(**trainer_kwargs)
 
-    # Add k_prime callback for XTR
-    if not use_colbert:
+    # Add k_prime callback for XTR (only for scheduled score functions, not for xtr_mixedbread)
+    if not use_colbert and training_method != "xtr_mixedbread" and score_fn_obj is not None:
         trainer.add_callback(scores.KPrimeSchedulerCallback(score_fn_obj))
 
     # Start training

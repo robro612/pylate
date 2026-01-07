@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from ..indexes import PLAID, Voyager
+from .. import indexes
 from ..rank import RerankResult, rerank, score_xtr
 from ..utils import iter_batch
 
@@ -94,7 +94,7 @@ class ColBERT:
 
     """
 
-    def __init__(self, index: Voyager | PLAID, verbose: bool = False) -> None:
+    def __init__(self, index: indexes.Base , verbose: bool = False) -> None:
         self.index = index
         self.verbose = verbose
 
@@ -130,7 +130,7 @@ class ColBERT:
 
         """
         # PLAID index directly retrieves the documents
-        if isinstance(self.index, PLAID):
+        if isinstance(self.index, indexes.PLAID):
             if self.verbose:
                 logger.info("Retrieving documents with PLAID index")
             start_time = time.time()

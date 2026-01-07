@@ -4,12 +4,12 @@ import itertools
 import logging
 import time
 from typing import Optional
-import os
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 
 from .base import Base
+from .utils import log_memory
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,7 @@ class ScaNN(Base):
         training_sample_size: Optional[int] = None,
         verbose: bool = False,
         use_autopilot: bool = False,
+        store_embeddings: bool = False,
     ) -> None:
         self.name = name
         self.embedding_size = embedding_size
@@ -99,13 +100,14 @@ class ScaNN(Base):
         self.num_leaves_to_search = num_leaves_to_search
         self.training_sample_size = training_sample_size
         self.use_autopilot = use_autopilot
-
+        self.store_embeddings = store_embeddings
         # In-memory data structures only (no file I/O)
         self.searcher = None
-        self.all_embeddings = None
         # Note: embedding_id == position (sequential IDs), so no need for separate mappings
-        self.documents_ids_to_embeddings = {}  # In-memory mapping: document ID (str) -> list of embedding IDs
+        # Store (start, length) tuples instead of lists for memory efficiency
+        self.doc_id_to_embedding_range = {}  # doc_id -> (start_position, length) tuple
         self.position_to_doc_id = None  # Direct mapping: position -> document ID (numpy array for vectorized indexing)
+        self.flattened_embeddings = None  # Flattened embeddings array (only if store_embeddings=True)
         self._documents_added = False  # Track if documents have been added
 
     def _build_searcher(self, embeddings: np.ndarray) -> None:
@@ -140,6 +142,7 @@ class ScaNN(Base):
                 logger.info(f"[ScaNN]   Parameters: num_leaves={self.num_leaves}, num_leaves_to_search={self.num_leaves_to_search}, training_sample_size={self.training_sample_size}, num_neighbors={self.num_neighbors}")
 
         # Build ScaNN searcher
+        log_memory("Before scann.build()", self.verbose)
         step_start = time.time()
         if self.use_autopilot:
             searcher = (
@@ -155,11 +158,12 @@ class ScaNN(Base):
                 .build()
             )
         step_time = time.time() - step_start
+        log_memory("After scann.build()", self.verbose)
         if self.verbose:
             logger.info(f"[ScaNN] ScaNN searcher built: {step_time:.4f}s")
 
         self.searcher = searcher
-        self.all_embeddings = embeddings
+        self.index_config = searcher.config()
         
         total_time = time.time() - build_start
         if self.verbose:
@@ -168,7 +172,7 @@ class ScaNN(Base):
     def add_documents(
         self,
         documents_ids: list[str],
-        documents_embeddings: list[list[list[int | float]]],
+        documents_embeddings: list[torch.Tensor],
         batch_size: int,
     ) -> None:
         """Add documents to the index.
@@ -188,72 +192,92 @@ class ScaNN(Base):
         if self.verbose:
             logger.info(f"[ScaNN] Adding {len(documents_ids)} documents to index...")
         
-        step_start = time.time()
-        if isinstance(documents_embeddings[0], torch.Tensor):
-            documents_embeddings = [emb.float().numpy().astype(bfloat16) for emb in documents_embeddings]
-        else:
-            documents_embeddings = reshape_embeddings(embeddings=documents_embeddings)
-        step_time = time.time() - step_start
-        if self.verbose:
-            logger.info(f"[ScaNN] Reshaping document embeddings: {step_time:.4f}s")
+        log_memory("Start of add_documents", self.verbose)
 
-        # Flatten all document embeddings at once (no need to batch since we rebuild the index)
+        # Calculate total embeddings to pre-allocate array
+        # Assumes input is list of torch tensors (the standard pylate format)
         step_start = time.time()
-        flattened_embeddings = list(itertools.chain(*documents_embeddings))
+        import gc
         
-        # Convert to numpy array
-        if isinstance(flattened_embeddings[0], list):
-            flattened_embeddings = np.array(flattened_embeddings)
-        else:
-            flattened_embeddings = np.array(flattened_embeddings)
-        step_time = time.time() - step_start
+        # Get doc lengths and total count in one pass
+        doc_lengths = [emb.shape[0] for emb in documents_embeddings]
+        total_embeddings = sum(doc_lengths)
+        embedding_dim = documents_embeddings[0].shape[1]
+        
         if self.verbose:
-            logger.info(f"[ScaNN] Flattening and converting to numpy array ({len(flattened_embeddings)} embeddings): {step_time:.4f}s")
-
-        # Assign embedding IDs sequentially starting from 0
-        step_start = time.time()
-        embedding_ids = list(range(len(flattened_embeddings)))
-        step_time = time.time() - step_start
-        if self.verbose:
-            logger.info(f"[ScaNN] Assigning embedding IDs: {step_time:.4f}s")
-
-        # Store mappings in memory and build position->doc_id array directly
-        # Since embedding_id == position (sequential), we can build position_to_doc_id directly
-        step_start = time.time()
-        position_to_doc_id_list = [None] * len(embedding_ids)
-        total = 0
+            logger.info(f"[ScaNN] Pre-allocating array for {total_embeddings} embeddings x {embedding_dim} dims ({total_embeddings * embedding_dim * 4 / 1e9:.2f} GB)")
+        
+        # Pre-allocate final float32 array (ScaNN requires float32)
+        flattened_embeddings = np.empty((total_embeddings, embedding_dim), dtype=np.float32)
+        
+        log_memory("After pre-allocating flattened_embeddings array", self.verbose)
+        
+        # Fill array in-place, deleting each tensor after copying to free memory
+        offset = 0
+        num_docs = len(documents_embeddings)
+        log_interval = max(1, num_docs // 10)  # Log memory ~10 times during the loop
+        
         iterator = tqdm(
-            zip(documents_ids, documents_embeddings),
-            desc="Adding documents to ScaNN index",
-            total=len(documents_ids),
+            enumerate(documents_embeddings),
+            desc="Flattening documents and adding to pre-allocated array",
+            total=num_docs,
             disable=not self.verbose,
         )
-        for doc_id, document_embeddings in iterator:
-            num_tokens = len(document_embeddings)
-            document_embeddings_ids = embedding_ids[total : total + num_tokens]
-            self.documents_ids_to_embeddings[doc_id] = document_embeddings_ids
-
-            # Build position->doc_id mapping directly (emb_id == pos, so use pos as index)
-            for emb_id in document_embeddings_ids:
-                position_to_doc_id_list[emb_id] = doc_id
+        for i, emb in iterator:
+            n = emb.shape[0]
+            flattened_embeddings[offset:offset + n] = emb.to("cpu", dtype=torch.float32).numpy()
+            offset += n
             
-            total += num_tokens
-
-        # Convert to numpy array for vectorized indexing (object dtype for strings)
-        self.position_to_doc_id = np.array(position_to_doc_id_list, dtype=object)
+            # Log memory periodically
+            if self.verbose and (i + 1) % log_interval == 0:
+                log_memory(f"During fill loop ({i + 1}/{num_docs} docs, {offset}/{total_embeddings} embeddings)", self.verbose)
+        
+        log_memory("After fill loop, before gc", self.verbose)
+        
+        # Clear the list and run gc
+        del documents_embeddings
+        gc.collect()
+        
+        log_memory("After del documents_embeddings + gc.collect()", self.verbose)
         
         step_time = time.time() - step_start
         if self.verbose:
-            logger.info(f"[ScaNN] Storing ID mappings and building position->doc_id array: {step_time:.4f}s")
+            logger.info(f"[ScaNN] Flattened {total_embeddings} embeddings to float32: {step_time:.4f}s")
+        
+        # Build position->doc_id array and doc_id->embedding_range mapping
+        step_start = time.time()
+        self.position_to_doc_id = np.empty(total_embeddings, dtype=object)
+        offset = 0
+        for doc_id, num_tokens in zip(documents_ids, doc_lengths):
+            # Store (start, length) tuple instead of list for memory efficiency
+            self.doc_id_to_embedding_range[doc_id] = (offset, num_tokens)
+            # Broadcast doc_id to fill the slice (no temp list needed)
+            self.position_to_doc_id[offset:offset + num_tokens] = doc_id
+            offset += num_tokens
+        
+        step_time = time.time() - step_start
+        if self.verbose:
+            logger.info(f"[ScaNN] Built ID mappings and position->doc_id array: {step_time:.4f}s")
 
         # Build the ScaNN index with all embeddings
         if len(flattened_embeddings) > 0:
             if self.verbose:
                 logger.info(f"[ScaNN] Building index with {len(flattened_embeddings)} embeddings...")
             
+            log_memory("Before _build_searcher", self.verbose)
+            
             # Note: embedding_id == position (sequential), so no position mappings needed
             # Build searcher (in-memory only)
             self._build_searcher(flattened_embeddings)
+            
+            # Store flattened embeddings if requested, otherwise free the array
+            if self.store_embeddings:
+                self.flattened_embeddings = flattened_embeddings
+                log_memory("After _build_searcher + storing flattened_embeddings reference", self.verbose)
+            else:
+                del flattened_embeddings
+                gc.collect()
+                log_memory("After _build_searcher + del flattened_embeddings", self.verbose)
             
             # Mark that documents have been added
             self._documents_added = True
@@ -391,25 +415,45 @@ class ScaNN(Base):
     def get_documents_embeddings(
         self, documents_ids: list[list[str]]
     ) -> list[list[np.ndarray]]:
-        """Retrieve document embeddings for re-ranking from ScaNN.
+        """Get document embeddings by their IDs.
         
-        Returns list of lists of numpy arrays, where each array has shape (seq_len, dim).
+        Parameters
+        ----------
+        documents_ids
+            Nested list of document IDs. Each inner list represents a group of documents.
+        
+        Returns
+        -------
+        list[list[np.ndarray]]
+            Nested list of embeddings. Each embedding is a numpy array with shape (seq_len, dim).
+        
+        Raises
+        ------
+        NotImplementedError
+            If store_embeddings=False (embeddings are not stored).
+        ValueError
+            If index is empty or document ID not found.
         """
-
-        if self.all_embeddings is None:
+        if not self.store_embeddings:
+            raise NotImplementedError(
+                "Retrieving document embeddings requires store_embeddings=True. "
+                "Set store_embeddings=True when creating the index."
+            )
+        
+        if self.flattened_embeddings is None:
             raise ValueError("Index is empty, add documents before retrieving embeddings.")
-
-        # Retrieve embeddings from memory using their IDs
-        # Since embedding_id == position, we can use embedding_ids directly as positions
+        
         reconstructed_embeddings = []
         for doc_group in documents_ids:
             group_embeddings = []
             for doc_id in doc_group:
-                doc_embedding_ids = self.documents_ids_to_embeddings[doc_id]
-                # embedding_id == position, so use embedding_ids directly as array indices
-                doc_embeddings = self.all_embeddings[doc_embedding_ids]  # Shape: (seq_len, dim)
-                group_embeddings.append(doc_embeddings)
+                if doc_id not in self.doc_id_to_embedding_range:
+                    raise ValueError(f"Document ID '{doc_id}' not found in index.")
+                
+                start, length = self.doc_id_to_embedding_range[doc_id]
+                # Slice the flattened array to get document embeddings
+                doc_emb = self.flattened_embeddings[start:start + length]
+                group_embeddings.append(doc_emb)
             reconstructed_embeddings.append(group_embeddings)
-
+        
         return reconstructed_embeddings
-

@@ -120,6 +120,7 @@ class Contrastive(nn.Module):
         size_average: bool = True,
         gather_across_devices: bool = False,
         temperature: float = 1.0,
+        do_auxillary_loss: None | tuple[int, float] = None,
     ) -> None:
         super(Contrastive, self).__init__()
         self.score_metric = score_metric
@@ -127,6 +128,13 @@ class Contrastive(nn.Module):
         self.size_average = size_average
         self.gather_across_devices = gather_across_devices
         self.temperature = temperature
+        if do_auxillary_loss is not None:
+            self.do_auxillary_loss = True
+            self.kprime = do_auxillary_loss[0]
+            self.auxillary_loss_weight = do_auxillary_loss[1]
+        else:
+            self.do_auxillary_loss = False
+
 
     def forward(
         self,
@@ -149,6 +157,7 @@ class Contrastive(nn.Module):
             )
             for sentence_feature in sentence_features
         ]
+
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (
             self.model.skiplist
@@ -206,6 +215,36 @@ class Contrastive(nn.Module):
             target=labels,
             reduction="mean" if self.size_average else "sum",
         )
+
+        if self.do_auxillary_loss:
+            q_embeddings = embeddings[0]
+            p_embeddings = embeddings[1] * masks[1][..., None]
+            n_embeddings = embeddings[2] * masks[2][..., None]
+
+            print(f"{q_embeddings.shape=} {p_embeddings.shape=} {n_embeddings.shape=}")
+
+            p_scores = torch.einsum("bnd, bsd -> bns", q_embeddings, p_embeddings)
+            n_scores = torch.einsum("bnd, bsd -> bns", q_embeddings, n_embeddings)
+
+            print(f"{p_scores.shape=} {n_scores.shape=}")
+
+
+            p_scores_topk = p_scores.topk(k=self.kprime, dim=-1).values
+            n_scores_topk = n_scores.topk(k=self.kprime, dim=-1).values
+
+            print(f"{p_scores_topk.shape=} {n_scores_topk.shape=}")
+
+            p_scores_topk_sum = p_scores_topk.sum(dim=-1).view(-1)
+            n_scores_topk_sum = n_scores_topk.sum(dim=-1).view(-1)
+
+            aux_loss = torch.nn.functional.softplus(n_scores_topk_sum - p_scores_topk_sum).mean()
+
+            print(f"Contrastive loss: {loss.item()}")
+            print(f"Auxillary loss: {aux_loss.item()}")
+
+            loss = loss + self.auxillary_loss_weight * aux_loss
+
+            print(f"Total loss: {loss.item()}")
 
         # Scale by world size when gathering across device
         if self.gather_across_devices:
