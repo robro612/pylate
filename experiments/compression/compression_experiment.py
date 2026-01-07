@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 import time
 from tqdm.autonotebook import tqdm
+import shutil
 
 import pandas as pd
 import torch
@@ -383,7 +384,7 @@ def load_configs_from_jsonl(jsonl_path: Path, model: ColBERT) -> list[Compressio
     return configs
 
 
-def create_default_configs(model: ColBERT, dataset_name: str) -> list[CompressionConfig | None]:
+def create_default_configs(model: ColBERT, dataset_name: str, lambda_reg_compactor : float) -> list[CompressionConfig | None]:
     """
     Create default compression configurations matching beir_dataset.py.
     
@@ -398,7 +399,7 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
         List of compression configs (None for baseline)
     """
     configs = []
-    # configs.append(None)  # Baseline (no compression)
+    configs.append(None)  # Baseline (no compression)
 
     ks = {
         "trec-covid" :[10, 20, 40, 80, 120],
@@ -407,22 +408,23 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
     }.get(dataset_name, [10, 20, 40, 80])
 
     # attention score pruning configs
-    # for lambda_mix in [0.15, 0.3, 0.45, 0.6, 0.75]:
-    #     for k in ks:
-    #         compactor_config = CompactorPruningConfig(
-    #             top_k=k,
-    #             protected_tokens=1,
-    #             sketch_dim=None,
-    #             attention_head_reduction="sum",
-    #             leverage_head_reduction="sum",
-    #             lambda_mix=lambda_mix,
-    #         )
-    #         strategy = CompactorPruningStrategy(compactor_config)
-    #         config = CompressionConfig(
-    #             strategies=[strategy],
-    #             description=f"Compactor pruning k={k} lambda_mix={lambda_mix} head_reductions=sum",
-    #         )
-    #         configs.append(config)
+    for lambda_mix in [0.25, 0.5, 0.75, 1]:
+        for k in ks:
+            compactor_config = CompactorPruningConfig(
+                top_k=k,
+                protected_tokens=1,
+                sketch_dim=None,
+                attention_head_reduction="sum",
+                leverage_head_reduction="sum",
+                lambda_mix=lambda_mix,
+                lambda_reg=lambda_reg_compactor,
+            )
+            strategy = CompactorPruningStrategy(compactor_config)
+            config = CompressionConfig(
+                strategies=[strategy],
+                description=f"Compactor pruning k={k} lambda_mix={lambda_mix} lambda_reg={lambda_reg_compactor} head_reductions=sum",
+            )
+            configs.append(config)
     # for k in ks:
     #     attention_config = AttentionPruningConfig(
     #         top_k=k,
@@ -472,13 +474,13 @@ def create_default_configs(model: ColBERT, dataset_name: str) -> list[Compressio
     #     configs.append(config)
     
     # Pooling configs
-    for method in ["window", "random"]: 
-        for k in [2, 3, 4, 5]:
-            for weight_by in [None]:
-                pooling_config = PoolingConfig(pool_factor=k, protected_tokens=1, clustering_method=method, show_progress_bar=True, weight_by=weight_by)
-                strategy = PoolingStrategy(pooling_config)
-                config = CompressionConfig(strategies=[strategy], description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1 weight_by={weight_by}")
-                configs.append(config)
+    # for method in ["window", "random"]: 
+    #     for k in [2, 3, 4, 5]:
+    #         for weight_by in [None]:
+    #             pooling_config = PoolingConfig(pool_factor=k, protected_tokens=1, clustering_method=method, show_progress_bar=True, weight_by=weight_by)
+    #             strategy = PoolingStrategy(pooling_config)
+    #             config = CompressionConfig(strategies=[strategy], description=f"{method[0].upper() + method[1:]} Pooling f={k} protected tokens=1 weight_by={weight_by}")
+    #             configs.append(config)
     
     return configs
 
@@ -588,7 +590,7 @@ def evaluate_config(
 
     # Create a new index for this config
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_run_{run_id}_config_{config_idx}"
     )
     match index_type:
         case "flat":
@@ -613,6 +615,12 @@ def evaluate_config(
     # Retrieve
     retriever = retrieve.ColBERT(index=config_index)
     scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+
+    # delete the index (if plaid)
+    if index_type == "plaid":
+        index_folder = Path(config_index._index.index_folder) / config_index._index.index_name
+        if index_folder.exists():
+            shutil.rmtree(index_folder, ignore_errors=True)
 
     # Remove query_id from scores, needed for FiQA dataset
     for (query_id, query), query_scores in zip(queries.items(), scores):
@@ -876,7 +884,13 @@ def parse_args() -> argparse.Namespace:
         default=2400,
         help="Batch size for encoding (default: 2400)",
     )
-    
+
+    parser.add_argument(
+        "--lambda_reg_compactor",
+        type=float,
+        default=1e-2,
+        help="Lambda regularization for compactor pruning (default: 1e-2)",
+    )
     # Compression group
     compression_group = parser.add_argument_group(
         "Compression options",
@@ -888,6 +902,12 @@ def parse_args() -> argparse.Namespace:
         default="plaid",
         help="Index type to use (default: 'plaid')",
         choices=["flat", "plaid"],
+    )
+
+    compression_group.add_argument(
+        "--keep_index",
+        action="store_true",
+        help="Keep the index after compression (default: False)",
     )
     compression_group.add_argument(
         "--experiment_output_dir",
@@ -980,7 +1000,7 @@ def main() -> None:
             configs = load_configs_from_jsonl(Path(args.configs_file), model)
             print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
         else:
-            configs = create_default_configs(model, args.dataset_name)
+            configs = create_default_configs(model, args.dataset_name, args.lambda_reg_compactor)
             print(f"✓ Created {len(configs)} default configs")
         
         # Determine artifact requirements
@@ -1133,7 +1153,7 @@ def main() -> None:
             configs = load_configs_from_jsonl(Path(args.configs_file), model)
             print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
         else:
-            configs = create_default_configs(model, args.dataset_name)
+            configs = create_default_configs(model, args.dataset_name, args.lambda_reg_compactor)
             print(f"✓ Created {len(configs)} default configs")
         
         print("\nConfigurations:")

@@ -501,7 +501,7 @@ class ColBERT(SentenceTransformer):
         )
     
     def _setup_leverage_score_hook(
-        self, captured_leverage_scores: list[torch.Tensor], sketch_dim: Optional[int] = None, head_reduction: Literal["sum", "max"] = "sum"
+        self, captured_leverage_scores: list[torch.Tensor], sketch_dim: Optional[int] = None, head_reduction: Literal["sum", "max"] = "sum", lambda_reg: float = 1e-2
     ) -> torch.utils.hooks.RemovableHandle | None:
         """
         Set up a forward hook on the last layer's attention module to capture leverage scores.
@@ -518,6 +518,8 @@ class ColBERT(SentenceTransformer):
         head_reduction
             How to aggregate leverage scores across heads: "sum" or "max".
             Defaults to "sum".
+        lambda_reg
+            Regularization parameter for leverage score computation. Defaults to 1e-2.
         
         Returns
         -------
@@ -527,7 +529,7 @@ class ColBERT(SentenceTransformer):
         # Get the last layer's attention module
         last_attention_layer = self._get_model_last_attention_layer()
         return last_attention_layer.register_forward_hook(
-            make_leverage_score_hook(captured_leverage_scores, sketch_dim=sketch_dim, head_reduction=head_reduction)
+            make_leverage_score_hook(captured_leverage_scores, sketch_dim=sketch_dim, head_reduction=head_reduction, lambda_reg=lambda_reg)
         )
 
     DocumentEmbeddings: TypeAlias = list[torch.Tensor] | ndarray | torch.Tensor
@@ -748,8 +750,9 @@ class ColBERT(SentenceTransformer):
                 args = _get_artifact_args("leverage_scores")
                 sketch_dim = args.get("sketch_dim", None)
                 head_reduction = args.get("head_reduction", "sum")
+                lambda_reg = args.get("lambda_reg", 1e-2)
                 leverage_hook_handle = self._setup_leverage_score_hook(
-                    captured_leverage_scores, sketch_dim=sketch_dim, head_reduction=head_reduction
+                    captured_leverage_scores, sketch_dim=sketch_dim, head_reduction=head_reduction, lambda_reg=lambda_reg
                 )
         else:
             attention_hook_handle = None

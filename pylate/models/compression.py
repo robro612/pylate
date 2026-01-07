@@ -271,6 +271,9 @@ class CompactorPruningConfig(CompressionStrategyConfigBase):
     leverage_head_reduction
         Reduction function for aggregating leverage scores over heads: "sum" or "max".
         This parameter documents how leverage scores were computed.
+    lambda_reg
+        Regularization parameter for leverage score computation. Defaults to 1e-2.
+        This parameter is used when computing leverage scores (not in pruning itself).
     track_pruned_tokens
         If True, tracks which tokens were pruned from each document. Access via
         ``strategy.get_pruned_tokens()`` after encoding. Defaults to False.
@@ -285,6 +288,7 @@ class CompactorPruningConfig(CompressionStrategyConfigBase):
     sketch_dim: Optional[int] = None
     attention_head_reduction: Literal["sum", "max"] = "sum"
     leverage_head_reduction: Literal["sum", "max"] = "sum"
+    lambda_reg: float = 1e-2
     track_pruned_tokens: bool = False
     show_progress_bar: bool = False
 
@@ -301,6 +305,8 @@ class CompactorPruningConfig(CompressionStrategyConfigBase):
             raise ValueError("`threshold` must be a finite float.")
         if self.lambda_mix < 0:
             raise ValueError("`lambda_mix` must be non-negative.")
+        if self.lambda_reg < 0:
+            raise ValueError("`lambda_reg` must be non-negative.")
 
     def serialize(self) -> dict:
         """
@@ -319,6 +325,7 @@ class CompactorPruningConfig(CompressionStrategyConfigBase):
             "sketch_dim": self.sketch_dim,
             "attention_head_reduction": self.attention_head_reduction,
             "leverage_head_reduction": self.leverage_head_reduction,
+            "lambda_reg": self.lambda_reg,
             "track_pruned_tokens": self.track_pruned_tokens,
             "show_progress_bar": self.show_progress_bar,
         }
@@ -389,6 +396,7 @@ class PoolingConfig(CompressionStrategyConfigBase):
     attention_head_reduction: Literal["sum", "max"] = "sum"
     leverage_head_reduction: Literal["sum", "max"] = "sum"
     leverage_sketch_dim: Optional[int] = None
+    leverage_lambda_reg: float = 1e-3
     stride: Optional[int] = None
 
     def __post_init__(self):
@@ -424,6 +432,7 @@ class PoolingConfig(CompressionStrategyConfigBase):
         elif self.weight_by == "leverage":
             result["leverage_head_reduction"] = self.leverage_head_reduction
             result["leverage_sketch_dim"] = self.leverage_sketch_dim
+            result["leverage_lambda_reg"] = self.leverage_lambda_reg
         if self.stride is not None:
             result["stride"] = self.stride
         return result
@@ -1720,6 +1729,7 @@ class CompactorPruningStrategy(CompressionStrategy):
             sketch_dim=config_data.get("sketch_dim"),
             attention_head_reduction=config_data.get("attention_head_reduction", "sum"),
             leverage_head_reduction=config_data.get("leverage_head_reduction", "sum"),
+            lambda_reg=config_data.get("lambda_reg", 1e-2),
             track_pruned_tokens=config_data.get("track_pruned_tokens", False),
             show_progress_bar=config_data.get("show_progress_bar", True),
         )
@@ -1743,6 +1753,7 @@ class CompactorPruningStrategy(CompressionStrategy):
             "leverage_scores": {
                 "sketch_dim": self.config.sketch_dim,
                 "head_reduction": self.config.leverage_head_reduction,
+                "lambda_reg": self.config.lambda_reg,
             },
         }
     
@@ -2014,7 +2025,7 @@ class CompactorPruningStrategy(CompressionStrategy):
                     keep_mask.append(True)
             
             # Apply mask to embeddings and scores
-            keep_mask_tensor = torch.tensor(keep_mask, device=doc_embeddings.device, dtype=torch.bool)
+            keep_mask_tensor = torch.tensor(keep_mask, dtype=torch.bool)
             pruned_doc_embeddings = doc_embeddings[keep_mask_tensor]
             pruned_doc_attention = doc_attention_scores[keep_mask_tensor]
             pruned_doc_leverage = doc_leverage_scores[keep_mask_tensor]
@@ -2496,6 +2507,7 @@ class PoolingStrategy(CompressionStrategy):
                 "leverage_scores": {
                     "sketch_dim": self.config.leverage_sketch_dim,
                     "head_reduction": self.config.leverage_head_reduction,
+                    "lambda_reg": self.config.leverage_lambda_reg,
                 },
             }
         elif self.config.weight_by in ["idf", "tfidf"]:
@@ -3739,7 +3751,7 @@ def _compute_leverage_scores_right_sketch(k_tensor: torch.Tensor, sketch_dim: Op
     
     return scores
 
-def make_leverage_score_hook(results_list: list[torch.Tensor], sketch_dim: Optional[int] = None, head_reduction: Literal["sum", "max"] = "sum") -> Callable[[nn.Module, tuple, tuple], None]:
+def make_leverage_score_hook(results_list: list[torch.Tensor], sketch_dim: Optional[int] = None, head_reduction: Literal["sum", "max"] = "sum", lambda_reg: float = 1e-2) -> Callable[[nn.Module, tuple, tuple], None]:
     def leverage_score_hook(module: nn.Module, input: tuple, output: tuple) -> None:
         """
         Inspired by Compactor (http://arxiv.org/abs/2507.08143)
@@ -3759,7 +3771,7 @@ def make_leverage_score_hook(results_list: list[torch.Tensor], sketch_dim: Optio
         k = k.squeeze(2)  # (batch, seq_len, hidden_size)
         k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # (batch, num_heads, seq_len, head_dim)
         
-        leverage_scores = _compute_leverage_scores_right_sketch(k, sketch_dim, lambda_reg=1e-3) # (batch, num_heads, seq_len)
+        leverage_scores = _compute_leverage_scores_right_sketch(k, sketch_dim, lambda_reg=lambda_reg) # (batch, num_heads, seq_len)
 
         match head_reduction: # (batch, seq_len)
             case "sum":
