@@ -888,7 +888,7 @@ class ColBERT(SentenceTransformer):
 
             with torch.no_grad():
                 # TODO: add the truncate/sliding window logic here
-                out_features = self.forward(input=features)
+                out_features = self.forward(input=features, is_query=is_query)
                 if self.device.type == "hpu":
                     out_features = copy.deepcopy(out_features)
 

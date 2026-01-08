@@ -145,9 +145,9 @@ class Contrastive(nn.Module):
         """
         embeddings = [
             torch.nn.functional.normalize(
-                self.model(sentence_feature)["token_embeddings"], p=2, dim=-1
+                self.model(sentence_feature, is_query=(idx == 0))["token_embeddings"], p=2, dim=-1
             )
-            for sentence_feature in sentence_features
+            for idx, sentence_feature in enumerate(sentence_features)
         ]
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (

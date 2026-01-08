@@ -80,11 +80,11 @@ class Distillation(torch.nn.Module):
 
         """
         queries_embeddings = torch.nn.functional.normalize(
-            self.model(sentence_features[0])["token_embeddings"], p=2, dim=-1
+            self.model(sentence_features[0], is_query=True)["token_embeddings"], p=2, dim=-1
         )
         # Compute the bs * n_ways embeddings
         documents_embeddings = torch.nn.functional.normalize(
-            self.model(sentence_features[1])["token_embeddings"], p=2, dim=-1
+            self.model(sentence_features[1], is_query=False)["token_embeddings"], p=2, dim=-1
         )
 
         # Reshape them to (bs, n_ways)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .colbert import ColBERT
+from .ConstBERT import ConstBERT
 from .compression import (
     CompressionArtifacts,
     CompressionConfig,
@@ -31,6 +32,7 @@ from .Dense import Dense
 
 __all__ = [
     "ColBERT",
+    "ConstBERT",
     "Dense",
     "CompressionArtifacts",
     "CompressionConfig",
