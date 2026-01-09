@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .colbert import ColBERT
 from .ConstBERT import ConstBERT
+from .ProxyAttentionColBERT import ProxyAttentionColBERT
 from .compression import (
     CompressionArtifacts,
     CompressionConfig,
@@ -33,6 +34,7 @@ from .Dense import Dense
 __all__ = [
     "ColBERT",
     "ConstBERT",
+    "ProxyAttentionColBERT",
     "Dense",
     "CompressionArtifacts",
     "CompressionConfig",
