@@ -148,7 +148,24 @@ Uses **Knowledge Distillation** with:
 - **Student scores**: ColBERT MaxSim scores from ProxyAttentionColBERT
 - **Loss**: KL Divergence between softmax-normalized score distributions
 
-### 4.4 Resulting Model
+### 4.4 Multi-GPU Training
+
+By default, running `python proxy_attention_colbert.py` uses only **1 GPU**. For multi-GPU training:
+
+```bash
+# Option 1: torchrun (recommended)
+torchrun --nproc_per_node=4 proxy_attention_colbert.py  # For 4 GPUs
+
+# Option 2: accelerate
+accelerate launch proxy_attention_colbert.py
+
+# Option 3: Specific GPUs
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 proxy_attention_colbert.py
+```
+
+The `SentenceTransformerTrainer` is built on HuggingFace's `Trainer`, which uses DistributedDataParallel (DDP) when launched with `torchrun` or `accelerate`.
+
+### 4.5 Resulting Model
 
 After training, the model will:
 1. Accept documents of any length (up to 300 tokens)

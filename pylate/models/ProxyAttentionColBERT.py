@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Iterable, Optional, override
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -40,7 +41,7 @@ class ProxyEmbeddingsModule(nn.Module):
         self,
         num_proxy_tokens: int,
         hidden_size: int,
-        init_std: float = 0.02,
+        init_std: float = 1.0,
     ):
         super().__init__()
         self.num_proxy_tokens = num_proxy_tokens
@@ -50,7 +51,7 @@ class ProxyEmbeddingsModule(nn.Module):
         # Create weight as a Parameter (not Embedding to avoid issues with Sequential)
         self.weight = nn.Parameter(torch.empty(num_proxy_tokens, hidden_size))
 
-        # Initialize with random Gaussian
+        # Initialize with random Gaussian (same as nn.Embedding default: mean=0, std=1)
         nn.init.normal_(self.weight, mean=0.0, std=init_std)
 
     def forward(self, features: dict) -> dict:
@@ -735,8 +736,9 @@ class ProxyAttentionColBERT(ColBERT):
     @override
     def forward(
         self,
-        features: dict[str, torch.Tensor],
+        features: dict[str, torch.Tensor] = None,
         is_query: bool | None = None,
+        input: dict[str, torch.Tensor] = None,  # For compatibility with ColBERT.encode()
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass with proxy attention for documents.
@@ -750,12 +752,20 @@ class ProxyAttentionColBERT(ColBERT):
             Input features from tokenizer
         is_query : bool, optional
             Whether this is a query (True) or document (False)
+        input : dict, optional
+            Alternative name for features (for compatibility with ColBERT.encode())
 
         Returns
         -------
         dict
             Features with 'token_embeddings' and 'sentence_embedding'
         """
+        # Handle both 'features' and 'input' parameter names
+        if features is None and input is not None:
+            features = input
+        elif features is None and input is None:
+            raise ValueError("Either 'features' or 'input' must be provided")
+
         if is_query is None:
             is_query = True  # Default to query mode
 
@@ -786,6 +796,97 @@ class ProxyAttentionColBERT(ColBERT):
             features['attention_mask'] = features_with_selection['attention_mask']
 
             return features
+
+    @override
+    def encode(
+        self,
+        sentences: list[str],
+        is_query: bool = True,
+        batch_size: int = 32,
+        show_progress_bar: bool | None = None,
+        output_value: str = "sentence_embedding",
+        convert_to_numpy: bool = True,
+        convert_to_tensor: bool = False,
+        device: str = None,
+        normalize_embeddings: bool = False,
+        **kwargs,
+    ) -> list[torch.Tensor] | np.ndarray | torch.Tensor:
+        """
+        Encode sentences with ProxyAttentionColBERT.
+
+        For documents, the skiplist mask is not applied because token selection
+        already happened during the forward pass. The output tokens are already
+        the selected salient tokens.
+
+        This overrides the base ColBERT.encode() to handle the case where
+        document embeddings have a different sequence length than input_ids.
+        """
+        from sentence_transformers.util import batch_to_device
+        from tqdm.autonotebook import trange
+
+        self.eval()
+
+        if show_progress_bar is None:
+            show_progress_bar = (
+                logger.getEffectiveLevel() == logging.INFO
+                or logger.getEffectiveLevel() == logging.DEBUG
+            )
+
+        if convert_to_tensor:
+            convert_to_numpy = False
+
+        if device is None:
+            device = self.device
+
+        all_embeddings = []
+        length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
+        sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
+
+        for start_index in trange(
+            0,
+            len(sentences),
+            batch_size,
+            desc=f"Encoding queries (bs={batch_size})"
+            if is_query
+            else f"Encoding documents (bs={batch_size})",
+            disable=not show_progress_bar,
+        ):
+            sentences_batch = sentences_sorted[start_index : start_index + batch_size]
+            features = self.tokenize(texts=sentences_batch, is_query=is_query)
+            features = batch_to_device(batch=features, target_device=device)
+
+            with torch.no_grad():
+                out_features = self.forward(input=features, is_query=is_query)
+
+                if is_query:
+                    # For queries, use the attention mask
+                    masks = out_features["attention_mask"].bool()
+                else:
+                    # For documents with proxy attention, the tokens are already selected
+                    # No skiplist mask needed - all output tokens are valid
+                    masks = out_features["attention_mask"].bool()
+
+                embeddings = []
+                for i, mask in enumerate(masks):
+                    emb = out_features["token_embeddings"][i][mask]
+                    if normalize_embeddings:
+                        emb = F.normalize(emb, p=2, dim=-1)
+                    embeddings.append(emb)
+
+                all_embeddings.extend(embeddings)
+
+        # Restore original order
+        all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+
+        # ColBERT returns multi-vector embeddings (one per token), so we can't stack
+        # Just convert to appropriate format
+        if convert_to_tensor:
+            # Keep as list of tensors (different sizes)
+            pass
+        elif convert_to_numpy:
+            all_embeddings = [emb.cpu().numpy() for emb in all_embeddings]
+
+        return all_embeddings
 
     @override
     def save(
