@@ -4,6 +4,7 @@ import ast
 import logging
 
 import datasets
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -77,14 +78,19 @@ class KDProcessing:
 
         self.n_ways = n_ways
 
-        self.queries_index = {
-            query_id: i for i, query_id in enumerate(iterable=self.queries["query_id"])
-        }
+        # Build query index with progress bar
+        self.queries_index = {}
+        for i, query_id in enumerate(
+            tqdm(self.queries["query_id"], desc="Building query index")
+        ):
+            self.queries_index[query_id] = i
 
-        self.documents_index = {
-            document_id: i
-            for i, document_id in enumerate(iterable=self.documents["document_id"])
-        }
+        # Build document index with progress bar
+        self.documents_index = {}
+        for i, document_id in enumerate(
+            tqdm(self.documents["document_id"], desc="Building document index")
+        ):
+            self.documents_index[document_id] = i
 
     def transform(self, examples: dict) -> dict:
         """Update the input dataset with the queries and documents."""

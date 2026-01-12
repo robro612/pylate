@@ -232,40 +232,90 @@ class ProxyAttentionColBERT(ColBERT):
             init_std=proxy_init_std,
         )
 
-        # Enable eager attention for the last layer (required for attention weights)
-        self._enable_eager_for_last_layer()
+        # Enable eager attention for the last layer only
+        # This allows us to get attention weights without affecting other layers
+        transformer = self[0]
+        self._enable_eager_attention_for_last_layer(transformer.auto_model)
 
         logger.info(
             f"Initialized ProxyAttentionColBERT with {num_proxy_tokens} proxy tokens, "
             f"selecting {num_select_tokens} tokens, cluster_pooling={use_cluster_pooling}"
         )
 
-    def _enable_eager_for_last_layer(self):
-        """
-        Set the last transformer layer to use eager attention implementation.
-
-        This is required because output_attentions=True only works with eager attention,
-        not with flash_attention_2 or sdpa implementations.
-        """
-        transformer = self[0]
-        auto_model = transformer.auto_model
-
+    def _get_last_layer(self, auto_model):
+        """Get the last transformer layer."""
         # Find the last transformer layer based on model architecture
-        last_layer = None
         if hasattr(auto_model, 'layers'):
             # ModernBERT style (list of layers)
-            last_layer = auto_model.layers[-1]
+            return auto_model.layers[-1]
         elif hasattr(auto_model, 'encoder') and hasattr(auto_model.encoder, 'layer'):
             # BERT/RoBERTa style
-            last_layer = auto_model.encoder.layer[-1]
+            return auto_model.encoder.layer[-1]
         elif hasattr(auto_model, 'transformer') and hasattr(auto_model.transformer, 'layer'):
             # Some other architectures
-            last_layer = auto_model.transformer.layer[-1]
+            return auto_model.transformer.layer[-1]
         else:
             raise ValueError(
                 f"Cannot find transformer layers in model architecture: {type(auto_model)}. "
                 "Please check the model structure and add support for this architecture."
             )
+
+    def _setup_last_layer_attention_capture(self, auto_model):
+        """
+        Set up the last layer to use eager attention and capture attention weights.
+
+        This modifies ONLY the last layer to:
+        1. Use eager attention (required for output_attentions)
+        2. Always output attention weights
+
+        All other layers continue to use SDPA/flash attention for efficiency.
+
+        Returns
+        -------
+        captured_attention : list
+            A mutable list where captured_attention[0] will hold the attention weights
+        cleanup_fn : callable
+            Function to call after forward to restore original behavior
+        """
+        last_layer = self._get_last_layer(auto_model)
+
+        # Storage for captured attention weights
+        captured_attention = [None]
+
+        # Save the original forward method
+        original_forward = last_layer.forward
+
+        def hooked_forward(*args, **kwargs):
+            """Wrapper that forces output_attentions=True for this layer only."""
+            # Force output_attentions=True for this layer
+            kwargs['output_attentions'] = True
+
+            # Call original forward
+            output = original_forward(*args, **kwargs)
+
+            # Capture attention weights (typically second element of output tuple)
+            if isinstance(output, tuple) and len(output) > 1:
+                captured_attention[0] = output[1]
+
+            return output
+
+        # Replace forward method
+        last_layer.forward = hooked_forward
+
+        def cleanup():
+            """Restore original forward method."""
+            last_layer.forward = original_forward
+
+        return captured_attention, cleanup
+
+    def _enable_eager_attention_for_last_layer(self, auto_model):
+        """
+        Configure the last layer to use eager attention.
+
+        This is required because output_attentions=True only works with eager attention.
+        We only modify the LAST layer's config, keeping other layers on SDPA/flash.
+        """
+        last_layer = self._get_last_layer(auto_model)
 
         # Find the attention module within the layer
         attn_module = None
@@ -275,34 +325,23 @@ class ProxyAttentionColBERT(ColBERT):
                 break
 
         if attn_module is None:
-            raise ValueError(
+            logger.warning(
                 f"Cannot find attention module in layer: {type(last_layer)}. "
-                f"Available attributes: {dir(last_layer)}"
+                "Attention capture may not work correctly."
             )
+            return
 
-        # Set attention implementation to eager
-        # Different models store this differently
+        # Set attention implementation to eager for this layer only
         if hasattr(attn_module, 'config'):
-            # Copy config and modify
-            new_config = copy.deepcopy(attn_module.config)
-            new_config._attn_implementation = 'eager'
-            attn_module.config = new_config
-            logger.debug("Set last layer attention to eager via config")
-        elif hasattr(attn_module, '_attn_implementation'):
-            attn_module._attn_implementation = 'eager'
-            logger.debug("Set last layer _attn_implementation to eager")
-        else:
-            # Try setting on the layer itself
-            if hasattr(last_layer, 'config'):
-                new_config = copy.deepcopy(last_layer.config)
-                new_config._attn_implementation = 'eager'
-                last_layer.config = new_config
-                logger.debug("Set last layer attention to eager via layer config")
-            else:
-                logger.warning(
-                    "Could not set attention implementation to eager. "
-                    "output_attentions=True may not work correctly."
-                )
+            # ModernBERT and similar: each layer has its own config reference
+            # We need to create a modified copy for just this layer
+            attn_module.config = copy.deepcopy(attn_module.config)
+            attn_module.config._attn_implementation = 'eager'
+            logger.debug("Set last layer attention to eager via attn config")
+        elif hasattr(last_layer, 'config'):
+            last_layer.config = copy.deepcopy(last_layer.config)
+            last_layer.config._attn_implementation = 'eager'
+            logger.debug("Set last layer attention to eager via layer config")
 
     def _get_embedding_layer(self, auto_model) -> nn.Module:
         """Get the word embedding layer from the model."""
@@ -606,9 +645,13 @@ class ProxyAttentionColBERT(ColBERT):
         This is the core document encoding method that:
         1. Gets input embeddings from the transformer
         2. Appends proxy token embeddings
-        3. Runs through transformer with output_attentions=True
-        4. Computes saliency from attention weights
-        5. Performs hard selection with optional cluster pooling
+        3. Sets up a hook to capture attention weights from ONLY the last layer
+        4. Runs through transformer (other layers use SDPA, last layer uses eager)
+        5. Computes saliency from captured attention weights
+        6. Performs hard selection with optional cluster pooling
+
+        Note: We use a hook-based approach to capture attention from only the last
+        layer, avoiding model-wide eager attention fallback that causes OOM.
 
         Parameters
         ----------
@@ -635,17 +678,35 @@ class ProxyAttentionColBERT(ColBERT):
         # Append proxy token embeddings
         combined_embeds, combined_mask = self._append_proxy_tokens(input_embeds, attention_mask)
 
-        # Run through transformer with output_attentions for last layer
-        outputs = auto_model(
-            inputs_embeds=combined_embeds,
-            attention_mask=combined_mask,
-            output_attentions=True,
-            output_hidden_states=False,
-            return_dict=True,
-        )
+        # Set up hook to capture attention weights from the last layer only
+        captured_attention, cleanup = self._setup_last_layer_attention_capture(auto_model)
+
+        try:
+            # Run through transformer
+            # Note: We do NOT set output_attentions=True at model level to avoid
+            # triggering model-wide eager attention fallback
+            # The last layer's forward is hooked to output attentions
+            outputs = auto_model(
+                inputs_embeds=combined_embeds,
+                attention_mask=combined_mask,
+                output_attentions=False,  # Model-level: False
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        finally:
+            # Always clean up the hook
+            cleanup()
 
         last_hidden_state = outputs.last_hidden_state
-        last_attention_weights = outputs.attentions[-1]  # Last layer attention
+
+        # Get captured attention weights from the last layer
+        last_attention_weights = captured_attention[0]
+
+        if last_attention_weights is None:
+            raise RuntimeError(
+                "Failed to capture attention weights from the last layer. "
+                "The model may not support output_attentions or the hook failed."
+            )
 
         total_seq_len = last_hidden_state.shape[1]
 
