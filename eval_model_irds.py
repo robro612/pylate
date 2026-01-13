@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 from tqdm.auto import tqdm
@@ -94,10 +96,16 @@ def parse_arguments() -> argparse.Namespace:
         help="Directory to store cached embeddings (default: 'embedding_cache')",
     )
     parser.add_argument(
-        "--batch_size",
+        "--encode_batch_size",
         type=int,
         default=2048,
         help="Batch size to use for encoding documents and queries (default: 2048)",
+    )
+    parser.add_argument(
+        "--retrieve_batch_size",
+        type=int,
+        default=1,
+        help="Batch size to use for retrieval operations (default: 1)",
     )
     parser.add_argument(
         "--k",
@@ -133,6 +141,11 @@ def parse_arguments() -> argparse.Namespace:
         "--use_autopilot",
         action="store_true",
         help="Use ScaNN's autopilot() method for automatic parameter tuning. Overrides num_leaves, num_leaves_to_search, and training_sample_size (default: False)",
+    )
+    parser.add_argument(
+        "--save_index",
+        action="store_true",
+        help="Save the index to disk after encoding (default: False)",
     )
     parser.add_argument(
         "--index_types",
@@ -290,7 +303,51 @@ def sanitize_dataset_name(dataset_name: str) -> str:
 
 def sanitize_model_name(model_name: str) -> str:
     # remove everything before output/
-    return model_name.split("output/")[-1].replace("/", "_")
+    sanitized = model_name.split("output/")[-1].replace("/", "_")
+    # Remove checkpoint suffix if present (we extract it separately)
+    if "_checkpoint-" in sanitized:
+        sanitized = sanitized.rsplit("_checkpoint-", 1)[0]
+    return sanitized
+
+def extract_checkpoint_number(model_name: str) -> str | None:
+    """Extract checkpoint number from model path if present.
+    
+    Examples:
+        "output/model_name/checkpoint-15000" -> "15000"
+        "robro612/xtr-base-en-pylate" -> None
+        "output/model/checkpoint-2500" -> "2500"
+    """
+    if "checkpoint-" in model_name:
+        parts = model_name.split("checkpoint-")
+        if len(parts) > 1:
+            # Get the number part (may have trailing path)
+            checkpoint_part = parts[-1].split("/")[0]
+            # Try to extract just the number
+            match = re.search(r'\d+', checkpoint_part)
+            if match:
+                return match.group()
+    return None
+
+def generate_scann_index_name(dataset_name: str, model_name: str) -> str:
+    """Generate a programmatic index name from dataset, model, and checkpoint.
+    
+    Format: {sanitized_dataset}_{sanitized_model}_{checkpoint if exists}
+    
+    Args:
+        dataset_name: Full dataset name (e.g., "beir/nfcorpus/test")
+        model_name: Model path or name (e.g., "output/model/checkpoint-15000" or "robro612/xtr-base-en-pylate")
+    
+    Returns:
+        Sanitized index name suitable for filesystem paths
+    """
+    sanitized_dataset = sanitize_dataset_name(dataset_name)
+    sanitized_model = sanitize_model_name(model_name)
+    
+    checkpoint = extract_checkpoint_number(model_name)
+    if checkpoint:
+        return f"{sanitized_dataset}_{sanitized_model}_ckpt{checkpoint}"
+    else:
+        return f"{sanitized_dataset}_{sanitized_model}"
 
 
 def expand_model_paths(model_paths: List[str]) -> List[str]:
@@ -591,22 +648,27 @@ def get_index_configs(
         List of index configuration dictionaries
     """
     base_name = f"{dataset_name}_{model_name.replace('/', '_')}"
+    # Generate programmatic index name for ScaNN
+    scann_index_name = generate_scann_index_name(dataset_name, model_name)
+    
     all_index_configs = [
         {
             "name": "ScaNN",
             "index_class": indexes.ScaNN,
             "init_kwargs": {
-                "name": f"{base_name}_scann",
+                "name": scann_index_name,
                 "embedding_size": embedding_size,
                 "num_neighbors": args.num_neighbors,
                 "num_leaves": args.num_leaves,
                 "num_leaves_to_search": args.num_leaves_to_search,
                 "verbose": True,
                 "use_autopilot": args.use_autopilot,
-                "store_embeddings": args.retrieval_mode == "ColBERT",  # Only store if using ColBERT retrieval
+                "store_embeddings": True,  # Store embeddings for all indexes (so XTR indices can be used subsequently for ColBERT retrieval)
+                "index_folder": "indexes" if args.save_index else None,  # Save indices in the indexes directory
+                "override": False,  # Don't override existing indices, load them instead
             },
             "add_documents_kwargs": {
-                "batch_size": args.batch_size,
+                "batch_size": args.encode_batch_size,
             },
         },
         {
@@ -616,11 +678,11 @@ def get_index_configs(
                 "name": f"{base_name}_flat",
                 "embedding_size": embedding_size,
                 "device": "cuda",  # Use GPU acceleration
-                "search_batch_size": args.batch_size,  # Batch size for search
+                "search_batch_size": args.retrieve_batch_size,  # Batch size for search
                 "verbose": False,
             },
             "add_documents_kwargs": {
-                "batch_size": args.batch_size,
+                "batch_size": args.encode_batch_size,
             },
         },
         {
@@ -667,6 +729,8 @@ def test_index(
     lowercase: bool,
     retrieval_mode: str = "XTR",
     save_runfile: bool = False,
+    encode_batch_size: int = 2000,
+    retrieval_batch_size: int = 1,
 ) -> None:
     """
     Test a single index: create, add documents, retrieve, evaluate, and save results.
@@ -678,6 +742,7 @@ def test_index(
     
     # Initialize index
     index : indexes.Base = config["index_class"](**config["init_kwargs"])
+
     retriever = retrieve.ColBERT(index=index, verbose=verbose)
 
     # # convert documents_embeddings to numpy array
@@ -686,33 +751,38 @@ def test_index(
         case "bf16":
             from ml_dtypes import bfloat16
             # documents_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in documents_embeddings]
-            queries_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in queries_embeddings]
+            # queries_embeddings = [emb.detach().cpu().view(torch.uint16).numpy().view(bfloat16) for emb in queries_embeddings]
         case _:
             # documents_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in documents_embeddings]
             queries_embeddings = [emb.to(dtype=get_torch_dtype(embedding_dtype)).detach().cpu().numpy() for emb in queries_embeddings]
 
 
-    # Add documents
-    print(f"Adding documents to {index_name} index...")
-    start_time = time.time()
-    add_kwargs = {
-        "documents_ids": documents_ids,
-        "documents_embeddings": documents_embeddings,
-        **config["add_documents_kwargs"],
-    }
-    index.add_documents(**add_kwargs)
-    index_time = time.time() - start_time
-    print(f"{index_name} indexing time: {index_time:.2f} seconds")
+    # Add documents (skip if index was already loaded from disk)
+    if hasattr(index, "_documents_added") and index._documents_added:
+        print(f"{index_name} index already loaded from disk, skipping document addition")
+        index_time = 0.0  # No time spent indexing since we loaded from disk
+
+    else:
+        print(f"Adding documents to {index_name} index...")
+        start_time = time.time()
+        add_kwargs = {
+            "documents_ids": documents_ids,
+            "documents_embeddings": documents_embeddings,
+            **config["add_documents_kwargs"],
+        }
+        index.add_documents(**add_kwargs)
+        index_time = time.time() - start_time
+        print(f"{index_name} indexing time: {index_time:.2f} seconds")
     
     # Retrieve
     print(f"Retrieving with {index_name} using {retrieval_mode} mode...")
     start_time = time.time()
     if retrieval_mode == "ColBERT":
         # ColBERT-style retrieval (works for PLAID, ScaNN with store_embeddings=True, Flat, Voyager)
-        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=1)
+        scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=retrieval_batch_size)
     else:
         # XTR-style retrieval (works for all indexes)
-        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=1)
+        scores = retriever.retrieve_xtr(queries_embeddings=queries_embeddings, k=k, k_token=k_token, batch_size=retrieval_batch_size)
     retrieve_time = time.time() - start_time
     print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
     
@@ -730,6 +800,9 @@ def test_index(
         metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "hit_rate@5"],
     )
 
+    # Get timestamp for this evaluation run
+    timestamp = datetime.now().isoformat()
+    
     if save_runfile:
         # Create run_dict: {query_id: {doc_id: score, ...}, ...}
         run_dict = {
@@ -751,19 +824,23 @@ def test_index(
             "lowercase": lowercase,
             "k": k,
             "k_token": k_token,
+            "retrieval_mode": retrieval_mode,
+            "encode_batch_size": encode_batch_size,
+            "retrieval_batch_size": retrieval_batch_size,
             "index_time": index_time,
             "retrieve_time": retrieve_time,
+            "timestamp": timestamp,
         }
         
         # Create runfiles subdirectory
         runfiles_dir = results_dir / "runs"
         runfiles_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate descriptive filename: model_index_k{k}_k_token{k_token}.json
+        # Generate descriptive filename: model_dataset_index_retrievalmode.json
         # Sanitize model name for filesystem
         sanitized_model_name = sanitize_model_name(model_name)
         sanitized_dataset_name = sanitize_dataset_name(dataset_name)
-        run_filename = f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}.json"
+        run_filename = f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}_{retrieval_mode}.json"
         run_filepath = runfiles_dir / run_filename
         
         # Save runfile
@@ -790,6 +867,10 @@ def test_index(
         "retrieve_time": retrieve_time,
         "k": k,
         "k_token": k_token,
+        "retrieval_mode": retrieval_mode,
+        "encode_batch_size": encode_batch_size,
+        "retrieval_batch_size": retrieval_batch_size,
+        "timestamp": timestamp,
         "index_config": index_config_info,
     }
     
@@ -906,7 +987,7 @@ def main() -> None:
             doc_embeddings_cache_file=doc_embeddings_cache_file,
             cache_embeddings=args.cache_embeddings,
             shard_size=args.shard_size,
-            batch_size=args.batch_size,
+            batch_size=args.encode_batch_size,
             embedding_dtype=embedding_dtype_torch,
             move_to_cpu=args.move_embeddings_to_cpu,
         )
@@ -921,7 +1002,7 @@ def main() -> None:
             queries=queries,
             query_embeddings_cache_file=query_embeddings_cache_file,
             cache_embeddings=args.cache_embeddings,
-            batch_size=args.batch_size,
+            batch_size=args.encode_batch_size,
             embedding_dtype=embedding_dtype_torch,
             move_to_cpu=args.move_embeddings_to_cpu,
         )
@@ -973,6 +1054,8 @@ def main() -> None:
                 lowercase=args.lowercase,
                 retrieval_mode=args.retrieval_mode,
                 save_runfile=args.save_runfile,
+                encode_batch_size=args.encode_batch_size,
+                retrieval_batch_size=args.retrieve_batch_size,
             )
 
 
