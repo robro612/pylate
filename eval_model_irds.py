@@ -39,6 +39,7 @@ QUERY_LEN = {
     "beir/trec-covid" : 48,
     "beir/webis-touche2020/v2" : 32,
     "beir/quora/test" : 32,
+    "beir/nq" : 32,
     "disks45/nocr/trec-robust-2004" : 32,
     "lotte/lifestyle/dev/forum" : 32,
     "lotte/lifestyle/dev/search" : 32,
@@ -726,11 +727,20 @@ def test_index(
     results_dir: Path,
     model_dtype: str,
     embedding_dtype: str,
+    query_length: int,
+    doc_length: int,
     lowercase: bool,
     retrieval_mode: str = "XTR",
     save_runfile: bool = False,
     encode_batch_size: int = 2000,
     retrieval_batch_size: int = 1,
+    limit_queries: Optional[int] = None,
+    limit_documents: Optional[int] = None,
+    shard_size: Optional[int] = None,
+    cache_embeddings: Optional[bool] = None,
+    cache_dir: Optional[str] = None,
+    move_embeddings_to_cpu_flag: Optional[bool] = None,
+    save_index: Optional[bool] = None,
 ) -> None:
     """
     Test a single index: create, add documents, retrieve, evaluate, and save results.
@@ -814,19 +824,30 @@ def test_index(
         }
 
         run = Run(run=run_dict)
+        checkpoint = extract_checkpoint_number(model_name)
         run.metadata = {
             "index_type": config["name"],
             **{k : v for k, v in config["init_kwargs"].items() if k != "index_class"},
             "dataset": dataset_name,
             "model": model_name,
+            "checkpoint": checkpoint,
             "model_dtype": model_dtype,
             "embedding_dtype": embedding_dtype,
             "lowercase": lowercase,
+            "query_length": query_length,
+            "doc_length": doc_length,
             "k": k,
             "k_token": k_token,
             "retrieval_mode": retrieval_mode,
             "encode_batch_size": encode_batch_size,
             "retrieval_batch_size": retrieval_batch_size,
+            "limit_queries": limit_queries,
+            "limit_documents": limit_documents,
+            "shard_size": shard_size,
+            "cache_embeddings": cache_embeddings,
+            "cache_dir": cache_dir,
+            "move_embeddings_to_cpu": move_embeddings_to_cpu_flag,
+            "save_index": save_index,
             "index_time": index_time,
             "retrieve_time": retrieve_time,
             "timestamp": timestamp,
@@ -839,8 +860,13 @@ def test_index(
         # Generate descriptive filename: model_dataset_index_retrievalmode.json
         # Sanitize model name for filesystem
         sanitized_model_name = sanitize_model_name(model_name)
+        if checkpoint:
+            sanitized_model_name = f"{sanitized_model_name}_ckpt{checkpoint}"
         sanitized_dataset_name = sanitize_dataset_name(dataset_name)
-        run_filename = f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}_{retrieval_mode}.json"
+        run_filename = (
+            f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}_{retrieval_mode}"
+            f"_{model_dtype}_{embedding_dtype}_qlen{query_length}_dlen{doc_length}.json"
+        )
         run_filepath = runfiles_dir / run_filename
         
         # Save runfile
@@ -861,6 +887,8 @@ def test_index(
         "model": model_name,
         "model_dtype": model_dtype,
         "embedding_dtype": embedding_dtype,
+        "query_length": query_length,
+        "doc_length": doc_length,
         "lowercase": lowercase,
         "evaluation_scores": evaluation_scores,
         "index_time": index_time,
@@ -1051,11 +1079,20 @@ def main() -> None:
                 results_dir=results_dir,
                 model_dtype=args.model_dtype,
                 embedding_dtype=args.embedding_dtype,
+                query_length=query_length,
+                doc_length=doc_length,
                 lowercase=args.lowercase,
                 retrieval_mode=args.retrieval_mode,
                 save_runfile=args.save_runfile,
                 encode_batch_size=args.encode_batch_size,
                 retrieval_batch_size=args.retrieve_batch_size,
+                limit_queries=args.limit_queries,
+                limit_documents=args.limit_documents,
+                shard_size=args.shard_size,
+                cache_embeddings=args.cache_embeddings,
+                cache_dir=args.cache_dir,
+                move_embeddings_to_cpu_flag=args.move_embeddings_to_cpu,
+                save_index=args.save_index,
             )
 
 
