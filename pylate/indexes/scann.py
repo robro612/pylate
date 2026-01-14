@@ -545,7 +545,6 @@ class ScaNN(Base):
         # Map embedding indices back to document IDs using fully vectorized numpy operations
         step_start = time.time()
         n_tokens_per_query = [len(q) for q in queries_embeddings]
-        print(f"{n_tokens_per_query=}")
         
         # Vectorized lookup: process all tokens at once using numpy advanced indexing
         # neighbors shape: (n_tokens_total, k), distances shape: (n_tokens_total, k)
@@ -572,7 +571,6 @@ class ScaNN(Base):
             
             documents.append(query_documents)
             distances_list.append(query_distances)
-            print(f"{len(query_distances)=}")
 
         step_time = time.time() - step_start
         if self.verbose:
