@@ -42,10 +42,10 @@ def parse_arguments():
         help="Training method: 'distillation' or 'contrastive' or 'xtr_mixedbread'",
     )
     method_group.add_argument(
-        "--auxillary_loss_weight",
+        "--auxiliary_loss_weight",
         type=float,
         default=None,
-        help="Weight for auxillary loss",
+        help="Weight for auxiliary loss",
     )
     # Model Group
     model_group = parser.add_argument_group("Model Configuration")
@@ -159,7 +159,18 @@ def parse_arguments():
         "--score_fn",
         type=str,
         default=None,
-        help="Name of score function to use from pylate.scores (e.g., 'xtr_kd_training_scores', 'xtr_contrastive_training_scores', 'xtr_contrastive_training_scores_primeqa'). If not provided, defaults based on training_method.",
+        help="Name of score functions to use from pylate.scores (e.g., 'xtr_kd_training_scores', 'xtr_contrastive_training_scores', 'xtr_contrastive_training_scores_multiple_negatives'). If not provided, defaults based on training_method.",
+    )
+    xtr_group.add_argument(
+        "--score_all_docs_at_once",
+        action="store_true",
+        help="(contrastive) Score all documents (pos+negs) in a single call (needed for XTR global retrieval-pool thresholding).",
+    )
+    xtr_group.add_argument(
+        "--positive_document_index",
+        type=int,
+        default=0,
+        help="(contrastive) Index of the positive document among the provided document groups (default: 0).",
     )
 
     # Training Hyperparameters Group
@@ -324,6 +335,7 @@ def create_score_function(
     Z_clamp_value: float,
     start_normalizer_Z_at_step: int,
     impute_scores_instead_of_zero: bool,
+    score_all_docs_at_once: bool = False,
     score_fn: Optional[str] = None,
 ):
     """Create the appropriate score function based on training method and configuration."""
@@ -356,7 +368,11 @@ def create_score_function(
             if training_method == "distillation":
                 base_score_fn = scores.xtr_kd_training_scores
             else:
-                base_score_fn = scores.xtr_contrastive_training_scores
+                base_score_fn = (
+                    scores.xtr_contrastive_training_scores_multiple_negatives
+                    if score_all_docs_at_once
+                    else scores.xtr_contrastive_training_scores
+                )
 
         scheduled_xtr_kwargs = dict(
             score_fn=base_score_fn,
@@ -377,7 +393,9 @@ def create_loss_function(
     score_fn,
     kd_minmax_normalize: bool = False,
     k_prime: int = 100,
-    auxillary_loss_weight: Optional[float] = None,
+    auxiliary_loss_weight: Optional[float] = None,
+    score_all_docs_at_once: bool = False,
+    positive_document_index: int = 0,
 ):
     """Create the appropriate loss function based on training method."""
     match training_method:
@@ -391,7 +409,9 @@ def create_loss_function(
             return losses.Contrastive(
                 model=model,
                 score_metric=score_fn,
-                do_auxillary_loss=(k_prime, auxillary_loss_weight) if auxillary_loss_weight is not None else None,
+                do_auxiliary_loss=(k_prime, auxiliary_loss_weight) if auxiliary_loss_weight is not None else None,
+                score_all_docs_at_once=score_all_docs_at_once,
+                positive_document_index=positive_document_index,
             )
         case "xtr_mixedbread":
             return losses.XTR(
@@ -524,7 +544,7 @@ def main():
 
     # Extract arguments
     training_method = args.training_method
-    auxillary_loss_weight = args.auxillary_loss_weight
+    auxiliary_loss_weight = args.auxiliary_loss_weight
     model_name = args.model_name.strip("/")
     query_length = args.query_length
     doc_length = args.doc_length
@@ -542,6 +562,8 @@ def main():
     start_normalizer_Z_at_step = args.start_normalizer_Z_at_step
     impute_scores_instead_of_zero = args.impute_scores_instead_of_zero
     score_fn = args.score_fn
+    score_all_docs_at_once = args.score_all_docs_at_once
+    positive_document_index = args.positive_document_index
     lr = args.lr
     batch_size = args.batch_size
     gradient_accumulation_steps = args.grad_acc_steps
@@ -562,8 +584,8 @@ def main():
     print("Training Configuration")
     print("=" * 80)
     print(f"Training Method: {training_method}")
-    if auxillary_loss_weight is not None:
-        print(f"Auxillary Loss Weight: {auxillary_loss_weight}")
+    if auxiliary_loss_weight is not None:
+        print(f"auxiliary Loss Weight: {auxiliary_loss_weight}")
     print(f"Model: {model_name}")
     print(f"Query Length: {query_length}, Doc Length: {doc_length}")
     print(f"Learning Rate: {lr}")
@@ -649,6 +671,7 @@ def main():
         Z_clamp_value=Z_clamp_value,
         start_normalizer_Z_at_step=start_normalizer_Z_at_step,
         impute_scores_instead_of_zero=impute_scores_instead_of_zero,
+        score_all_docs_at_once=score_all_docs_at_once,
         score_fn=score_fn,
     )
 
@@ -659,8 +682,40 @@ def main():
         score_fn=score_fn_obj,
         kd_minmax_normalize=kd_minmax_normalize,
         k_prime=k_prime,
-        auxillary_loss_weight=auxillary_loss_weight,
+        auxiliary_loss_weight=auxiliary_loss_weight,
+        score_all_docs_at_once=score_all_docs_at_once,
+        positive_document_index=positive_document_index,
     )
+
+    # print(f"\n\n\nOVERRIDING TRAIN LOSS TO TEST MULTIPLE SCORE FUNCTIONS (MULTIPLE K_PRIME VALUES). REMOVE THIS BEFORE DOING ANYTHING ELSE, ROHAN!\n\n\n")
+    # input("Press Enter to acknowledge you read this...")
+
+    # score_fns = [
+    #     create_score_function(
+    #         training_method="contrastive",
+    #         use_colbert=False,
+    #         k_prime=k,
+    #         k_prime_start=k,
+    #         k_prime_anneal_steps=k_prime_anneal_steps,
+    #         k_prime_schedule="constant",
+    #         use_normalizer_Z=False,
+    #         Z_clamp_value=Z_clamp_value,
+    #         start_normalizer_Z_at_step=start_normalizer_Z_at_step,
+    #         impute_scores_instead_of_zero=impute_scores_instead_of_zero,
+    #         score_fn="xtr_contrastive_training_scores",
+    #     )
+    #     for k in [64, 128, 256, 512, 1024, 2048]
+    # ]
+
+    # score_metric = [
+    #     (score_fn, 1.0) for score_fn in score_fns
+    # ]
+
+    # print(f"{score_metric=}")
+    # train_loss = losses.Contrastive(
+    #     model=model,
+    #     score_metric=score_metric,
+    # )
 
     # Create evaluators
     evaluator = create_evaluators(

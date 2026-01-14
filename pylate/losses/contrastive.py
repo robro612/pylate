@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+import wandb
 
 from ..models import ColBERT
 from ..scores import colbert_scores
@@ -116,24 +117,33 @@ class Contrastive(nn.Module):
     def __init__(
         self,
         model: ColBERT,
-        score_metric=colbert_scores,
+        score_metric : Callable | list[tuple[Callable, float]]=colbert_scores,
         size_average: bool = True,
         gather_across_devices: bool = False,
         temperature: float = 1.0,
-        do_auxillary_loss: None | tuple[int, float] = None,
+        do_auxiliary_loss: None | tuple[int, float] = None,
+        score_all_docs_at_once: bool = False,
+        positive_document_index: int = 0,
     ) -> None:
         super(Contrastive, self).__init__()
-        self.score_metric = score_metric
+        if isinstance(score_metric, list):
+            # normalize the weights so that they sum to 1
+            weights_sum = sum(weight for _, weight in score_metric)
+            self.score_metrics = [(score_metric, weight / weights_sum) for score_metric, weight in score_metric]
+        else:
+            self.score_metrics = [(score_metric, 1.0)]
         self.model = model
         self.size_average = size_average
         self.gather_across_devices = gather_across_devices
         self.temperature = temperature
-        if do_auxillary_loss is not None:
-            self.do_auxillary_loss = True
-            self.kprime = do_auxillary_loss[0]
-            self.auxillary_loss_weight = do_auxillary_loss[1]
+        self.score_all_docs_at_once = score_all_docs_at_once
+        self.positive_document_index = positive_document_index
+        if do_auxiliary_loss is not None:
+            self.do_auxiliary_loss = True
+            self.kprime = do_auxiliary_loss[0]
+            self.auxiliary_loss_weight = do_auxiliary_loss[1]
         else:
-            self.do_auxillary_loss = False
+            self.do_auxiliary_loss = False
 
 
     def forward(
@@ -173,9 +183,79 @@ class Contrastive(nn.Module):
             sentence_features=sentence_features, skiplist=skiplist
         )
         batch_size = embeddings[0].size(0)
+        rank = get_rank() if self.gather_across_devices else 0
+
+        if self.score_all_docs_at_once:
+            if len(embeddings) < 2:
+                raise ValueError(
+                    "Contrastive(score_all_docs_at_once=True) expects at least 2 sentence_features: "
+                    "[query, documents...]"
+                )
+            if not (0 <= self.positive_document_index < (len(embeddings) - 1)):
+                raise ValueError(
+                    f"positive_document_index must be in [0, {len(embeddings) - 2}] "
+                    f"but got {self.positive_document_index}."
+                )
+
+            # Stack all document groups into a single tensor so score_metrics can use a shared
+            # retrieval pool / thresholding (required for XTR-style scoring).
+            # docs_embeddings: (bs, n_docs, d_seq_len, dim)
+            docs_embeddings = torch.stack(embeddings[1:], dim=1)
+            docs_masks = torch.stack(masks[1:], dim=1)  # (bs, n_docs, d_seq_len)
+
+            # Create corresponding labels: positive document for query i is at column
+            # (global_doc_index * n_docs + positive_document_index)
+            n_docs = docs_embeddings.size(1)
+            labels = (
+                torch.arange(0, batch_size, device=embeddings[0].device) * n_docs
+                + int(self.positive_document_index)
+            )
+
+            # Possibly gather documents across devices to have more in-batch negatives.
+            if self.gather_across_devices:
+                # Keep gradients for docs embeddings, but not for masks.
+                docs_embeddings = torch.cat(
+                    all_gather_with_gradients(docs_embeddings), dim=0
+                )
+                docs_masks = torch.cat(all_gather(docs_masks), dim=0)
+                labels = labels + rank * batch_size * n_docs
+
+            losses = []
+            for score_metric, weight in self.score_metrics:
+                scores = score_metric(
+                    embeddings[0],
+                    docs_embeddings,
+                    queries_mask=masks[0] if not do_query_expansion else None,
+                    documents_mask=docs_masks,
+                )
+                loss = F.cross_entropy(
+                    input=scores / self.temperature,
+                    target=labels,
+                    reduction="mean" if self.size_average else "sum",
+                )
+                losses.append(weight * loss)
+
+            if wandb.run is not None:
+                wandb.log({f"losses_{i}": loss.item() for i, loss in enumerate(losses)})
+
+            loss = sum(losses)
+
+            if self.do_auxiliary_loss:
+                # Auxiliary loss currently assumes exactly (query, positive, negative).
+                raise ValueError(
+                    "do_auxiliary_loss is not compatible with score_all_docs_at_once=True. "
+                    "It assumes exactly [query, positive, negative]."
+                )
+
+            if self.gather_across_devices:
+                loss *= get_world_size()
+            return loss
+
+        # Default behavior: score each doc group separately (can be fine for dot-product style scores).
+
         # create corresponding labels
         labels = torch.arange(0, batch_size, device=embeddings[0].device)
-        # Possibly gather the embeddings across devices to have more in-batch negatives.
+        # Possibly gather the embeddings across devices to have more in batch negatives.
         if self.gather_across_devices:
             # Note that we only gather the documents embeddings and not the queries embeddings (embeddings[0]), but are keeping gradients. This is to lower the memory usage, see https://github.com/mlfoundations/open_clip/issues/616
             embeddings = [
@@ -191,60 +271,65 @@ class Contrastive(nn.Module):
                 masks[0],
                 *[torch.cat(all_gather(mask)) for mask in masks[1:]],
             ]
-            rank = get_rank()
             # Adjust the labels to match the gathered embeddings positions
             labels = labels + rank * batch_size
         # Note: the queries mask is not used, if added, take care that the expansion tokens are not masked from scoring (because they might be masked during encoding).
         # We might not need to compute the mask for queries but I let the logic there for now
-        scores = torch.cat(
-            [
-                self.score_metric(
-                    embeddings[0],
-                    group_embeddings,
-                    queries_mask=masks[0] if not do_query_expansion else None,
-                    documents_mask=documents_masks,
-                )
-                for group_embeddings, documents_masks in zip(embeddings[1:], masks[1:])
-            ],
-            dim=1,
-        )
 
-        # compute constrastive loss using cross-entropy over the scores
-        loss = F.cross_entropy(
-            input=scores / self.temperature,
-            target=labels,
-            reduction="mean" if self.size_average else "sum",
-        )
+        losses = []
+        for score_metric, weight in self.score_metrics:
+            scores = torch.cat(
+                [
+                    score_metric(
+                        embeddings[0],
+                        group_embeddings,
+                        queries_mask=masks[0] if not do_query_expansion else None,
+                        documents_mask=documents_masks,
+                    )
+                    for group_embeddings, documents_masks in zip(embeddings[1:], masks[1:])
+                ],
+                dim=1,
+            )
 
-        if self.do_auxillary_loss:
+            # compute constrastive loss using cross-entropy over the scores
+            loss = F.cross_entropy(
+                input=scores / self.temperature,
+                target=labels,
+                reduction="mean" if self.size_average else "sum",
+            )
+            losses.append(weight * loss)
+
+        if wandb.run is not None:
+            wandb.log({f"losses_{i}": loss.item() for i, loss in enumerate(losses)})
+        
+        loss = sum(losses)
+
+        if self.do_auxiliary_loss:
             q_embeddings = embeddings[0]
             p_embeddings = embeddings[1] * masks[1][..., None]
             n_embeddings = embeddings[2] * masks[2][..., None]
 
-            print(f"{q_embeddings.shape=} {p_embeddings.shape=} {n_embeddings.shape=}")
-
             p_scores = torch.einsum("bnd, bsd -> bns", q_embeddings, p_embeddings)
             n_scores = torch.einsum("bnd, bsd -> bns", q_embeddings, n_embeddings)
 
-            print(f"{p_scores.shape=} {n_scores.shape=}")
+            k = min(self.kprime, p_scores.shape[-1], n_scores.shape[-1])
 
-
-            p_scores_topk = p_scores.topk(k=self.kprime, dim=-1).values
-            n_scores_topk = n_scores.topk(k=self.kprime, dim=-1).values
-
-            print(f"{p_scores_topk.shape=} {n_scores_topk.shape=}")
+            p_scores_topk = p_scores.topk(k=k, dim=-1).values
+            n_scores_topk = n_scores.topk(k=k, dim=-1).values
 
             p_scores_topk_sum = p_scores_topk.sum(dim=-1).view(-1)
             n_scores_topk_sum = n_scores_topk.sum(dim=-1).view(-1)
 
             aux_loss = torch.nn.functional.softplus(n_scores_topk_sum - p_scores_topk_sum).mean()
 
-            print(f"Contrastive loss: {loss.item()}")
-            print(f"Auxillary loss: {aux_loss.item()}")
+            wandb.log({
+                "contrastive_loss": loss.item(),
+                "auxiliary_loss": aux_loss.item(),
+                "aux_loss_weight": self.auxiliary_loss_weight,
+                "aux_loss_k": k,
+            })
 
-            loss = loss + self.auxillary_loss_weight * aux_loss
-
-            print(f"Total loss: {loss.item()}")
+            loss = loss + self.auxiliary_loss_weight * aux_loss
 
         # Scale by world size when gathering across device
         if self.gather_across_devices:

@@ -470,7 +470,9 @@ def xtr_contrastive_training_scores(
         # (batch_size, batch_size)
         normalizer_Z = valid_retrieval_mask.sum(dim=-1).to(numerator.dtype)
         scores = numerator / normalizer_Z.clamp(min=Z_clamp_value)
-        xtr_scores = torch.where(normalizer_Z > 0, scores, torch.zeros_like(scores, dtype=scores.dtype))
+        # is this necessary?
+        # xtr_scores = torch.where(normalizer_Z > 0, scores, torch.zeros_like(scores, dtype=scores.dtype))
+        xtr_scores = scores
     else:
         xtr_scores = numerator
 
@@ -533,6 +535,19 @@ def xtr_contrastive_training_scores(
             "Z_max_neg": normalizer_Z[off_diag_mask].max().item(),
         })
 
+        # Compute Spearman correlation between numerator and Z-normalized scores
+        numerator_np = numerator.detach().cpu().numpy()
+        xtr_scores_np = xtr_scores.detach().cpu().numpy()
+
+        batch_size = numerator_np.shape[0]
+        rank_correlations = []
+        for i in range(batch_size):
+            corr, _ = spearmanr(numerator_np[i], xtr_scores_np[i])
+            rank_correlations.append(corr)
+
+        mean_rank_correlation = sum(rank_correlations) / len(rank_correlations) if rank_correlations else 0.0
+        log_dict["Z_rank_correlation"] = mean_rank_correlation
+
     # log whether Z changes the max document
     # xtr_scores is (bq, bd)
     top_idx = xtr_scores.argmax(dim=1)                # which doc is top for each query
@@ -549,6 +564,144 @@ def xtr_contrastive_training_scores(
 
     if is_main_process():
         wandb.log(log_dict)
+
+    return xtr_scores
+
+def xtr_contrastive_training_scores_multiple_negatives(
+    queries_embeddings: list | np.ndarray | torch.Tensor,
+    documents_embeddings: list | np.ndarray | torch.Tensor,
+    queries_mask: torch.Tensor | None = None,
+    documents_mask: torch.Tensor | None = None,
+    k_prime: int = 100,
+    use_normalizer_Z : bool = False,
+    impute_scores_instead_of_zero: bool = False,
+    Z_clamp_value: float = 1.0,
+) -> torch.Tensor:
+    """Computes the XTR scores for Contrastive Learning when each query has multiple candidate documents.
+
+    This is the "multiple negatives" variant of `xtr_contrastive_training_scores`.
+
+    Shapes
+    ------
+    queries_embeddings:
+        (batch_queries, q_seq_len, embedding_size)
+    documents_embeddings:
+        (batch_docs, n_docs, d_seq_len, embedding_size)
+        where n_docs typically corresponds to [positive, neg_1, ..., neg_k] per query.
+    queries_mask:
+        (batch_queries, q_seq_len)
+    documents_mask:
+        (batch_docs, n_docs, d_seq_len)
+
+    Returns
+    -------
+    scores:
+        (batch_queries, batch_docs * n_docs)
+        Suitable for cross-entropy where the positive for query i is located at
+        column (global_doc_index * n_docs + positive_document_index).
+
+    Notes
+    -----
+    Unlike the single-document version, this function does not assume a square
+    (batch_queries == batch_docs) score matrix.
+    """
+    queries_embeddings = convert_to_tensor(queries_embeddings)
+    documents_embeddings = convert_to_tensor(documents_embeddings)
+
+    if documents_embeddings.ndim != 4:
+        raise ValueError(
+            "documents_embeddings must have shape (batch_docs, n_docs, d_seq_len, embedding_size); "
+            f"got {tuple(documents_embeddings.shape)}"
+        )
+
+    bq, q_seq_len, _ = queries_embeddings.shape
+    bd, n_docs, d_seq_len, _ = documents_embeddings.shape
+
+    # Flatten the (batch_docs, n_docs) dims into a single document batch dim.
+    # flat_docs: (bd * n_docs, d_seq_len, embedding_size)
+    flat_docs = documents_embeddings.reshape(bd * n_docs, d_seq_len, documents_embeddings.size(-1))
+
+    # 1. Compute raw Cross-Batch Scores
+    # (batch_queries, bd*n_docs, q_seq_len, d_seq_len)
+    cross_batch_scores = torch.einsum(
+        "aqh, bdh->abqd",
+        queries_embeddings,
+        flat_docs,
+    )
+
+    # 2. Apply Padding Masking
+    if queries_mask is not None:
+        queries_mask = convert_to_tensor(queries_mask)
+        cross_batch_scores = cross_batch_scores * queries_mask.unsqueeze(1).unsqueeze(3)
+
+    if documents_mask is not None:
+        documents_mask = convert_to_tensor(documents_mask)
+        if documents_mask.ndim != 3:
+            raise ValueError(
+                "documents_mask must have shape (batch_docs, n_docs, d_seq_len); "
+                f"got {tuple(documents_mask.shape)}"
+            )
+        flat_docs_mask = documents_mask.reshape(bd * n_docs, d_seq_len)
+        cross_batch_scores = cross_batch_scores * flat_docs_mask.unsqueeze(0).unsqueeze(2)
+
+    total_docs = bd * n_docs
+
+    # 3. Flatten to find Global Top-K Thresholds
+    # (batch_queries, q_seq_len, total_docs * d_seq_len)
+    cross_batch_scores_flattened = cross_batch_scores.permute(0, 2, 1, 3).reshape(
+        bq, q_seq_len, total_docs * d_seq_len
+    )
+
+    k_index = max(1, cross_batch_scores_flattened.size(-1) - k_prime + 1)
+    thresholds = cross_batch_scores_flattened.kthvalue(k=k_index, dim=-1).values
+    thresholds = thresholds.unsqueeze(1).unsqueeze(-1)  # (bq, 1, q_len, 1)
+
+    # 4. Determine Retrieval (Alignment Matrix A)
+    is_retrieved = cross_batch_scores >= thresholds
+
+    # 5. Compute Max Similarity for Retrieved Tokens
+    if impute_scores_instead_of_zero:
+        masked_scores = torch.where(is_retrieved, cross_batch_scores, thresholds)
+    else:
+        masked_scores = cross_batch_scores.masked_fill(~is_retrieved, -float("inf"))
+
+    max_sim_per_query_token = masked_scores.max(dim=-1).values  # (bq, total_docs, q_len)
+
+    # 6. Handle "Nothing Retrieved" Cases
+    valid_retrieval_mask = is_retrieved.any(dim=-1)  # (bq, total_docs, q_len)
+    max_sim_per_query_token = torch.where(
+        valid_retrieval_mask,
+        max_sim_per_query_token,
+        torch.zeros_like(max_sim_per_query_token),
+    )
+
+    # 7. Compute Normalizer Z and Final Scores
+    numerator = max_sim_per_query_token.sum(dim=-1)  # (bq, total_docs)
+
+    if use_normalizer_Z:
+        normalizer_Z = valid_retrieval_mask.sum(dim=-1).to(numerator.dtype)  # (bq, total_docs)
+        xtr_scores = numerator / normalizer_Z.clamp(min=Z_clamp_value)
+    else:
+        xtr_scores = numerator
+
+    # Lightweight logging (avoid assuming square matrices / diagonal positives).
+    if is_main_process() and wandb.run is not None:
+        retrieved_counts = is_retrieved.sum(dim=-1).float()  # (bq, total_docs, q_len)
+        wandb.log(
+            {
+                "numerator_mean": numerator.mean().item(),
+                "numerator_std": numerator.std().item(),
+                "numerator_min": numerator.min().item(),
+                "numerator_max": numerator.max().item(),
+                "xtr_scores_mean": xtr_scores.mean().item(),
+                "xtr_scores_std": xtr_scores.std().item(),
+                "k_prime": k_prime,
+                "retrieved_counts_mean": retrieved_counts.mean().item(),
+                "retrieved_counts_std": retrieved_counts.std().item(),
+                "retrieved_counts_max": retrieved_counts.max().item(),
+                "k_index": k_index,
+            }
+        )
 
     return xtr_scores
 
@@ -894,9 +1047,6 @@ class ScheduledXTRScore:
             self.use_normalizer_Z 
             and self.current_step >= self.start_normalizer_Z_at_step
         )
-        
-        if should_use_normalizer_Z and self.current_step == self.start_normalizer_Z_at_step:
-            print(f"Starting normalizer Z at step {self.current_step}")
         
         # Call the wrapped score function with scheduled k_prime
 
