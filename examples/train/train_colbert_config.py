@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from typing import Optional
 
 from datasets import load_dataset
@@ -101,17 +102,18 @@ class TrainingConfig:
             json.dump(asdict(self), f, indent=2)
     
     def generate_run_name(self) -> str:
-        """Generate a run name based on config."""
+        """Generate a run name based on config with timestamp."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if self.model_type == "proxy_attention":
             return (
                 f"ProxyAttention-ColBERT-{self.num_select_tokens}tok-"
                 f"{self.lr}-lr-{self.epochs}ep-{self.training_mode}-"
-                f"bs{self.batch_size}-nway{self.n_ways}"
+                f"bs{self.batch_size}-nway{self.n_ways}-{timestamp}"
             )
         else:
             return (
                 f"ColBERT-{self.lr}-lr-{self.epochs}ep-"
-                f"bs{self.batch_size}-nway{self.n_ways}"
+                f"bs{self.batch_size}-nway{self.n_ways}-{timestamp}"
             )
 
 
