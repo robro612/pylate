@@ -1,4 +1,6 @@
 #!/bin/bash
+# NOTE: GPU count is set dynamically via --gpus flag when submitting
+# Example: sbatch --gpus=4 scripts/run_all_datasets.sh --parallel
 #SBATCH --job-name=exp_colbert
 #SBATCH --partition=h100,a100
 #SBATCH --gpus=1
@@ -24,8 +26,11 @@ SAVE_RUNFILES=""
 SAVE_RETRIEVAL_RESULTS="--save-retrieval-results"
 PARALLEL=false
 KMEANS_GPU=""
-DOC_LENGTH=""  # Empty means use model's max length
-BATCH_SIZE=4
+DOC_LENGTH="1024"  # Empty means use model's max length
+BATCH_SIZE=8
+MULTI_GPU="--multi-gpu"
+NUM_GPUS_ARG="4"
+OUTPUT_DIR=""
 
 # Function to show help
 show_help() {
@@ -72,6 +77,18 @@ while [[ $# -gt 0 ]]; do
             BATCH_SIZE="$2"
             shift 2
             ;;
+        --multi-gpu)
+            MULTI_GPU="--multi-gpu"
+            shift
+            ;;
+        --num-gpus)
+            NUM_GPUS_ARG="$2"
+            shift 2
+            ;;
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             show_help
             ;;
@@ -114,6 +131,9 @@ echo "Batch Size:           ${BATCH_SIZE}"
 echo "Save Runfiles:        $([ -n "${SAVE_RUNFILES}" ] && echo "Yes" || echo "No")"
 echo "Save Retrieval:       $([ -n "${SAVE_RETRIEVAL_RESULTS}" ] && echo "Yes" || echo "No")"
 echo "KMeans GPU:           $([ -n "${KMEANS_GPU}" ] && echo "Yes" || echo "No")"
+echo "Multi-GPU:            $([ -n "${MULTI_GPU}" ] && echo "Yes" || echo "No")"
+echo "Num GPUs:             ${NUM_GPUS_ARG:-"(all available)"}"
+echo "Output Dir:           ${OUTPUT_DIR:-"(auto-generated)"}"
 echo "Parallel:             ${PARALLEL}"
 echo "================================================================================"
 echo ""
@@ -127,6 +147,21 @@ run_dataset() {
     echo "################################################################################"
     echo ""
 
+    # Build multi-gpu args
+    local MULTI_GPU_ARGS=""
+    if [[ -n "${MULTI_GPU}" ]]; then
+        MULTI_GPU_ARGS="${MULTI_GPU}"
+        if [[ -n "${NUM_GPUS_ARG}" ]]; then
+            MULTI_GPU_ARGS="${MULTI_GPU_ARGS} --num-gpus ${NUM_GPUS_ARG}"
+        fi
+    fi
+
+    # Build output dir arg
+    local OUTPUT_DIR_ARG=""
+    if [[ -n "${OUTPUT_DIR}" ]]; then
+        OUTPUT_DIR_ARG="--output-dir ${OUTPUT_DIR}"
+    fi
+
     "${RUN_SCRIPT}" \
         --dataset "${dataset}" \
         --model "${MODEL_NAME}" \
@@ -135,7 +170,9 @@ run_dataset() {
         ${SAVE_RUNFILES} \
         ${SAVE_RETRIEVAL_RESULTS} \
         ${KMEANS_GPU} \
-        ${DOC_LENGTH_ARG}
+        ${DOC_LENGTH_ARG} \
+        ${MULTI_GPU_ARGS} \
+        ${OUTPUT_DIR_ARG}
     
     local exit_code=$?
     
@@ -151,18 +188,41 @@ run_dataset() {
     fi
 }
 
+# Detect available GPUs
+detect_gpus() {
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        IFS=',' read -ra GPU_LIST <<< "${CUDA_VISIBLE_DEVICES}"
+    else
+        # Query nvidia-smi for GPU count
+        local gpu_count
+        gpu_count=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || echo "1")
+        GPU_LIST=()
+        for ((i=0; i<gpu_count; i++)); do
+            GPU_LIST+=("$i")
+        done
+    fi
+    NUM_GPUS=${#GPU_LIST[@]}
+}
+
+detect_gpus
+echo "Available GPUs: ${GPU_LIST[*]} (${NUM_GPUS} total)"
+
 # Run experiments
 if [[ "${PARALLEL}" == true ]]; then
-    echo "Running experiments in parallel..."
+    echo "Running experiments in parallel across ${NUM_GPUS} GPUs..."
     echo ""
-    
-    # Run in parallel using background processes
+
+    # Run in parallel using background processes, cycling through GPUs
     pids=()
+    gpu_idx=0
     for dataset in ${DATASETS}; do
-        run_dataset "${dataset}" &
+        gpu_id=${GPU_LIST[$gpu_idx]}
+        echo "Assigning ${dataset} to GPU ${gpu_id}"
+        CUDA_VISIBLE_DEVICES=${gpu_id} run_dataset "${dataset}" &
         pids+=($!)
+        gpu_idx=$(( (gpu_idx + 1) % NUM_GPUS ))
     done
-    
+
     # Wait for all background processes
     failed=0
     for pid in "${pids[@]}"; do
@@ -170,7 +230,7 @@ if [[ "${PARALLEL}" == true ]]; then
             failed=$((failed + 1))
         fi
     done
-    
+
     if [[ ${failed} -gt 0 ]]; then
         echo "⚠ ${failed} experiment(s) failed"
         exit 1

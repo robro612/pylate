@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 import time
 from tqdm.autonotebook import tqdm
+import torch
+import torch.multiprocessing as mp
 
 import pandas as pd
 
@@ -70,6 +73,162 @@ QUERY_LEN = {
     "cqadupstack/webmasters": 32,
     "cqadupstack/wordpress": 32,
 }
+
+
+def _encode_worker(
+    gpu_id: int,
+    model_name: str,
+    document_length: int,
+    query_length: int,
+    sentences: list[str],
+    batch_size: int,
+    result_queue: mp.Queue,
+    worker_idx: int,
+) -> None:
+    """Worker function for multi-GPU encoding. Runs in a separate process."""
+    # Set the device for this worker
+    device = f"cuda:{gpu_id}"
+
+    # Import and load model in this process
+    from pylate import models
+    model = models.ColBERT(
+        model_name_or_path=model_name,
+        document_length=document_length,
+        query_length=query_length,
+        trust_remote_code=True,
+        device=device,
+    )
+
+    # Encode documents
+    embeddings, artifacts = model.encode(
+        sentences=sentences,
+        batch_size=batch_size,
+        is_query=False,
+        show_progress_bar=True,
+        convert_to_tensor=False,  # Keep as numpy for pickling
+        normalize_embeddings=False,
+        return_extra_artifacts={"input_ids": True, "attention_scores": True},
+    )
+
+    # Convert tensors to CPU numpy for pickling
+    def to_numpy(t):
+        if hasattr(t, 'cpu'):
+            t = t.detach().cpu()
+            # Convert bfloat16 to float32 (numpy doesn't support bfloat16)
+            if t.dtype == torch.bfloat16:
+                t = t.float()
+            if hasattr(t, 'numpy'):
+                return t.numpy()
+        return t
+
+    embeddings_np = [to_numpy(emb) for emb in embeddings]
+    artifacts_np = {}
+    for key, val in artifacts.items():
+        artifacts_np[key] = [to_numpy(v) for v in val]
+
+    result_queue.put((worker_idx, embeddings_np, artifacts_np))
+
+
+def encode_multi_gpu(
+    model_name: str,
+    document_length: int,
+    query_length: int,
+    sentences: list[str],
+    batch_size: int,
+    num_gpus: int | None = None,
+) -> tuple[list, dict]:
+    """
+    Encode documents using multiple GPUs in parallel.
+
+    Parameters
+    ----------
+    model_name : str
+        Model name/path
+    document_length : int
+        Maximum document length
+    query_length : int
+        Query length
+    sentences : list[str]
+        List of sentences to encode
+    batch_size : int
+        Batch size for encoding
+    num_gpus : int | None
+        Number of GPUs to use. If None, uses all available GPUs.
+
+    Returns
+    -------
+    tuple[list, dict]
+        Embeddings and artifacts (same format as model.encode with return_extra_artifacts)
+    """
+    if num_gpus is None:
+        num_gpus = torch.cuda.device_count()
+
+    if num_gpus <= 1:
+        # Fall back to single GPU encoding
+        from pylate import models
+        model = models.ColBERT(
+            model_name_or_path=model_name,
+            document_length=document_length,
+            query_length=query_length,
+            trust_remote_code=True,
+        )
+        return model.encode(
+            sentences=sentences,
+            batch_size=batch_size,
+            is_query=False,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+            normalize_embeddings=False,
+            return_extra_artifacts={"input_ids": True, "attention_scores": True},
+        )
+
+    print(f"  Using {num_gpus} GPUs for parallel encoding")
+
+    # Split sentences into chunks for each GPU
+    chunk_size = (len(sentences) + num_gpus - 1) // num_gpus
+    chunks = []
+    for i in range(num_gpus):
+        start_idx = i * chunk_size
+        end_idx = min(start_idx + chunk_size, len(sentences))
+        if start_idx < len(sentences):
+            chunks.append(sentences[start_idx:end_idx])
+
+    # Create result queue and spawn workers
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = []
+
+    for i, chunk in enumerate(chunks):
+        p = ctx.Process(
+            target=_encode_worker,
+            args=(i, model_name, document_length, query_length, chunk, batch_size, result_queue, i),
+        )
+        p.start()
+        processes.append(p)
+
+    # Collect results
+    results = []
+    for _ in range(len(chunks)):
+        results.append(result_queue.get())
+
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+
+    # Sort results by worker index and merge
+    results.sort(key=lambda x: x[0])
+
+    all_embeddings = []
+    all_artifacts = {"input_ids": [], "attention_scores": []}
+
+    for _, embeddings_np, artifacts_np in results:
+        # Convert back to tensors
+        all_embeddings.extend([torch.from_numpy(emb) for emb in embeddings_np])
+        for key in all_artifacts:
+            if key in artifacts_np:
+                all_artifacts[key].extend([torch.from_numpy(v) for v in artifacts_np[key]])
+
+    return all_embeddings, all_artifacts
 
 
 def load_model(model_name: str, dataset_name: str, document_length: int | None = None) -> ColBERT:
@@ -990,6 +1149,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum document length in tokens. If not specified, uses model's max length (capped at 8192).",
     )
+    parser.add_argument(
+        "--multi_gpu",
+        action="store_true",
+        help="Enable multi-GPU encoding. Uses all available GPUs to encode documents in parallel.",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use for multi-GPU encoding. If not specified, uses all available GPUs.",
+    )
     return parser.parse_args()
 
 
@@ -1060,15 +1230,29 @@ def main() -> None:
     print("Encoding documents (unnormalized for importance scoring)...")
     print("=" * 80)
     encoding_start = time.time()
-    documents_embeddings, artifacts = model.encode(
-        sentences=[document["text"] for document in documents],
-        batch_size=args.batch_size,
-        is_query=False,
-        show_progress_bar=True,
-        convert_to_tensor=True,
-        normalize_embeddings=False,  # Keep unnormalized for importance scoring
-        return_extra_artifacts={"input_ids": True, "attention_scores": True},
-    )
+
+    if args.multi_gpu:
+        # Multi-GPU encoding: spawn separate processes for each GPU
+        documents_embeddings, artifacts = encode_multi_gpu(
+            model_name=args.model_name,
+            document_length=model.document_length,
+            query_length=model.query_length,
+            sentences=[document["text"] for document in documents],
+            batch_size=args.batch_size,
+            num_gpus=args.num_gpus,
+        )
+    else:
+        # Single GPU encoding
+        documents_embeddings, artifacts = model.encode(
+            sentences=[document["text"] for document in documents],
+            batch_size=args.batch_size,
+            is_query=False,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+            normalize_embeddings=False,  # Keep unnormalized for importance scoring
+            return_extra_artifacts={"input_ids": True, "attention_scores": True},
+        )
+
     encoding_time = time.time() - encoding_start
     print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
     print(f"   Embeddings are UNNORMALIZED (for importance-based compression)")

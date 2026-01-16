@@ -16,6 +16,8 @@
 #   --metrics METRICS          Space-separated metrics (default: map ndcg@10 ndcg@100 recall@10 recall@100 mrr@10 precision@10)
 #   --configs-file FILE        Path to custom configs JSONL file
 #   --kmeans-gpu               Enable GPU for fastkmeans in spherical pooling (experimental)
+#   --multi-gpu                Enable multi-GPU encoding (uses all available GPUs)
+#   --num-gpus N               Number of GPUs to use for multi-GPU encoding
 #   -h, --help                 Show this help message
 #
 # Examples:
@@ -46,6 +48,8 @@ METRICS="map ndcg@10 ndcg@100 recall@10 recall@100 mrr@10 precision@10"
 CONFIGS_FILE=""
 KMEANS_GPU=""
 DOC_LENGTH=""  # Empty means use model's max length
+MULTI_GPU=""
+NUM_GPUS=""
 
 # Function to show help
 show_help() {
@@ -98,6 +102,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --doc-length)
             DOC_LENGTH="$2"
+            shift 2
+            ;;
+        --multi-gpu)
+            MULTI_GPU="--multi_gpu"
+            shift
+            ;;
+        --num-gpus)
+            NUM_GPUS="$2"
             shift 2
             ;;
         -h|--help)
@@ -159,6 +171,14 @@ if [[ -n "${DOC_LENGTH}" ]]; then
     COMMAND="${COMMAND} --document_length ${DOC_LENGTH}"
 fi
 
+if [[ -n "${MULTI_GPU}" ]]; then
+    COMMAND="${COMMAND} ${MULTI_GPU}"
+fi
+
+if [[ -n "${NUM_GPUS}" ]]; then
+    COMMAND="${COMMAND} --num_gpus ${NUM_GPUS}"
+fi
+
 # Print configuration
 echo "================================================================================"
 echo "COMPRESSION EXPERIMENT CONFIGURATION"
@@ -172,6 +192,8 @@ echo "Document Length:      ${DOC_LENGTH:-"(model max)"}"
 echo "Save Runfiles:        $([ -n "${SAVE_RUNFILES}" ] && echo "Yes" || echo "No")"
 echo "Save Retrieval:       $([ -n "${SAVE_RETRIEVAL_RESULTS}" ] && echo "Yes" || echo "No")"
 echo "KMeans GPU:           $([ -n "${KMEANS_GPU}" ] && echo "Yes" || echo "No")"
+echo "Multi-GPU:            $([ -n "${MULTI_GPU}" ] && echo "Yes" || echo "No")"
+echo "Num GPUs:             ${NUM_GPUS:-"(all available)"}"
 echo "Metrics:              ${METRICS}"
 echo "Configs File:         ${CONFIGS_FILE:-"(default)"}"
 echo "================================================================================"

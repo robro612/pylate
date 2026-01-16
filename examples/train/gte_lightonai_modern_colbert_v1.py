@@ -31,9 +31,9 @@ train.set_transform(
 
 # Define the base model, training parameters, and output directory
 model_name = "lightonai/GTE-ModernColBERT-v1"
-batch_size = 8
+batch_size = 28
 lr = 3e-5
-num_train_epochs = 3
+num_train_epochs = 1
 
 # Set the run name for logging and output directory
 run_name = f"lightonai_GTE-ModernColBERT-v1-{lr}-lr-{num_train_epochs}-epochs-gemma"

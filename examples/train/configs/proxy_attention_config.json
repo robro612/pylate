@@ -1,0 +1,37 @@
+{
+  "model_type": "proxy_attention",
+  "model_name": "Alibaba-NLP/gte-modernbert-base",
+  "document_length": 300,
+  
+  "num_proxy_tokens": 32,
+  "num_select_tokens": 32,
+  "use_cluster_pooling": true,
+  "proxy_tau": 1.0,
+  "batch_size": 24,
+  "n_ways": 16,
+
+  "lr": 3e-5,
+  "epochs": 3,
+  "warmup_ratio": 0.0,
+  "gradient_accumulation_steps": 1,
+  "gradient_checkpointing": false,
+  
+  "training_mode": "full",
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.1,
+  
+  "eval_steps": 500,
+  "save_steps": 5000,
+  "logging_steps": 20,
+  "skip_initial_eval": false,
+  
+  "fp16": false,
+  "bf16": true,
+  
+  "output_dir": null,
+  "run_name": null,
+  
+  "dataset_path": "lightonai/ms-marco-en-bge-gemma"
+}
+
