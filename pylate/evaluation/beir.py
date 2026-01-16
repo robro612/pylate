@@ -145,7 +145,8 @@ def evaluate(
     qrels: dict,
     queries: list[str],
     metrics: list | None = None,
-) -> dict[str, float]:
+    return_run: bool = False,
+) -> dict[str, float] | tuple[dict[str, float], "Run"]:
     """Evaluate candidates matches.
 
     Parameters
@@ -203,9 +204,12 @@ def evaluate(
     if not metrics:
         metrics = ["ndcg@10"] + [f"hits@{k}" for k in [1, 2, 3, 4, 5, 10]]
 
-    return evaluate(
+    results = evaluate(
         qrels=qrels,
         run=run,
         metrics=metrics,
         make_comparable=True,
     )
+    if return_run:
+        return results, run
+    return results
