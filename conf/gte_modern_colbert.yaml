@@ -1,0 +1,28 @@
+defaults:
+  - model: colbert
+  - _self_
+
+model:
+  name: Alibaba-NLP/gte-modernbert-base
+  query_length: 32
+  document_length: 300
+
+batch_size: 20
+n_ways: 16
+lr: 3e-5
+max_steps: 10000
+warmup_ratio: 0.0
+eval_steps: 250
+save_steps: 5000
+logging_steps: 10
+dtype: bf16
+normalize_scores: false
+compile: true
+
+run_name: null
+
+dataset_path: lightonai/ms-marco-en-bge-gemma
+
+hydra:
+  run:
+    dir: .

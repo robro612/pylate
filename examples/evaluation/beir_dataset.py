@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import torch
 
 from pylate import evaluation, indexes, models, retrieve
 from pylate.models.compression import PoolingConfig, PoolingStrategy, IDFPruningConfig, IDFPruningStrategy
@@ -56,6 +57,17 @@ if __name__ == "__main__":
         help="Model names or paths.",
     )
     parser.add_argument(
+        "--model_type",
+        type=str,
+        nargs="+",
+        default=["colbert"],
+        help=(
+            "Model class for each entry in --model_name_or_path "
+            "(colbert, constbert, memory_token, proxy_attention). "
+            "If one value is provided, it is used for all models."
+        ),
+    )
+    parser.add_argument(
         "--index_type",
         type=str,
         default="plaid",
@@ -69,15 +81,53 @@ if __name__ == "__main__":
         help="Directory to write evaluation results.",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1000,
+        help="Batch size for encoding documents and queries.",
+    )
+    parser.add_argument(
+        "--do_hierarchical_pooling",
+        action="store_true",
+        help="Use hierarchical pooling for compression.",
+    )
+    parser.add_argument(
         "--save_runfile",
         action="store_true",
         help="Save the runfile (run.json) for each run.",
     )
     args = parser.parse_args()
+
+    if args.do_hierarchical_pooling and set(args.model_type) != {"colbert"}:
+        raise ValueError("Hierarchical pooling is only supported for ColBERT models.")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     def sanitize_name(model_name: str) -> str:
         return "_".join(model_name.strip("/").split("/")[-2:])
+
+    def normalize_model_type(model_type: str) -> type:
+        model_map = {
+            "colbert": models.ColBERT,
+            "constbert": models.ConstBERT,
+            "memory_token": models.MemoryTokenColBERT,
+            "proxy_attention": models.ProxyAttentionColBERT,
+        }
+        if model_type not in model_map:
+            raise ValueError(
+                f"Invalid model type {model_type=}. Choose from: "
+                "ColBERT, ConstBERT, MemoryTokenColBERT, ProxyAttentionColBERT."
+            )
+        return model_map[model_type]
+
+    if len(args.model_type) == 1:
+        model_types = [args.model_type[0]] * len(args.model_name_or_path)
+    elif len(args.model_type) == len(args.model_name_or_path):
+        model_types = args.model_type
+    else:
+        raise ValueError(
+            "--model_type must have one value or match --model_name_or_path length."
+        )
 
     overall_results_path = os.path.join(args.output_dir, "overall_results.jsonl")
 
@@ -89,7 +139,7 @@ if __name__ == "__main__":
             "avg_tokens_per_document": num_tokens / len(documents),
         }
         print(
-            f"{name} - Number of tokens: {data['num_tokens']}, Number of documents: {data['num_documents']}, Average number of tokens per document: {data['avg_tokens_per_document']}"
+            f"{name} - Number of tokens: {data['num_tokens']}, Number of documents: {data['num_documents']}, Average number of tokens per document: {round(data['avg_tokens_per_document'], 2)}"
         )
         return data
 
@@ -116,23 +166,28 @@ if __name__ == "__main__":
         print(f"Dataset: {dataset_name}")
         print("=" * 80)
 
-        for model_name in args.model_name_or_path:
+        for model_name, model_type in zip(args.model_name_or_path, model_types):
             print("=" * 80)
-            print(f"Model: {model_name}")
+            print(f"Model: {model_name} ({model_type})")
             print("=" * 80)
-            model = models.ColBERT(
+            model_class = normalize_model_type(model_type)
+            model = model_class(
                 model_name_or_path=model_name,
                 document_length=300,
                 query_length=query_len.get(dataset_name),
             )
+            print(f"Compiling model and casting to bfloat16 on GPU...")
+            print(f"Model before compilation: {model.dtype=} {model.device=}")
+            model = model.to("cuda", dtype=torch.bfloat16)
+            model.compile()
+            print(f"Model after compilation: {model.dtype=} {model.device=}")
 
-            documents_embeddings, artifacts = model.encode(
+            documents_embeddings = model.encode(
                 sentences=[document["text"] for document in documents],
-                batch_size=1000,
+                batch_size=args.batch_size,
                 is_query=False,
                 show_progress_bar=True,
                 convert_to_tensor=True,
-                return_extra_artifacts={"input_ids": True, "attention_scores": False},
             )
 
             pruning_configs = [
@@ -171,13 +226,13 @@ if __name__ == "__main__":
                 sentences=list(queries.values()),
                 is_query=True,
                 show_progress_bar=True,
-                batch_size=512,
+                batch_size=args.batch_size,
                 convert_to_tensor=True,
             )
 
             experiments = {
                 "baseline": None,
-                # **{strategy.name: strategy for strategy in compression_strategies}
+                **({strategy.name: strategy for strategy in pooling_strategies} if args.do_hierarchical_pooling else {})
             }
 
             for name, compression_strategy in experiments.items():
@@ -186,7 +241,7 @@ if __name__ == "__main__":
                 else:
                     compressed_embs, _compressed_artifacts = compression_strategy.compress(
                         embeddings=documents_embeddings,
-                        artifacts=artifacts,
+                        artifacts={},
                     )
 
                 results = {}
@@ -197,12 +252,13 @@ if __name__ == "__main__":
                     case "flat":
                         index = indexes.Flat(
                             override=True,
-                            index_name=f"{dataset_dir}_{sanitize_name(model_name)}",
+                            index_name=f"{dataset_dir}_{sanitize_name(model_name)}{"_" + name if name != "baseline" else ""}",
                         )
                     case "plaid":
                         index = indexes.PLAID(
                             override=True,
-                            index_name=f"{dataset_dir}_{sanitize_name(model_name)}",
+                            index_name=f"{dataset_dir}_{sanitize_name(model_name)}{"_" + name if name != "baseline" else ""}",
+                            use_triton=True,
                         )
                     case _:
                         raise ValueError(f"Invalid index type: {args.index_type}")

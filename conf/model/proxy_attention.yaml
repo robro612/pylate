@@ -1,0 +1,6 @@
+type: proxy_attention
+variant_args:
+  num_proxy_tokens: 32
+  num_select_tokens: 32
+  use_cluster_pooling: true
+  proxy_tau: 1.0

@@ -1,0 +1,4 @@
+type: memory_token
+variant_args:
+  num_memory_tokens: 32
+  attend_to_memory_tokens: false

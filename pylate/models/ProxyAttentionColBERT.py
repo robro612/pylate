@@ -49,7 +49,7 @@ class ProxyEmbeddingsModule(nn.Module):
         self.init_std = init_std
 
         # Create weight as a Parameter (not Embedding to avoid issues with Sequential)
-        self.weight = nn.Parameter(torch.empty(num_proxy_tokens, hidden_size))
+        self.weight = nn.Parameter(torch.empty(num_proxy_tokens, hidden_size, dtype=torch.bfloat16))
 
         # Initialize with random Gaussian (same as nn.Embedding default: mean=0, std=1)
         nn.init.normal_(self.weight, mean=0.0, std=init_std)

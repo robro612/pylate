@@ -1,0 +1,4 @@
+type: constbert
+variant_args:
+  constbert_variant: transpose
+  constbert_seq_length: 32
