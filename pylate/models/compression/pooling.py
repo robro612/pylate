@@ -1,12 +1,22 @@
 from .base import *
+from typing import Optional, Literal
 
 @dataclass
 class PoolingConfig(CompressionStrategyConfigBase):
     pool_factor: int = 1
     protected_tokens: int = 1
     clustering_method: Literal["hierarchical", "spherical"] = "hierarchical"
+    # Variant for hierarchical clustering behavior:
+    #  - 'ward_embeddings': Ward linkage on observation matrix X (optionally L2-normalized)
+    #  - 'cosine_average': average linkage on condensed cosine distances via pdist
+    #  - 'h2pool': legacy behavior (Ward on full cosine distance matrix) — not recommended
+    hierarchical_variant: Literal["ward_embeddings", "cosine_average", "h2pool"] = "h2pool"
     show_progress_bar: bool = False
     kmeans_gpu: bool = False  # Enable GPU for fastkmeans (experimental, will fallback to CPU on error)
+    # If enabled, ignore pool_factor and instead target a fixed total number of tokens per document
+    # (including protected tokens). Short documents may yield fewer than this target.
+    fixed_size: bool = False
+    fixed_tokens: Optional[int] = None
 
     def serialize(self) -> dict:
         """
@@ -21,8 +31,11 @@ class PoolingConfig(CompressionStrategyConfigBase):
             "pool_factor": self.pool_factor,
             "protected_tokens": self.protected_tokens,
             "clustering_method": self.clustering_method,
+            "hierarchical_variant": self.hierarchical_variant,
             "show_progress_bar": self.show_progress_bar,
             "kmeans_gpu": self.kmeans_gpu,
+            "fixed_size": self.fixed_size,
+            "fixed_tokens": self.fixed_tokens,
         }
 
     @property
@@ -52,8 +65,13 @@ class PoolingStrategy(CompressionStrategy):
         config
             Pooling configuration specifying pool_factor, protected_tokens, and clustering_method
         """
-        if config.pool_factor <= 0:
-            raise ValueError("`pool_factor` must be a positive integer.")
+        # Validate configuration
+        if config.fixed_size:
+            if config.fixed_tokens is None or config.fixed_tokens <= 0:
+                raise ValueError("When fixed_size=True, `fixed_tokens` must be a positive integer.")
+        else:
+            if config.pool_factor <= 0:
+                raise ValueError("`pool_factor` must be a positive integer.")
         if config.protected_tokens < 0:
             raise ValueError("`protected_tokens` must be non-negative.")
 
@@ -62,7 +80,15 @@ class PoolingStrategy(CompressionStrategy):
     @property
     def name(self) -> str:
         """Name of this compression strategy."""
-        return f"pooling-{self.config.clustering_method}_k-{self.config.pool_factor}_p-{self.config.protected_tokens}"
+        if self.config.fixed_size and self.config.fixed_tokens is not None:
+            return (
+                f"pooling-{self.config.clustering_method}-{self.config.hierarchical_variant}_fixed-"
+                f"{self.config.fixed_tokens}_p-{self.config.protected_tokens}"
+            )
+        return (
+            f"pooling-{self.config.clustering_method}-{self.config.hierarchical_variant}"
+            f"_k-{self.config.pool_factor}_p-{self.config.protected_tokens}"
+        )
 
     @property
     def strategy_type(self) -> str:
@@ -103,8 +129,11 @@ class PoolingStrategy(CompressionStrategy):
             pool_factor=config_data.get("pool_factor", 1),
             protected_tokens=config_data.get("protected_tokens", 1),
             clustering_method=config_data.get("clustering_method", "hierarchical"),
+            hierarchical_variant=config_data.get("hierarchical_variant", "h2pool"),
             show_progress_bar=config_data.get("show_progress_bar", False),
             kmeans_gpu=config_data.get("kmeans_gpu", False),
+            fixed_size=config_data.get("fixed_size", False),
+            fixed_tokens=config_data.get("fixed_tokens", None),
         )
         return cls(config)
     
@@ -153,7 +182,11 @@ class PoolingStrategy(CompressionStrategy):
         
         iterator = tqdm(
             documents_embeddings,
-            desc=f"Hierarchical pooling (factor={pool_factor})",
+            desc=(
+                f"Hierarchical pooling (fixed={self.config.fixed_tokens})"
+                if self.config.fixed_size and self.config.fixed_tokens is not None
+                else f"Hierarchical pooling (factor={pool_factor})"
+            ),
             disable=not self.config.show_progress_bar,
             leave=False,
         )
@@ -176,19 +209,65 @@ class PoolingStrategy(CompressionStrategy):
                 cluster_assignments.append([])
                 continue
 
-            # Compute cosine similarity and convert to distance matrix
-            # Cast to float32 for torch.mm compatibility (BFloat16 not supported on all platforms)
+            # If no embeddings to pool, just return protected embeddings
+            if num_embeddings == 0:
+                pooled_embeddings.append(protected_embeddings)
+                cluster_assignments.append([])
+                continue
+
+            # If only one embedding to pool, no clustering needed
+            if num_embeddings == 1:
+                # Single cluster assignment
+                cluster_assignments.append([1])
+                pooled_document_embeddings = [embeddings_to_pool[0]]
+                # Re-append protected embeddings
+                pooled_document_embeddings.extend(protected_embeddings)
+                pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+                continue
+
+            # Choose clustering variant
+            variant = getattr(self.config, "hierarchical_variant", "h2pool")
+            # Cast to float32 for numerical stability
             embeddings_float32 = embeddings_to_pool.float()
-            cosine_similarities = torch.mm(
-                input=embeddings_float32, mat2=embeddings_float32.t()
-            )
-            distance_matrix = 1 - cosine_similarities.cpu().numpy()
+            if variant == "ward_embeddings":
+                # Optionally L2-normalize to align squared Euclidean with cosine geometry
+                X = torch.nn.functional.normalize(embeddings_float32, p=2, dim=1)
+                clusters = hierarchy.linkage(X.cpu().numpy(), method="ward")
+            elif variant == "cosine_average":
+                # Use condensed cosine distances with average linkage
+                try:
+                    from scipy.spatial.distance import pdist
+                except Exception as e:
+                    raise ImportError(
+                        "scipy is required for 'cosine_average' hierarchical_variant"
+                    ) from e
+                X = embeddings_float32.cpu().numpy()
+                y = pdist(X, metric="cosine")
+                clusters = hierarchy.linkage(y, method="average")
+            elif variant == "h2pool":
+                # Legacy: compute full cosine distance matrix and pass to Ward linkage
+                cosine_similarities = torch.mm(
+                    input=embeddings_float32, mat2=embeddings_float32.t()
+                )
+                distance_matrix = 1 - cosine_similarities.cpu().numpy()
+                clusters = hierarchy.linkage(distance_matrix, method="ward")
+            else:
+                raise ValueError(
+                    f"Unknown hierarchical_variant: {variant}. "
+                    "Use 'ward_embeddings', 'cosine_average', or 'h2pool'."
+                )
             
-            # Perform hierarchical clustering using Ward's method
-            clusters = hierarchy.linkage(distance_matrix, method="ward")
-            
-            # Determine the number of clusters based on pool_factor
-            num_clusters = max(num_embeddings // pool_factor, 1)
+            # Determine number of clusters based on mode
+            if self.config.fixed_size and self.config.fixed_tokens is not None:
+                target_total = self.config.fixed_tokens
+                # Do not exceed the number of available tokens
+                target_after_protected = max(target_total - actual_protected, 0)
+                num_clusters = min(max(target_after_protected, 0), num_embeddings)
+                # If target yields 0 clusters but tokens exist, keep at least 1 to avoid empty
+                if num_clusters == 0 and num_embeddings > 0:
+                    num_clusters = 1
+            else:
+                num_clusters = max(num_embeddings // pool_factor, 1)
             cluster_labels = hierarchy.fcluster(
                 clusters, t=num_clusters, criterion="maxclust"
             )
@@ -271,7 +350,11 @@ class PoolingStrategy(CompressionStrategy):
         
         iterator = tqdm(
             documents_embeddings,
-            desc=f"Spherical pooling (factor={pool_factor})",
+            desc=(
+                f"Spherical pooling (fixed={self.config.fixed_tokens})"
+                if self.config.fixed_size and self.config.fixed_tokens is not None
+                else f"Spherical pooling (factor={pool_factor})"
+            ),
             disable=not self.config.show_progress_bar,
             leave=False,
         )
@@ -304,8 +387,15 @@ class PoolingStrategy(CompressionStrategy):
                 cluster_assignments.append([])
                 continue
             
-            # Determine the number of clusters based on pool_factor
-            num_clusters = max(num_embeddings // pool_factor, 1)
+            # Determine the number of clusters based on mode
+            if self.config.fixed_size and self.config.fixed_tokens is not None:
+                target_total = self.config.fixed_tokens
+                target_after_protected = max(target_total - actual_protected, 0)
+                num_clusters = min(max(target_after_protected, 0), num_embeddings)
+                if num_clusters == 0 and num_embeddings > 0:
+                    num_clusters = 1
+            else:
+                num_clusters = max(num_embeddings // pool_factor, 1)
             
             # If we have fewer embeddings than clusters, just use all embeddings
             if num_clusters >= num_embeddings:
@@ -417,8 +507,9 @@ class PoolingStrategy(CompressionStrategy):
             Shape-matched artifacts maintain 1:1 mapping with pooled embeddings.
             Metadata artifacts are passed through unchanged.
         """
-        # Skip pooling if pool_factor is 1 (no pooling)
-        if self.config.pool_factor == 1:
+        # Skip pooling if no compression is requested.
+        # For fixed-size mode, we cannot skip based on pool_factor alone.
+        if not self.config.fixed_size and self.config.pool_factor == 1:
             return embeddings, artifacts
         
         # Apply pooling based on clustering method
@@ -465,7 +556,8 @@ class PoolingStrategy(CompressionStrategy):
                     
                     # Use cluster assignments to select representative tokens
                     doc_cluster_labels = cluster_assignments[doc_idx]
-                    num_clusters = max(len(doc_cluster_labels) // self.config.pool_factor, 1)
+                    # Determine cluster count directly from labels to support both modes
+                    num_clusters = len(set(doc_cluster_labels)) if len(doc_cluster_labels) > 0 else 0
                     
                     # For each cluster, select the first token as representative
                     for cluster_id in range(1, num_clusters + 1):

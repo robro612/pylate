@@ -83,20 +83,21 @@ class PyLateInformationRetrievalEvaluator(InformationRetrievalEvaluator):
                     if self.truncate_dim is None
                     else corpus_model.truncate_sentence_embeddings(self.truncate_dim)
                 ):
-                    sub_corpus_embeddings = torch.nn.utils.rnn.pad_sequence(
-                        corpus_model.encode(
-                            self.corpus[corpus_start_idx:corpus_end_idx],
-                            prompt_name=self.corpus_prompt_name,
-                            prompt=self.corpus_prompt,
-                            is_query=False,
-                            batch_size=self.batch_size,
-                            show_progress_bar=False,
-                            # convert_to_tensor=True,
-                            convert_to_numpy=False,
-                        ),
-                        batch_first=True,
-                        padding_value=0,
-                    )
+                        sub_corpus_embeddings = torch.nn.utils.rnn.pad_sequence(
+                            corpus_model.encode(
+                                self.corpus[corpus_start_idx:corpus_end_idx],
+                                prompt_name=self.corpus_prompt_name,
+                                prompt=self.corpus_prompt,
+                                is_query=False,
+                                batch_size=self.batch_size,
+                                # Show per-chunk encoding progress when enabled on the evaluator
+                                show_progress_bar=self.show_progress_bar,
+                                # convert_to_tensor=True,
+                                convert_to_numpy=False,
+                            ),
+                            batch_first=True,
+                            padding_value=0,
+                        )
 
             else:
                 sub_corpus_embeddings = corpus_embeddings[
