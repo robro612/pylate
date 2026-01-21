@@ -510,13 +510,16 @@ class ProxyAttentionColBERT(ColBERT):
         doc_hidden_states: torch.Tensor,
         saliency_scores: torch.Tensor,
         doc_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Hard top-k selection with optional cluster pooling.
+        Hard selection with per-sample length and optional cluster pooling.
 
-        Select the top m document tokens based on saliency scores.
-        If cluster pooling is enabled, use selected tokens as centroids
-        and average all tokens within each cluster.
+        Behavior change:
+        - If a document has <= num_select_tokens valid tokens, keep the full document tokens.
+        - Otherwise, select exactly num_select_tokens tokens by saliency.
+
+        Returns padded outputs of uniform length num_select_tokens and a mask indicating
+        which positions are valid for each sample.
 
         Parameters
         ----------
@@ -530,33 +533,94 @@ class ProxyAttentionColBERT(ColBERT):
         Returns
         -------
         selected_embeddings : torch.Tensor
-            Selected/pooled embeddings (batch, m, hidden_dim)
+            Selected/kept embeddings (batch, num_select_tokens, hidden_dim)
+        selected_mask : torch.Tensor
+            Mask of valid positions in selected_embeddings (batch, num_select_tokens)
         """
         batch_size, seq_len, hidden_dim = doc_hidden_states.shape
 
-        # Only consider document positions (not proxy tokens)
-        # Mask out proxy positions from saliency scores
-        masked_saliency = saliency_scores.clone()
-        masked_saliency = masked_saliency.masked_fill(~doc_mask.bool(), float('-inf'))
+        device = doc_hidden_states.device
+        dtype = doc_hidden_states.dtype
+        mask_dtype = doc_mask.dtype
 
-        # Get number of valid document tokens
-        n_doc = doc_mask.sum(dim=-1).min().int().item()  # Minimum across batch
-        m = min(self.num_select_tokens, n_doc)
+        target_m = int(self.num_select_tokens)
 
-        # Get top-k indices based on saliency scores
-        _, topk_indices = torch.topk(masked_saliency, k=m, dim=-1, largest=True, sorted=False)
+        # Per-sample valid doc lengths
+        doc_lengths = doc_mask.sum(dim=-1).to(dtype=torch.int32)  # (batch,)
+        keep_full = doc_lengths <= target_m  # (batch,)
+        select_mask = ~keep_full
 
-        # Gather the selected embeddings (centroids)
-        expanded_indices = topk_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
-        centroid_embeddings = torch.gather(doc_hidden_states, dim=1, index=expanded_indices)
+        # Prepare outputs (padded to target_m)
+        out_emb = torch.zeros(batch_size, target_m, hidden_dim, device=device, dtype=dtype)
+        out_msk = torch.zeros(batch_size, target_m, device=device, dtype=mask_dtype)
 
-        if self.use_cluster_pooling:
-            weights = saliency_scores if self.use_attn_weight_cluster_pooling else None
-            return self._cluster_pool(
-                doc_hidden_states, centroid_embeddings, topk_indices, doc_mask, weights
-            )
-        else:
-            return centroid_embeddings
+        # Precompute masked saliency (mask out non-doc positions)
+        masked_saliency_all = saliency_scores.clone().masked_fill(~doc_mask.bool(), float("-inf"))
+
+        # --- Vectorized path ---
+        # Group 1: keep_full -> copy first Lb tokens per sample (zero-pad remainder)
+        idx_keep = torch.nonzero(keep_full, as_tuple=False).squeeze(-1)
+        if idx_keep.numel() > 0:
+            L_keep = doc_lengths[idx_keep].to(torch.long)  # (n_keep,)
+            # Take first target_m tokens (may include padded tokens beyond Lb)
+            take = doc_hidden_states.index_select(0, idx_keep)[:, :target_m, :]  # (n_keep, m, H)
+            # Build per-sample position mask: pos < Lb
+            pos = torch.arange(target_m, device=device).unsqueeze(0)  # (1, m)
+            pos_mask = (pos < L_keep.unsqueeze(1))  # (n_keep, m)
+            # Zero-out positions beyond Lb for safety (and set mask)
+            take = take * pos_mask.unsqueeze(-1).to(dtype)
+            # Assign the (possibly zero-padded) kept tokens
+            out_emb[idx_keep, :target_m, :] = take
+            out_msk[idx_keep, :target_m] = pos_mask.to(mask_dtype)
+
+        # Group 2: select -> hard top-k selection (and optional cluster pooling)
+        idx_sel = torch.nonzero(select_mask, as_tuple=False).squeeze(-1)
+        if idx_sel.numel() > 0:
+            sal_sel = masked_saliency_all.index_select(0, idx_sel)  # (n_sel, S)
+            _, topk_idx = torch.topk(sal_sel, k=target_m, dim=-1, largest=True, sorted=False)  # (n_sel, m)
+
+            doc_sel = doc_hidden_states.index_select(0, idx_sel)  # (n_sel, S, H)
+            gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, hidden_dim)
+            centroid = torch.gather(doc_sel, dim=1, index=gather_idx)  # (n_sel, m, H)
+
+            if self.use_cluster_pooling:
+                weights_sel = saliency_scores.index_select(0, idx_sel) if self.use_attn_weight_cluster_pooling else None
+                doc_mask_sel = doc_mask.index_select(0, idx_sel)
+                centroid = self._cluster_pool(
+                    doc_sel, centroid, topk_idx, doc_mask_sel,
+                    weights_sel if weights_sel is not None else None,
+                )
+
+            out_emb[idx_sel, :target_m, :] = centroid
+            out_msk[idx_sel, :target_m] = 1
+
+        # --- Legacy per-sample implementation (kept for easy revert) ---
+        # for b in range(batch_size):
+        #     Lb = int(doc_lengths[b].item())
+        #     if Lb <= 0:
+        #         continue
+        #     if bool(keep_full[b].item()):
+        #         emb_b = doc_hidden_states[b, :Lb, :]
+        #         out_emb[b, :Lb, :] = emb_b
+        #         out_msk[b, :Lb] = 1
+        #     else:
+        #         masked_saliency_b = masked_saliency_all[b]
+        #         _, topk_idx = torch.topk(masked_saliency_b, k=target_m, dim=-1, largest=True, sorted=False)
+        #         centroid_emb = doc_hidden_states[b].index_select(0, topk_idx)
+        #         if self.use_cluster_pooling:
+        #             weights_b = saliency_scores[b] if self.use_attn_weight_cluster_pooling else None
+        #             pooled = self._cluster_pool(
+        #                 doc_hidden_states[b].unsqueeze(0),
+        #                 centroid_emb.unsqueeze(0),
+        #                 topk_idx.unsqueeze(0),
+        #                 doc_mask[b].unsqueeze(0),
+        #                 weights_b.unsqueeze(0) if weights_b is not None else None,
+        #             )
+        #             centroid_emb = pooled.squeeze(0)
+        #         out_emb[b, :target_m, :] = centroid_emb
+        #         out_msk[b, :target_m] = 1
+
+        return out_emb, out_msk
 
     def _cluster_pool(
         self,
@@ -719,17 +783,14 @@ class ProxyAttentionColBERT(ColBERT):
             last_attention_weights, doc_mask, proxy_mask
         )
 
-        # Hard selection with optional cluster pooling
-        selected_embeddings = self._hard_select(
+        # Hard selection with per-sample keep/full behavior and mask
+        selected_embeddings, selected_mask = self._hard_select(
             last_hidden_state, saliency_scores, doc_mask
         )
 
-        # Update features with selected embeddings
+        # Update features with selected embeddings and corresponding mask
         features['token_embeddings'] = selected_embeddings
-        features['attention_mask'] = torch.ones(
-            batch_size, selected_embeddings.shape[1],
-            device=selected_embeddings.device, dtype=attention_mask.dtype
-        )
+        features['attention_mask'] = selected_mask
 
         return features
 
@@ -792,8 +853,13 @@ class ProxyAttentionColBERT(ColBERT):
 
             # Create output
             features['token_embeddings'] = token_embeddings
-            features['sentence_embedding'] = token_embeddings.mean(dim=1)
-            features['attention_mask'] = features_with_selection['attention_mask']
+            # Masked mean over valid positions to avoid padding bias for short docs
+            selected_mask = features_with_selection['attention_mask']
+            mask_f = selected_mask.to(dtype=token_embeddings.dtype)
+            summed = (token_embeddings * mask_f.unsqueeze(-1)).sum(dim=1)
+            denom = mask_f.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
+            features['sentence_embedding'] = summed / denom
+            features['attention_mask'] = selected_mask
 
             return features
 

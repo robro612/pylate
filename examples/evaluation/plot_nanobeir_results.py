@@ -9,7 +9,7 @@ import numpy as np
 # Read the results
 # file_name = "nanobeir_model_comparison_new"
 # file_name = "nanobeir_model_comparison"
-file_name = "model_comparison_scifact_nfcorpus"
+file_name = "model_comparison_scifact_nfcorpus_clean2_10000"
 
 
 df = pd.read_csv(f"{file_name}.csv", index_col=0)
@@ -237,6 +237,7 @@ if summary_df is None:
     summary_df = pd.concat(computed, axis=1)
 summary_df.columns = ["NDCG@10", "MRR@10", "MAP@100", "Recall@10"]
 print(summary_df.to_string())
+summary_df.to_csv(f"{file_name}_summary.csv")
 
 # Show which model wins on each dataset
 print("\n" + "="*60)

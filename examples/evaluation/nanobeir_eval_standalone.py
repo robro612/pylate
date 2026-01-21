@@ -88,15 +88,15 @@ MODELS = [
     ("lightonai/GTE-ModernColBERT-v1", "GTE-ModernColBERT-v1-base-HPool32", "colbert", True),
     ("output/lightonai_GTE-ModernColBERT-v1-3e-05-lr-3-epochs-gemma/checkpoint-5000", "ColBERT-V1-300tok-5000", "colbert", False),
     ("output/lightonai_GTE-ModernColBERT-v1-3e-05-lr-3-epochs-gemma/checkpoint-5000", "ColBERT-V1-300tok-5000-HPool32", "colbert", True),
-    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-25000", "ColBERT-Base-300tok-5000", "colbert", False),
-    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-25000", "ColBERT-Base-300tok-5000-HPool32", "colbert", True, 'ward_embeddings'),
+    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-10000", "ColBERT-Base-300tok-10000", "colbert", False),
+    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-10000", "ColBERT-Base-300tok-10000-HPool32", "colbert", True, 'ward_embeddings'),
 
     # Copy of the above with explicit h2pool variant
-    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-25000", "ColBERT-Base-300tok-5000-HPool32-h2pool", "colbert", True, "h2pool"),
+    ("output/Alibaba-GTE-ModernColBERT-3e-05-lr-3-epochs-gemma-bs24-nway16/checkpoint-10000", "ColBERT-Base-300tok-10000-HPool32-h2pool", "colbert", True, "h2pool"),
 
     ("output/ProxyAttention-ColBERT-32tok-3e-05-lr-3-epochs-full/checkpoint-5000", "ProxyAttention-V1-32tok-5000", "proxy", False),
     ("output/ProxyAttention-ColBERT-32tok-3e-05-lr-1-epochs-full/checkpoint-5000", "ProxyAttention-V1-32tok-5000-bs112", "proxy", False),
-    ("output/ProxyAttention-Alibaba-ColBERT-32tok-3e-05-lr-3-epochs-full-bs24-nway16/checkpoint-25000", "ProxyAttention-Base-32tok-5000-bs24", "proxy", False),
+    ("output/ProxyAttention-Alibaba-ColBERT-32tok-3e-05-lr-3-epochs-full-bs24-nway16/checkpoint-10000", "ProxyAttention-Base-32tok-10000-bs24", "proxy", False),
 ]
 "ProxyAttention-Base-32tok-5000-bs24 ColBERT-Base-300tok-5000 ColBERT-Base-300tok-5000-HPool32"
 
@@ -192,6 +192,12 @@ if __name__ == "__main__":
         "--enable-avg-doc-tokens",
         action="store_true",
         help="Compute and include avg_doc_tokens in results (WARNING: slow). Disabled by default.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size to use for both query and corpus encoding (default: 32).",
     )
     args = parser.parse_args()
     # Dataset selection override
@@ -297,6 +303,7 @@ if __name__ == "__main__":
                     corpus=corpus_dict,
                     relevant_docs=relevant_docs,
                     name=human_name,
+                    batch_size=args.batch_size,
                     show_progress_bar=args.show_progress,
                 )
                 ds_scores = beir_eval(model)
@@ -323,6 +330,11 @@ if __name__ == "__main__":
                 if dataset_names is not None
                 else evaluation.NanoBEIREvaluator(show_progress_bar=args.show_progress)
             )
+            # Ensure the evaluator uses the requested batch size for encoding
+            try:
+                setattr(evaluator, "batch_size", int(args.batch_size))
+            except Exception:
+                pass
             results = evaluator(model)
 
         # Optionally augment results with average document token count across the evaluated datasets
