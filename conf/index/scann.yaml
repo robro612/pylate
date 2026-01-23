@@ -1,0 +1,15 @@
+types:
+  - "ScaNN"
+save: true
+folder: "indexes"
+override: false
+schema_version: 2
+load_dir: null
+scann:
+  num_neighbors: 10
+  num_leaves: 2000
+  num_leaves_to_search: 200
+  use_autopilot: false
+  store_embeddings: true
+  verbose_level: "init"
+

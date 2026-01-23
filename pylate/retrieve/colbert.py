@@ -288,11 +288,12 @@ class ColBERT:
         
         results = []
         
-        for batch_queries_embeddings in tqdm(
+        progress_bar = tqdm(
             iter_batch(queries_embeddings, batch_size=batch_size),
             desc="Retrieving documents (XTR)",
             disable=not self.verbose,
-        ):
+        )
+        for batch_queries_embeddings in progress_bar:
             # Initial retrieval from index
             retrieval_start = time.time()
             index_results = self.index(batch_queries_embeddings, k=k_token, subset=subset)
@@ -317,12 +318,25 @@ class ColBERT:
             scoring_time = time.time() - scoring_start
             total_scoring_time += scoring_time
             num_batches += 1
+
+            batch_count = max(1, len(batch_queries_embeddings))
+            per_query_retrieval = retrieval_time / batch_count  # seconds per query
+            per_query_scoring = scoring_time / batch_count      # seconds per query
+            per_query_total = per_query_retrieval + per_query_scoring  # seconds per query
+            if not progress_bar.disable:
+                progress_bar.set_postfix(
+                    {
+                        "per_query_retrieval (s)": f"{per_query_retrieval:.3f} ({per_query_retrieval / (per_query_total + 1e-12) * 100:.1f}%)",
+                        "per_query_scoring (s)": f"{per_query_scoring:.3f} ({per_query_scoring / (per_query_total + 1e-12) * 100:.1f}%)",
+                        "per_query_total (s)": f"{per_query_total:.3f}",
+                    }
+                )
         
         # Log timing breakdown if verbose
         if self.verbose:
             total_time = total_retrieval_time + total_scoring_time
             logger.info(
-                f"XTR retrieval timing breakdown (total: {total_time:.4f}s, {num_batches} batches):"
+                f"XTR retrieval timing breakdown (total: {total_time:.4f}s, {num_batches} batches of {batch_size} queries):"
             )
             logger.info(
                 f"  - Index retrieval: {total_retrieval_time:.4f}s ({total_retrieval_time / total_time * 100:.1f}%)"

@@ -486,7 +486,7 @@ def get_index_configs(
                 "num_neighbors": args.num_neighbors,
                 "num_leaves": args.num_leaves,
                 "num_leaves_to_search": args.num_leaves_to_search,
-                "verbose": True,
+                "verbose_level": "all",
             },
             "add_documents_kwargs": {
                 "batch_size": args.batch_size,

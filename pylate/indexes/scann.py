@@ -71,9 +71,9 @@ class ScaNN(Base):
         Higher values improve recall but slow down search.
     training_sample_size
         The number of samples to use for training the ScaNN index.
-    verbose
-        Whether to enable verbose logging of timing and operations.
-        Defaults to False for cleaner output.
+    verbose_level
+        Verbosity scope. "none" disables logs, "init" logs only build/load/indexing,
+        "all" logs build/load/indexing and per-query retrieval.
     use_autopilot
         Whether to use ScaNN's autopilot() method for automatic parameter tuning.
         If True, overrides num_leaves, num_leaves_to_search, and training_sample_size.
@@ -95,7 +95,7 @@ class ScaNN(Base):
         num_leaves: Optional[int] = None,
         num_leaves_to_search: Optional[int] = None,
         training_sample_size: Optional[int] = None,
-        verbose: bool = False,
+        verbose_level: str = "none",
         use_autopilot: bool = False,
         store_embeddings: bool = False,
         index_folder: str | None = None,
@@ -104,7 +104,8 @@ class ScaNN(Base):
         self.name = name
         self.embedding_size = embedding_size
         self.num_neighbors = num_neighbors
-        self.verbose = verbose
+        self.verbose_level = verbose_level
+        self.verbose = self.verbose_level in ("init", "all")
         self.num_leaves = num_leaves
         self.num_leaves_to_search = num_leaves_to_search
         self.training_sample_size = training_sample_size
@@ -130,6 +131,9 @@ class ScaNN(Base):
                 metadata_path = index_path / "metadata.json"
                 if scann_config_path.exists() and metadata_path.exists():
                     self._load_index()
+
+    def _log_retrieve(self) -> bool:
+        return self.verbose_level == "all"
 
     def _build_searcher(self, embeddings: np.ndarray) -> None:
         """Build the ScaNN searcher from embeddings (in-memory only)."""
@@ -518,7 +522,7 @@ class ScaNN(Base):
         queries_embeddings = reshape_embeddings(embeddings=queries_embeddings)
         n_queries = len(queries_embeddings)
         step_time = time.time() - step_start
-        if self.verbose:
+        if self._log_retrieve():
             logger.info(f"[ScaNN] Reshaping {n_queries} queries: {step_time:.4f}s")
 
         # Flatten query embeddings (assume they are already normalized)
@@ -528,7 +532,7 @@ class ScaNN(Base):
         )
         n_tokens_total = len(flattened_queries)
         step_time = time.time() - step_start
-        if self.verbose:
+        if self._log_retrieve():
             logger.info(f"[ScaNN] Flattening {n_tokens_total} query tokens: {step_time:.4f}s")
 
         # Query the index
@@ -539,7 +543,7 @@ class ScaNN(Base):
             print(f"distances has {np.isnan(distances).sum()} NaN values out of {distances.size} total values")
             distances = np.nan_to_num(distances, nan=0.0)
         step_time = time.time() - step_start
-        if self.verbose:
+        if self._log_retrieve():
             logger.info(f"[ScaNN] ScaNN search_batched for {n_tokens_total} tokens (k={k}): {step_time:.4f}s ({step_time/n_tokens_total*1000:.2f}ms per token)")
 
         # Map embedding indices back to document IDs using fully vectorized numpy operations
@@ -573,11 +577,11 @@ class ScaNN(Base):
             distances_list.append(query_distances)
 
         step_time = time.time() - step_start
-        if self.verbose:
+        if self._log_retrieve():
             logger.info(f"[ScaNN] Mapping results to document IDs: {step_time:.4f}s")
         
         total_time = time.time() - total_start
-        if self.verbose:
+        if self._log_retrieve():
             logger.info(f"[ScaNN] Total retrieval time: {total_time:.4f}s ({total_time/n_queries*1000:.2f}ms per query, {total_time/n_tokens_total*1000:.2f}ms per token)")
 
         return {

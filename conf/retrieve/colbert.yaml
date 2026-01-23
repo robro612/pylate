@@ -1,0 +1,7 @@
+mode: "ColBERT"
+k: 100
+k_token: 4000
+batch_size: 1
+configs: []
+verbose: false
+

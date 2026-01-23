@@ -1,0 +1,29 @@
+defaults:
+  - eval_model_irds_v2
+  - _self_
+
+model:
+  name_or_path:
+    - "/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/contrastive-xtr-bclavie-kprime-1024-lr-3e-5-bs196acc1steps15k/checkpoint-15000"
+
+dataset:
+  names:
+    # - "beir/nfcorpus/test"
+    # - "beir/trec-covid"
+    - "beir/nq"
+    
+retrieve:
+  configs:
+    - mode: "XTR"
+      k_token: 100
+    - mode: "XTR"
+      k_token: 1000
+    - mode: "XTR"
+      k_token: 4000
+    - mode: "XTR"
+      k_token: 10000
+    - mode: "XTR"
+      k_token: 40000
+    - mode: "XTR"
+      k_token: 100000
+

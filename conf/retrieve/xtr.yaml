@@ -1,0 +1,7 @@
+mode: "XTR"
+k: 100
+k_token: 40000
+batch_size: 32
+configs: []
+verbose: true
+
