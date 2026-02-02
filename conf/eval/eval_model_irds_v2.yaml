@@ -1,0 +1,49 @@
+defaults:
+  - index: scann
+  - retrieve: xtr
+  - hydra: default
+  - _self_
+
+model:
+  name_or_path:
+    - "robro612/xtr-base-en-pylate"
+  dtype: "fp32"
+  query_len: null
+  doc_len: 300
+  compile: true
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+    - "beir/fiqa/test"
+    - "beir/scidocs"
+    - "beir/scifact/test"
+    - "beir/trec-covid"
+  lowercase: false
+
+encode:
+  batch_size: 1000
+  shard_size: 10000
+  move_embeddings_to_cpu: true
+
+cache:
+  enable: false
+  dir: "embedding_cache"
+  embedding_dtype: "fp32"
+  schema_version: 2
+
+metrics:
+  - "map"
+  - "ndcg@10"
+  - "ndcg@100"
+  - "recall@10"
+  - "recall@100"
+  - "hit_rate@5"
+
+output:
+  results_dir: "results"
+  run_root: "results_runs"
+  save_runfile: true
+  save_jsonl: true
+  overall_results_file: "all_results.jsonl"
+

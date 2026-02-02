@@ -1,0 +1,15 @@
+Contrastive:
+  args: {}
+  score:
+    use_colbert: false
+    score_fn: null
+    score_all_docs_at_once: true
+    positive_document_index: 0
+    k_prime: 128
+    impute_scores_instead_of_zero: false
+    use_normalizer_Z: false
+    Z_clamp_value: 1.0
+    start_normalizer_Z_at_step: 0
+    log_gradients: true
+    log_z_stats: true
+    log_frequency: 10

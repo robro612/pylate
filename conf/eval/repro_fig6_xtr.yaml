@@ -4,38 +4,28 @@ defaults:
 
 model:
   name_or_path:
-    - "/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/contrastive-colbert-bclavie10m/checkpoint-15000"
+    - "OVERRIDE"
 
 dataset:
   names:
     # - "beir/nfcorpus/test"
     # - "beir/trec-covid"
     - "beir/nq"
-
+    
 retrieve:
   configs:
     - mode: "XTR"
       k_token: 100
-    - mode: "ColBERT"
-      k_token: 100
     - mode: "XTR"
-      k_token: 1000
-    - mode: "ColBERT"
+      k_token: 400
+    - mode: "XTR"
       k_token: 1000
     - mode: "XTR"
       k_token: 4000
-    - mode: "ColBERT"
-      k_token: 4000
     - mode: "XTR"
-      k_token: 10000
-    - mode: "ColBERT"
       k_token: 10000
     - mode: "XTR"
       k_token: 40000
-    - mode: "ColBERT"
-      k_token: 40000
     - mode: "XTR"
-      k_token: 100000
-    - mode: "ColBERT"
       k_token: 100000
 

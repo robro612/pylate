@@ -168,6 +168,7 @@ pylate-index/*
 /docs/api/
 
 results/*
+results_runs/*
 
 monitor/eval_scripts/*
 monitor/logs/*

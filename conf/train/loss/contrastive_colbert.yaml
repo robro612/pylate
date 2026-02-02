@@ -1,0 +1,4 @@
+Contrastive:
+  score:
+    use_colbert: true
+    score_all_docs_at_once: false

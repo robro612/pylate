@@ -1,0 +1,42 @@
+defaults:
+  - hydra: default
+  - loss: contrastive_colbert
+  - _self_
+
+model:
+  name_or_path: "BAAI/bge-small-en-v1.5"
+  query_length: 32
+  doc_length: 300
+  dtype: "bf16"
+
+dataset:
+  train_path: "bclavie/msmarco-10m-triplets"
+  distillation_path: null
+  subset: null
+  nways: 32
+  eval_split_ratio: 0.0002
+
+optimization:
+  lr: 3e-5
+  batch_size: 196
+  grad_acc_steps: 1
+  num_train_epochs: null
+  num_train_steps: 50000
+  warmup_ratio: 0.0
+  max_grad_norm: 10.0
+  compile: true
+
+evaluation:
+  eval_steps: 1000
+  use_triplet: true
+  use_nanobeir: false
+  nanobeir_datasets: null
+
+run:
+  save_steps: 25000
+  logging_steps: 10
+  project: "xtr"
+  tags:
+    - "contrastive"
+    - "bge-small"
+  name: null

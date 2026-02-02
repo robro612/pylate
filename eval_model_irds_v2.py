@@ -841,7 +841,7 @@ def build_model(cfg: DictConfig, model_name: str, query_length: int, doc_length:
     return model
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="eval_model_irds_v2")
+@hydra.main(version_base=None, config_path="conf/eval", config_name="eval_model_irds_v2")
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(
         level=logging.INFO,
