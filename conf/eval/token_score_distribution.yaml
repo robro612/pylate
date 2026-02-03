@@ -1,0 +1,53 @@
+defaults:
+  - index: scann
+  - hydra: default
+  - _self_
+
+model:
+  name_or_path:
+    - "robro612/xtr-base-en-pylate"
+    - "lightonai/GTE-ModernColBERT-v1"
+  dtype: "fp32"
+  query_len: null
+  doc_len: 300
+  compile: false
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+  lowercase: false
+
+retrieve:
+  k: 100  # Number of documents to retrieve per query
+  k_token: 40000  # Initial candidates per query token
+  batch_size: 32
+
+encode:
+  batch_size: 1000
+  shard_size: 10000
+  move_embeddings_to_cpu: true
+
+cache:
+  enable: true
+  dir: "embedding_cache"
+  embedding_dtype: "fp32"
+  schema_version: 2
+
+output:
+  figures_dir: "figures/token_score_distribution"
+  save_data: true  # Save raw score data for later analysis
+  data_dir: "results/token_score_distribution"
+
+plot:
+  figsize_single: [8, 6]  # Single model plot
+  figsize_comparison: [16, 6]  # Multi-model comparison
+  bins: 100
+  alpha: 0.6
+  dpi: 150
+  format: "png"  # png, pdf, svg
+  # Color scheme
+  pos_color: "#2ecc71"  # Green for positive
+  neg_color: "#e74c3c"  # Red for negative
+  # KDE settings
+  use_kde: true
+  kde_bw_adjust: 0.5

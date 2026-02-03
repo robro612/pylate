@@ -667,11 +667,20 @@ def evaluate_index(
             batch_size=retrieve_cfg.batch_size,
         )
     else:
+        imputation_cfg = getattr(retrieve_cfg, "imputation", None)
+        imputation_kwargs = {}
+        if imputation_cfg is not None:
+            imputation_kwargs["imputation"] = getattr(imputation_cfg, "method", "min")
+            imputation_kwargs["percentile"] = getattr(imputation_cfg, "percentile", 10.0)
+            imputation_kwargs["power_law_multiplier"] = getattr(
+                imputation_cfg, "power_law_multiplier", 100.0
+            )
         scores = retriever.retrieve_xtr(
             queries_embeddings=queries_embeddings,
             k=retrieve_cfg.k,
             k_token=retrieve_cfg.k_token,
             batch_size=retrieve_cfg.batch_size,
+            **imputation_kwargs,
         )
     retrieve_time = time.time() - start_time
 
@@ -687,6 +696,16 @@ def evaluate_index(
 
     timestamp = datetime.now().isoformat()
 
+    imputation_info = {}
+    if hasattr(retrieve_cfg, "imputation") and retrieve_cfg.imputation is not None:
+        imputation_info = {
+            "method": getattr(retrieve_cfg.imputation, "method", "min"),
+            "percentile": getattr(retrieve_cfg.imputation, "percentile", 10.0),
+            "power_law_multiplier": getattr(
+                retrieve_cfg.imputation, "power_law_multiplier", 100.0
+            ),
+        }
+
     run_id_payload = {
         "dataset": dataset_id,
         "model": model_name,
@@ -697,6 +716,7 @@ def evaluate_index(
             "k": retrieve_cfg.k,
             "k_token": retrieve_cfg.k_token,
             "batch_size": retrieve_cfg.batch_size,
+            "imputation": imputation_info,
         },
         "model_dtype": cfg.model.dtype,
         "embedding_dtype": cfg.cache.embedding_dtype,
@@ -753,6 +773,7 @@ def evaluate_index(
             "k": retrieve_cfg.k,
             "k_token": retrieve_cfg.k_token,
             "retrieval_mode": retrieve_cfg.mode,
+            "imputation": imputation_info if imputation_info else None,
             "encode_batch_size": cfg.encode.batch_size,
             "retrieval_batch_size": retrieve_cfg.batch_size,
             "shard_size": cfg.encode.shard_size,
@@ -784,6 +805,7 @@ def evaluate_index(
         "k": retrieve_cfg.k,
         "k_token": retrieve_cfg.k_token,
         "retrieval_mode": retrieve_cfg.mode,
+        "imputation": imputation_info if imputation_info else None,
         "encode_batch_size": cfg.encode.batch_size,
         "retrieval_batch_size": retrieve_cfg.batch_size,
         "timestamp": timestamp,

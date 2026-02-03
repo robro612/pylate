@@ -156,18 +156,134 @@ def rerank(
 
     return results
 
+def _compute_imputation_scores(
+    query_scores: list[list[float]],
+    imputation: str,
+    percentile: float,
+    power_law_multiplier: float,
+    device: str,
+) -> torch.Tensor:
+    """Compute imputation scores for each query token.
+
+    Parameters
+    ----------
+    query_scores
+        List of length q_tok, where each element is a list of scores.
+    imputation
+        Imputation strategy: "min", "zero", "mean", "percentile", or "power_law".
+    percentile
+        Percentile value (0-100) for percentile imputation.
+    power_law_multiplier
+        Multiplier for k' when extrapolating power-law (e.g., 100 means extrapolate to rank 100*k').
+    device
+        Device for tensor computation.
+
+    Returns
+    -------
+    torch.Tensor
+        Imputation score for each query token, shape (q_tok,).
+    """
+    q_tok = len(query_scores)
+
+    if imputation == "zero":
+        return torch.zeros(q_tok, dtype=torch.float32, device=device)
+
+    elif imputation == "min":
+        return torch.tensor(
+            [min(scores) if len(scores) > 0 else 0.0 for scores in query_scores],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    elif imputation == "mean":
+        return torch.tensor(
+            [sum(scores) / len(scores) if len(scores) > 0 else 0.0 for scores in query_scores],
+            dtype=torch.float32,
+            device=device,
+        )
+
+    elif imputation == "percentile":
+        imputation_scores = []
+        for scores in query_scores:
+            if len(scores) == 0:
+                imputation_scores.append(0.0)
+            else:
+                # np.percentile expects percentile in [0, 100]
+                imputation_scores.append(float(np.percentile(scores, percentile)))
+        return torch.tensor(imputation_scores, dtype=torch.float32, device=device)
+
+    elif imputation == "power_law":
+        # Fit power-law: score(rank) = a * rank^(-b)
+        # In log space: log(score) = log(a) - b * log(rank)
+        # Extrapolate to rank 100 * k' as per Lee et al., 2023
+        imputation_scores = []
+        for scores in query_scores:
+            if len(scores) < 2:
+                # Not enough points to fit, fall back to min
+                imputation_scores.append(min(scores) if len(scores) > 0 else 0.0)
+                continue
+
+            # Sort scores descending (rank 1 = highest score)
+            sorted_scores = sorted(scores, reverse=True)
+            k_prime = len(sorted_scores)
+
+            # Filter out non-positive scores (can't take log)
+            valid_pairs = [
+                (rank, score)
+                for rank, score in enumerate(sorted_scores, start=1)
+                if score > 0
+            ]
+
+            if len(valid_pairs) < 2:
+                imputation_scores.append(min(scores) if len(scores) > 0 else 0.0)
+                continue
+
+            ranks, valid_scores = zip(*valid_pairs)
+            log_ranks = np.log(ranks)
+            log_scores = np.log(valid_scores)
+
+            # Linear regression in log-log space: log(score) = log(a) - b * log(rank)
+            # Using numpy's polyfit for degree 1 polynomial
+            try:
+                coeffs = np.polyfit(log_ranks, log_scores, 1)
+                neg_b, log_a = coeffs  # slope is -b, intercept is log(a)
+
+                # Extrapolate to rank power_law_multiplier * k'
+                extrapolate_rank = power_law_multiplier * k_prime
+                log_imputed = log_a + neg_b * np.log(extrapolate_rank)
+                imputed = np.exp(log_imputed)
+
+                # Clamp to reasonable range [0, min_retrieved_score]
+                imputed = max(0.0, min(float(imputed), min(scores)))
+                imputation_scores.append(imputed)
+            except (np.linalg.LinAlgError, ValueError):
+                # Fitting failed, fall back to min
+                imputation_scores.append(min(scores))
+
+        return torch.tensor(imputation_scores, dtype=torch.float32, device=device)
+
+    else:
+        raise ValueError(
+            f"Unknown imputation strategy: {imputation}. "
+            f"Expected one of: 'min', 'zero', 'mean', 'percentile', 'power_law'."
+        )
+
+
 def score_xtr(
     query_doc_ids: list[list[str | int]],
     query_scores: list[list[float]],
     k: int,
     device: str = "cpu",
+    imputation: str = "min",
+    percentile: float = 10.0,
+    power_law_multiplier: float = 100.0,
 ) -> list[RerankResult]:
     """Score documents using XTR (eXact Token Retrieval) scoring.
-    
+
     XTR scoring differs from ColBERT in that it doesn't do full reranking.
     Instead, it only scores documents using initially retrieved tokens, and
-    imputes missing token scores with the minimum score per query token.
-    
+    imputes missing token scores based on the chosen imputation strategy.
+
     Parameters
     ----------
     query_doc_ids
@@ -180,21 +296,34 @@ def score_xtr(
         Number of top documents to return.
     device
         Device to use for computation ('cpu', 'cuda', etc.).
-    
+    imputation
+        Strategy for imputing missing scores. Options:
+        - "min": Use minimum retrieved score per query token (default, original XTR).
+        - "zero": Impute with zero (missing tokens contribute nothing).
+        - "mean": Use mean of retrieved scores per query token.
+        - "percentile": Use specified percentile of retrieved scores.
+        - "power_law": Fit power-law curve to retrieved scores and extrapolate
+          to rank (power_law_multiplier * k') as per Lee et al., 2023.
+    percentile
+        Percentile value (0-100) for percentile imputation. Default is 10.0.
+    power_law_multiplier
+        Multiplier for k' when extrapolating power-law. Default is 100.0 (extrapolate
+        to rank 100*k' as in the original XTR paper).
+
     Returns
     -------
     list[RerankResult]
         Top-k documents sorted by score (descending).
-    
+
     Notes
     -----
     The XTR scoring algorithm:
     1. For each document, sum scores across all query tokens
-    2. If a document's token wasn't retrieved for a query token, use that 
-       query token's minimum score as imputation
+    2. If a document's token wasn't retrieved for a query token, use the
+       imputed score based on the chosen strategy
     3. If multiple tokens from the same document were retrieved for a query token,
        use the maximum score
-    
+
     Examples
     --------
     >>> from pylate.rank import score_xtr
@@ -209,7 +338,13 @@ def score_xtr(
     >>> results = score_xtr(query_doc_ids, query_scores, k=3)
     >>> assert len(results) == 3
     >>> assert results[0]["id"] == "doc2"  # Has high scores for both tokens
-    
+
+    >>> # Using zero imputation
+    >>> results_zero = score_xtr(query_doc_ids, query_scores, k=3, imputation="zero")
+
+    >>> # Using power-law imputation
+    >>> results_pl = score_xtr(query_doc_ids, query_scores, k=3, imputation="power_law")
+
     """
     q_tok = len(query_doc_ids)
     
@@ -249,27 +384,40 @@ def score_xtr(
     unique_doc_ids, inverse_indices = torch.unique(all_doc_ids_t, return_inverse=True)
     num_docs = len(unique_doc_ids)
     
-    # Compute minimum score per query token for imputation
-    # Can't use torch.tensor directly because sublists may have different lengths
-    min_scores = torch.tensor(
-        [min(scores) for scores in query_scores], 
-        dtype=torch.float32, 
-        device=device
+    # Compute imputation scores based on chosen strategy
+    imputation_scores = _compute_imputation_scores(
+        query_scores=query_scores,
+        imputation=imputation,
+        percentile=percentile,
+        power_law_multiplier=power_law_multiplier,
+        device=device,
     )  # Shape: (q_tok,)
-    
-    # Initialize with minimum scores: shape (num_docs, q_tok)
-    doc_scores = min_scores.unsqueeze(0).expand(num_docs, q_tok).clone()
-    
-    # Flatten doc_scores for 1D scatter, then reshape
+
+    # Step 1: Compute max actual score per (doc, query_token) pair
+    # Initialize with -inf so we can detect which pairs have no retrieved score
+    NEG_INF = float("-inf")
+    doc_scores = torch.full(
+        (num_docs, q_tok), NEG_INF, dtype=torch.float32, device=device
+    )
+
+    # Flatten for 1D scatter, then reshape
     doc_scores_flat = doc_scores.reshape(-1)
     flat_indices = inverse_indices * q_tok + q_tok_indices_t
-    
+
     # Use scatter_reduce with reduce='amax' to keep max score when multiple tokens
     # from the same document are retrieved for a single query token
     doc_scores_flat.scatter_reduce_(
-        0, flat_indices, all_scores_t, reduce='amax', include_self=True
+        0, flat_indices, all_scores_t, reduce="amax", include_self=False
     )
     doc_scores = doc_scores_flat.reshape(num_docs, q_tok)
+
+    # Step 2: Replace -inf (no retrieved score) with imputation scores
+    missing_mask = doc_scores == NEG_INF
+    doc_scores = torch.where(
+        missing_mask,
+        imputation_scores.unsqueeze(0).expand(num_docs, q_tok),
+        doc_scores,
+    )
     
     # Sum across query tokens to get final document scores
     final_scores = doc_scores.sum(dim=1)

@@ -1,3 +1,6 @@
+defaults:
+  - imputation: min
+
 mode: "XTR"
 k: 100
 k_token: 40000

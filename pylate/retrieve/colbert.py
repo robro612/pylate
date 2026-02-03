@@ -249,13 +249,16 @@ class ColBERT:
         device: str | None = None,
         batch_size: int = 1,
         subset: list[list[str]] | list[str] | None = None,
+        imputation: str = "min",
+        percentile: float = 10.0,
+        power_law_multiplier: float = 100.0,
     ) -> list[list[RerankResult]]:
         """Retrieve documents using XTR (eXact Token Retrieval) scoring.
-        
+
         XTR differs from standard ColBERT retrieval in that it doesn't do a full
         reranking step. Instead, it only scores documents using initially retrieved
-        tokens and imputes missing scores with the minimum score per query token.
-        
+        tokens and imputes missing scores based on the chosen imputation strategy.
+
         Parameters
         ----------
         queries_embeddings
@@ -271,13 +274,24 @@ class ColBERT:
         subset
             Optional subset of document IDs to restrict search to.
             Only supported with certain index types.
-        
+        imputation
+            Strategy for imputing missing scores. Options:
+            - "min": Use minimum retrieved score per query token (default, original XTR).
+            - "zero": Impute with zero (missing tokens contribute nothing).
+            - "mean": Use mean of retrieved scores per query token.
+            - "percentile": Use specified percentile of retrieved scores.
+            - "power_law": Fit power-law curve to retrieved scores and extrapolate.
+        percentile
+            Percentile value (0-100) for percentile imputation. Default is 10.0.
+        power_law_multiplier
+            Multiplier for k' when extrapolating power-law. Default is 100.0.
+
         Returns
         -------
         list[list[RerankResult]]
             List of results for each query, where each result contains
             document IDs and scores sorted by score (descending).
-        
+
         """
         if device is None:
             device = 'cpu'
@@ -312,6 +326,9 @@ class ColBERT:
                     query_scores=query_scores,
                     k=k,
                     device=device,
+                    imputation=imputation,
+                    percentile=percentile,
+                    power_law_multiplier=power_law_multiplier,
                 )
                 
                 results.append(query_results)

@@ -1,0 +1,2 @@
+method: "percentile"
+percentile: 10.0
