@@ -24,12 +24,13 @@ def _is_main_process() -> bool:
 
 def _should_log(log_frequency: int) -> bool:
     """Return True when we should log this step (stateless: uses wandb.run.step)."""
-    if log_frequency <= 1:
-        return True
-    if wandb is None or wandb.run is None:
+    if log_frequency == 0 or wandb is None or wandb.run is None:
         return False
-    step = wandb.run.step or 0
-    return (step % log_frequency) == 0
+    elif log_frequency == 1:
+        return True
+    else:
+        step = wandb.run.step or 0
+        return (step % log_frequency) == 0
 
 
 class XTRPrimeQA(nn.Module):
