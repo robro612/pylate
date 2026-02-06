@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Models from experiment 1
-XTR_MODEL="/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k/checkpoint-50000"
+XTR_MODEL="/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k_bugfix/checkpoint-50000"
 COLBERT_MODEL="/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_colbert_bs196_50k/checkpoint-50000"
 GOOGLE_XTR_MODEL="robro612/xtr-base-en-pylate"
 SOTA_COLBERT_MODEL="lightonai/GTE-ModernColBERT-v1"
@@ -23,12 +23,8 @@ echo "Dataset: beir/nfcorpus/test"
 echo "================================================"
 
 python analyze_token_scores.py \
-  "model.name_or_path=[${XTR_MODEL},${COLBERT_MODEL}, ${GOOGLE_XTR_MODEL}, ${SOTA_COLBERT_MODEL}]" \
-  "dataset.names=[beir/nfcorpus/test]" \
-  retrieve.k=100 \
-  retrieve.k_token=40000 \
-  encode.batch_size=1000 \
-  cache.enable=true \
+  "model.name_or_path=[${XTR_MODEL},${COLBERT_MODEL}, ${SOTA_COLBERT_MODEL}, ${GOOGLE_XTR_MODEL}]" \
+  "dataset.names=[beir/nfcorpus/test, beir/fiqa/test, beir/trec-covid]" \
   output.figures_dir="figures/token_score_distribution" \
   output.save_data=true \
   plot.format=png \

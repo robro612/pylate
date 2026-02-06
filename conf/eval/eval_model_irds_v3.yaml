@@ -1,0 +1,60 @@
+defaults:
+  - index: scann
+  - retrieve: xtr
+  - hydra: default
+  - _self_
+
+# Stages to run. Options: encode_docs, build_index, encode_queries, retrieve, evaluate
+# note: later stages will implicitly invoke earlier stages if they depend on them (e.g. build_index will invoke encode_docs)
+# Use 'all' as shorthand for all stages, or list explicitly:
+stages:
+  - encode_docs
+  - build_index
+  - encode_queries
+  - retrieve
+  - evaluate
+
+model:
+  name_or_path:
+    - "REPLACE_ME"
+  dtype: "fp32"
+  query_len: null
+  doc_len: 300
+  compile: true
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+    - "beir/fiqa/test"
+    - "beir/scidocs"
+    - "beir/scifact/test"
+    - "beir/trec-covid"
+  lowercase: false
+
+encode:
+  batch_size: 1000
+  shard_size: 10000
+  move_embeddings_to_cpu: true
+
+cache:
+  enable_docs: false
+  enable_queries: true
+  dir: "embedding_cache"
+  embedding_dtype: "fp32"
+  schema_version: 3
+
+metrics:
+  - "map"
+  - "ndcg@10"
+  - "ndcg@100"
+  - "recall@10"
+  - "recall@100"
+  - "hit_rate@5"
+
+output:
+  results_dir: "results"
+  run_root: "results_runs"
+  save_runfile: true
+  save_jsonl: true
+  overall_results_file: "all_results.jsonl"
+

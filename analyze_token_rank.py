@@ -29,8 +29,8 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from pylate import indexes, models
 
-# Reuse helpers from eval_model_irds_v2
-from eval_model_irds_v2 import (
+# Reuse helpers from eval_model_irds_v3
+from eval_model_irds_v3 import (
     build_cache_paths,
     build_index_configs,
     build_model,
@@ -253,7 +253,8 @@ def run_analysis(
         dataset_slug=dataset_slug,
         model_name=model_name,
         embedding_size=embedding_size,
-        doc_embed_key=cache_paths.doc_hash,
+        doc_length=doc_length,
+        lowercase=cfg.dataset.lowercase,
     )
 
     # We expect exactly one index config (ScaNN)
@@ -284,7 +285,7 @@ def run_analysis(
         embedding_dtype=embedding_dtype,
         move_to_cpu=cfg.encode.move_embeddings_to_cpu,
         cache_paths=cache_paths,
-        cache_enabled=cfg.cache.enable,
+        cache_enabled=cfg.cache.enable_queries,
     )
 
     # Collect statistics

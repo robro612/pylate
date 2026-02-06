@@ -4,17 +4,15 @@
 #SBATCH --error=logs/exp_4_rank_analysis_%a.err
 #SBATCH --time=4:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
-#SBATCH --array=0-4
+#SBATCH --mem=256G
+#SBATCH --array=0-2
 
 set -euo pipefail
 
 # Models from experiment 1
 MODELS=(
-  "/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k/checkpoint-50000"
   "/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k_bugfix/checkpoint-50000"
   "/home/hltcoe/rjha/rjha_exp/pylate-xtr/output/experiment_1_contrastive_colbert_bs196_50k/checkpoint-50000"
-  "lightonai/GTE-ModernColBERT-v1"
   "robro612/xtr-base-en-pylate"
 )
 
@@ -31,12 +29,10 @@ echo "================================================"
 
 python analyze_token_rank.py \
   "model.name_or_path=[${MODEL}]" \
-  "dataset.names=[beir/nfcorpus/test, beir/fiqa/test, beir/trec-covid]" \
-  analysis.k_token=4000 \
+  "dataset.names=[beir/nfcorpus/test, beir/fiqa/test, beir/trec-covid, beir/nq]" \
+  analysis.k_token=1000 \
   analysis.relevance_threshold=1 \
-  analysis.batch_size=32 \
-  encode.batch_size=1000 \
-  cache.enable=true \
+  analysis.batch_size=64 \
   output.results_dir="results/experiment_4_token_rank_analysis" \
   output.save_data=true \
   output.figure_format=png

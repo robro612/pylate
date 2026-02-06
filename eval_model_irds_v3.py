@@ -26,8 +26,6 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from pylate import evaluation, indexes, models, retrieve
 
-raise RuntimeError("This script is deprecated. Use eval_model_irds_v3.py instead.")
-
 logger = logging.getLogger(__name__)
 
 QUERY_LEN = {
@@ -74,8 +72,6 @@ class CachePaths:
     query_meta: Path
     doc_shard_pattern: str
     query_file: Path
-    doc_hash: str
-    query_hash: str
 
 
 def get_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -185,7 +181,9 @@ def expand_model_paths(model_paths: Iterable[str]) -> List[str]:
 
 def get_embedding_size(model: models.ColBERT) -> int:
     if hasattr(model, "get_sentence_embedding_dimension"):
-        return int(model.get_sentence_embedding_dimension())
+        emb_dim = model.get_sentence_embedding_dimension()
+        if emb_dim is not None:
+            return int(emb_dim)
     try:
         last = model[-1]
         if hasattr(last, "out_features"):
@@ -306,38 +304,17 @@ def build_cache_paths(
         / f"edtype_{cfg.cache.embedding_dtype}"
         / f"mdtype_{cfg.model.dtype}"
     )
-    doc_key = {
-        "schema_version": cfg.cache.schema_version,
-        "dataset": dataset_id,
-        "model": model_name,
-        "doc_length": doc_length,
-        "lowercase": lowercase,
-        "embedding_dtype": cfg.cache.embedding_dtype,
-        "model_dtype": cfg.model.dtype,
-    }
-    query_key = {
-        "schema_version": cfg.cache.schema_version,
-        "dataset": dataset_id,
-        "model": model_name,
-        "query_length": query_length,
-        "lowercase": lowercase,
-        "embedding_dtype": cfg.cache.embedding_dtype,
-        "model_dtype": cfg.model.dtype,
-    }
-    doc_hash = short_hash(doc_key, length=12)
-    query_hash = short_hash(query_key, length=12)
-    doc_meta = base_dir / f"doc_{doc_hash}_meta.json"
-    query_meta = base_dir / f"query_{query_hash}_meta.json"
-    doc_shard_pattern = f"doc_{doc_hash}_shard_{{:03d}}.pt"
-    query_file = base_dir / f"query_{query_hash}.pt"
+    # Schema v3: use static filenames instead of hashes
+    doc_meta = base_dir / "doc_meta.json"
+    query_meta = base_dir / "query_meta.json"
+    doc_shard_pattern = "doc_shard_{:03d}.pt"
+    query_file = base_dir / "query.pt"
     return CachePaths(
         cache_dir=base_dir,
         doc_meta=doc_meta,
         query_meta=query_meta,
         doc_shard_pattern=doc_shard_pattern,
         query_file=query_file,
-        doc_hash=doc_hash,
-        query_hash=query_hash,
     )
 
 
@@ -479,44 +456,29 @@ def build_index_configs(
     dataset_slug: str,
     model_name: str,
     embedding_size: int,
-    doc_embed_key: str,
+    doc_length: int,
+    lowercase: bool,
 ) -> List[Dict[str, Any]]:
     model_slug = sanitize_model_name(model_name)
     index_configs: List[Dict[str, Any]] = []
     index_types = cfg.index.types
+    # Schema v3: use config params in path instead of hash
     index_root = (
         Path(cfg.index.folder)
         / dataset_slug
         / model_slug
         / f"schema_v{cfg.index.schema_version}"
-        / f"doc_{doc_embed_key}"
+        / f"doclen{doc_length}"
+        / f"lower{int(lowercase)}"
+        / f"edtype_{cfg.cache.embedding_dtype}"
+        / f"mdtype_{cfg.model.dtype}"
     )
     load_dir = Path(cfg.index.load_dir) if cfg.index.load_dir else None
 
-    def index_hash(index_type: str, params: Dict[str, Any]) -> str:
-        payload = {
-            "schema_version": cfg.index.schema_version,
-            "dataset": dataset_slug,
-            "model": model_name,
-            "index_type": index_type,
-            "params": params,
-            "embedding_size": embedding_size,
-            "doc_embed_key": doc_embed_key,
-        }
-        return short_hash(payload, length=8)
-
     if "ScaNN" in index_types:
         scann_verbose_level = cfg.index.scann.verbose_level
-        scann_params = {
-            "num_neighbors": cfg.index.scann.num_neighbors,
-            "num_leaves": cfg.index.scann.num_leaves,
-            "num_leaves_to_search": cfg.index.scann.num_leaves_to_search,
-            "use_autopilot": cfg.index.scann.use_autopilot,
-            "store_embeddings": cfg.index.scann.store_embeddings,
-            "verbose_level": scann_verbose_level,
-        }
-        scann_id = index_hash("ScaNN", scann_params)
-        scann_name = f"{dataset_slug}_{model_slug}_scann_{scann_id}"
+        # Schema v3: use simple folder name instead of hash
+        scann_name = "index"
         scann_folder = (index_root / "scann").as_posix()
         if load_dir is not None:
             scann_name = load_dir.name
@@ -542,13 +504,13 @@ def build_index_configs(
         )
 
     if "Flat" in index_types:
-        flat_id = index_hash("Flat", {"search_batch_size": cfg.index.flat.search_batch_size})
+        # Schema v3: use simple folder name instead of hash
         index_configs.append(
             {
                 "name": "Flat",
                 "index_class": indexes.Flat,
                 "init_kwargs": {
-                    "name": f"{dataset_slug}_{model_slug}_flat_{flat_id}",
+                    "name": "index",
                     "embedding_size": embedding_size,
                     "device": cfg.index.flat.device,
                     "search_batch_size": cfg.index.flat.search_batch_size,
@@ -559,21 +521,15 @@ def build_index_configs(
         )
 
     if "Voyager" in index_types:
-        voyager_id = index_hash(
-            "Voyager",
-            {
-                "M": cfg.index.voyager.M,
-                "ef_construction": cfg.index.voyager.ef_construction,
-                "ef_search": cfg.index.voyager.ef_search,
-            },
-        )
+        # Schema v3: use simple folder name instead of hash
+        voyager_folder = (index_root / "voyager").as_posix()
         index_configs.append(
             {
                 "name": "Voyager",
                 "index_class": indexes.Voyager,
                 "init_kwargs": {
-                    "index_folder": cfg.index.voyager.index_folder,
-                    "index_name": f"{dataset_slug}_{model_slug}_voyager_{voyager_id}",
+                    "index_folder": voyager_folder,
+                    "index_name": "index",
                     "override": cfg.index.voyager.override,
                     "embedding_size": embedding_size,
                     "M": cfg.index.voyager.M,
@@ -585,9 +541,9 @@ def build_index_configs(
         )
 
     if "PLAID" in index_types:
-        plaid_id = index_hash("PLAID", {"override": cfg.index.plaid.override})
+        # Schema v3: use simple folder name instead of hash
         plaid_folder = (index_root / "plaid").as_posix()
-        plaid_name = f"{dataset_slug}_{model_slug}_plaid_{plaid_id}"
+        plaid_name = "index"
         if load_dir is not None:
             plaid_name = load_dir.name
             plaid_folder = load_dir.parent.as_posix()
@@ -664,8 +620,6 @@ def evaluate_index(
     retrieve_cfg: DictConfig,
     index_config: Dict[str, Any],
     index_instance: indexes.Base,
-    documents_ids: List[str],
-    documents_embeddings: Optional[List[torch.Tensor]],
     queries: Dict[str, str],
     queries_embeddings: List[torch.Tensor],
     qrels: Dict[str, Dict[str, int]],
@@ -674,31 +628,17 @@ def evaluate_index(
     query_length: int,
     doc_length: int,
     results_dir: Path,
+    index_time: float = 0.0,
 ) -> None:
+    """Run retrieval and evaluation on an already-built index."""
     index_name = index_config["name"]
     retriever = retrieve.ColBERT(index=index_instance, verbose=retrieve_cfg.verbose)
 
-    if hasattr(index_instance, "_documents_added") and index_instance._documents_added:
-        index_time = 0.0
-        logger.info("")
-        logger.info("--- Index (%s) ---", index_name)
-        logger.info("Index loaded from disk, skipping add_documents.")
-    else:
-        logger.info("")
-        logger.info("--- Index (%s) ---", index_name)
-        if documents_embeddings is None:
-            raise RuntimeError(
-                f"{index_name} requires document embeddings, but none are available."
-            )
-        start_time = time.time()
-        add_kwargs = {
-            "documents_ids": documents_ids,
-            "documents_embeddings": documents_embeddings,
-            **index_config.get("add_documents_kwargs", {}),
-        }
-        index_instance.add_documents(**add_kwargs)
-        index_time = time.time() - start_time
-        logger.info("%s indexing time: %.2fs", index_name, index_time)
+    # Verify index is ready
+    if not getattr(index_instance, "_documents_added", False):
+        raise RuntimeError(
+            f"Index {index_name} has no documents. Run with 'build_index' stage first."
+        )
 
     logger.info("")
     logger.info("--- Retrieve (%s) ---", index_name)
@@ -794,7 +734,7 @@ def evaluate_index(
         retrieval_mode=retrieve_cfg.mode,
         run_id=run_id,
         stats={
-            "num_documents": len(documents_ids),
+            "num_documents": len(getattr(index_instance, "doc_id_to_embedding_range", {})),
             "num_queries": len(queries),
             "index_time": index_time,
             "retrieve_time": retrieve_time,
@@ -827,7 +767,8 @@ def evaluate_index(
             "encode_batch_size": cfg.encode.batch_size,
             "retrieval_batch_size": retrieve_cfg.batch_size,
             "shard_size": cfg.encode.shard_size,
-            "cache_embeddings": cfg.cache.enable,
+            "cache_docs": cfg.cache.enable_docs,
+            "cache_queries": cfg.cache.enable_queries,
             "cache_dir": cfg.cache.dir,
             "move_embeddings_to_cpu": cfg.encode.move_embeddings_to_cpu,
             "save_index": cfg.index.save,
@@ -913,13 +854,59 @@ def build_model(cfg: DictConfig, model_name: str, query_length: int, doc_length:
     return model
 
 
-@hydra.main(version_base=None, config_path="conf/eval", config_name="eval_model_irds_v2")
+ALL_STAGES = {"encode_docs", "build_index", "encode_queries", "retrieve", "evaluate"}
+
+
+def parse_stages(cfg: DictConfig) -> set:
+    """Parse stages config into a set of stage names."""
+    stages_list = list(cfg.stages) if hasattr(cfg, "stages") else ["all"]
+    if "all" in stages_list:
+        return ALL_STAGES.copy()
+    stages = set(stages_list)
+    unknown = stages - ALL_STAGES
+    if unknown:
+        raise ValueError(f"Unknown stages: {unknown}. Valid stages: {ALL_STAGES}")
+    return stages
+
+
+def build_index_only(
+    index_config: Dict[str, Any],
+    index_instance: indexes.Base,
+    documents_ids: List[str],
+    documents_embeddings: List[torch.Tensor],
+) -> float:
+    """Build index and return indexing time."""
+    index_name = index_config["name"]
+
+    if hasattr(index_instance, "_documents_added") and index_instance._documents_added:
+        logger.info("")
+        logger.info("--- Index (%s) ---", index_name)
+        logger.info("Index loaded from disk, skipping add_documents.")
+        return 0.0
+
+    logger.info("")
+    logger.info("--- Index (%s) ---", index_name)
+    start_time = time.time()
+    add_kwargs = {
+        "documents_ids": documents_ids,
+        "documents_embeddings": documents_embeddings,
+        **index_config.get("add_documents_kwargs", {}),
+    }
+    index_instance.add_documents(**add_kwargs)
+    index_time = time.time() - start_time
+    logger.info("%s indexing time: %.2fs", index_name, index_time)
+    return index_time
+
+
+@hydra.main(version_base=None, config_path="conf/eval", config_name="eval_model_irds_v3")
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
     )
 
+    stages = parse_stages(cfg)
+    logger.info("Stages to run: %s", sorted(stages))
     logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
     model_paths = expand_model_paths(cfg.model.name_or_path)
@@ -928,6 +915,12 @@ def main(cfg: DictConfig) -> None:
 
     logger.info("Models to test: %s", model_paths)
     logger.info("Datasets to test: %s", dataset_names)
+
+    # Determine what we need based on stages
+    need_doc_encoding = "encode_docs" in stages or "build_index" in stages
+    need_query_encoding = "encode_queries" in stages or "retrieve" in stages
+    need_indexing = "build_index" in stages
+    need_retrieval = "retrieve" in stages or "evaluate" in stages
 
     with logging_redirect_tqdm():
         for dataset_id, model_name in itertools.product(dataset_names, model_paths):
@@ -965,20 +958,24 @@ def main(cfg: DictConfig) -> None:
                 dataset_slug=dataset_slug,
                 model_name=model_name,
                 embedding_size=embedding_size,
-                doc_embed_key=cache_paths.doc_hash,
+                doc_length=doc_length,
+                lowercase=cfg.dataset.lowercase,
             )
 
+            # Initialize index instances
             index_instances: List[Tuple[Dict[str, Any], indexes.Base]] = []
-            needs_doc_embeddings = False
+            any_index_needs_building = False
             for index_config in index_configs:
                 index_instance: indexes.Base = index_config["index_class"](
                     **index_config["init_kwargs"]
                 )
                 index_instances.append((index_config, index_instance))
                 if not getattr(index_instance, "_documents_added", False):
-                    needs_doc_embeddings = True
+                    any_index_needs_building = True
 
-            if needs_doc_embeddings:
+            # --- Stage: encode_docs ---
+            documents_embeddings = None
+            if need_doc_encoding and any_index_needs_building:
                 logger.info("")
                 logger.info("--- Encode Documents ---")
                 logger.info("Encoding/loading document embeddings...")
@@ -990,26 +987,51 @@ def main(cfg: DictConfig) -> None:
                     embedding_dtype=embedding_dtype,
                     move_to_cpu=cfg.encode.move_embeddings_to_cpu,
                     cache_paths=cache_paths,
-                    cache_enabled=cfg.cache.enable,
+                    cache_enabled=cfg.cache.enable_docs,
                 )
-            else:
-                documents_embeddings = None
+            elif need_doc_encoding:
                 logger.info("")
                 logger.info("--- Encode Documents ---")
                 logger.info("All indexes loaded from disk; skipping document embeddings.")
 
-            logger.info("")
-            logger.info("--- Encode Queries ---")
-            queries_embeddings = encode_queries_with_cache(
-                model=model,
-                queries=queries,
-                batch_size=cfg.encode.batch_size,
-                embedding_dtype=embedding_dtype,
-                move_to_cpu=cfg.encode.move_embeddings_to_cpu,
-                cache_paths=cache_paths,
-                cache_enabled=cfg.cache.enable,
-            )
+            # --- Stage: build_index ---
+            if need_indexing:
+                for index_config, index_instance in index_instances:
+                    if not getattr(index_instance, "_documents_added", False):
+                        if documents_embeddings is None:
+                            raise RuntimeError(
+                                f"Index {index_config['name']} requires document embeddings, "
+                                "but none are available. Include 'encode_docs' stage."
+                            )
+                        build_index_only(
+                            index_config=index_config,
+                            index_instance=index_instance,
+                            documents_ids=documents_ids,
+                            documents_embeddings=documents_embeddings,
+                        )
 
+            # Early exit if no retrieval/evaluation needed
+            if not need_retrieval:
+                logger.info("")
+                logger.info("Stages complete for %s | %s (no retrieval requested)", dataset_id, model_name)
+                continue
+
+            # --- Stage: encode_queries ---
+            queries_embeddings = None
+            if need_query_encoding:
+                logger.info("")
+                logger.info("--- Encode Queries ---")
+                queries_embeddings = encode_queries_with_cache(
+                    model=model,
+                    queries=queries,
+                    batch_size=cfg.encode.batch_size,
+                    embedding_dtype=embedding_dtype,
+                    move_to_cpu=cfg.encode.move_embeddings_to_cpu,
+                    cache_paths=cache_paths,
+                    cache_enabled=cfg.cache.enable_queries,
+                )
+
+            # --- Stages: retrieve + evaluate ---
             for retrieve_cfg in iter_retrieval_configs(cfg):
                 logger.info("")
                 logger.info("--- Retrieval Config ---")
@@ -1027,8 +1049,6 @@ def main(cfg: DictConfig) -> None:
                         retrieve_cfg=retrieve_cfg,
                         index_config=index_config,
                         index_instance=index_instance,
-                        documents_ids=documents_ids,
-                        documents_embeddings=documents_embeddings,
                         queries=queries,
                         queries_embeddings=queries_embeddings,
                         qrels=qrels,

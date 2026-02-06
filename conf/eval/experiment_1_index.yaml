@@ -1,0 +1,35 @@
+defaults:
+  - eval_model_irds_v3
+  - _self_
+
+# Index and encode queries (not retrieval)
+stages:
+  - encode_docs
+  - build_index
+  - encode_queries
+
+model:
+  name_or_path:
+    - "OVERRIDE"
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+    - "beir/trec-covid"
+    - "beir/nq"
+
+# Enable query caching so queries are saved
+cache:
+  enable_queries: true
+  enable_docs: false
+
+# Default retrieve settings (mode will be overridden by script)
+retrieve:
+  mode: "XTR"
+  k: 100
+  k_token: 40000
+  batch_size: 32
+
+# Index settings (store_embeddings will be overridden by script)
+index:
+  save: true

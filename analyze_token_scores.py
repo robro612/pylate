@@ -9,6 +9,10 @@ ColBERT training causes many document tokens to have extremely high scores
 regardless of their actual relevance, while XTR mitigates this with a better
 training objective.
 
+Prerequisites:
+    - Existing index built with eval_model_irds_v3.py
+    - Query embeddings (will be cached)
+
 Usage:
     python analyze_token_scores.py
     python analyze_token_scores.py model.name_or_path=[model1,model2] dataset.names=[dataset1]
@@ -22,7 +26,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import hydra
 import matplotlib.pyplot as plt
@@ -32,16 +36,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
-from pylate import indexes, models, retrieve
+from pylate import indexes, models
 
 # Import helpers from eval script
-from eval_model_irds_v2 import (
-    QUERY_LEN,
-    CachePaths,
+from eval_model_irds_v3 import (
     build_cache_paths,
     build_index_configs,
-    cast_embeddings,
-    encode_documents_with_cache,
+    build_model,
     encode_queries_with_cache,
     expand_model_paths,
     get_embedding_size,
@@ -68,146 +69,161 @@ class TokenScoreData:
     neg_scores: np.ndarray = field(default_factory=lambda: np.array([]))
     # Metadata
     num_queries: int = 0
-    num_pos_docs: int = 0
-    num_neg_docs: int = 0
     num_pos_tokens: int = 0
     num_neg_tokens: int = 0
 
 
-def compute_token_scores_for_documents(
-    query_embedding: torch.Tensor,
-    doc_embeddings: List[torch.Tensor],
-    doc_ids: List[str],
+def extract_token_scores_from_retrieval(
+    query_id: str,
+    token_doc_ids: List[np.ndarray],  # List of arrays, one per query token
+    token_scores: List[np.ndarray],   # List of arrays, one per query token
     qrels_for_query: Dict[str, int],
+    relevance_threshold: int = 1,
 ) -> Tuple[List[float], List[float]]:
     """
-    Compute token-level similarity scores between a query and retrieved documents.
+    Extract and segment token-level scores from index retrieval results.
 
-    Returns:
-        Tuple of (positive_scores, negative_scores) where each is a list of all
-        token-level cosine similarity scores.
+    Parameters
+    ----------
+    query_id
+        The query ID (for logging/debugging).
+    token_doc_ids
+        For each query token, the document IDs of retrieved tokens.
+        Shape: (num_query_tokens, k) where k is top-k retrieved per token.
+    token_scores
+        For each query token, the similarity scores of retrieved tokens.
+        Shape: (num_query_tokens, k).
+    qrels_for_query
+        Mapping from doc_id -> relevance score for this query.
+    relevance_threshold
+        Minimum relevance score to consider a document as positive.
+
+    Returns
+    -------
+    pos_scores : List[float]
+        Token-level scores from relevant documents.
+    neg_scores : List[float]
+        Token-level scores from non-relevant documents.
     """
     pos_scores = []
     neg_scores = []
 
-    # query_embedding: (num_query_tokens, dim)
-    # Normalize query embedding
-    query_emb = query_embedding.float()
-    query_emb = query_emb / (query_emb.norm(dim=-1, keepdim=True) + 1e-9)
+    # For each query token
+    for doc_ids_arr, scores_arr in zip(token_doc_ids, token_scores):
+        # For each retrieved document token (top-k)
+        for doc_id, score in zip(doc_ids_arr, scores_arr):
+            # Check if document is relevant
+            is_relevant = doc_id in qrels_for_query and qrels_for_query[doc_id] >= relevance_threshold
 
-    for doc_id, doc_emb in zip(doc_ids, doc_embeddings):
-        # doc_emb: (num_doc_tokens, dim)
-        doc_emb = doc_emb.float()
-        doc_emb = doc_emb / (doc_emb.norm(dim=-1, keepdim=True) + 1e-9)
-
-        # Compute all pairwise token similarities: (num_query_tokens, num_doc_tokens)
-        sim_matrix = torch.matmul(query_emb, doc_emb.T)
-
-        # Flatten all token scores
-        token_scores = sim_matrix.flatten().cpu().numpy()
-
-        # Check if document is relevant (in qrels with relevance > 0)
-        is_relevant = doc_id in qrels_for_query and qrels_for_query[doc_id] > 0
-
-        if is_relevant:
-            pos_scores.extend(token_scores.tolist())
-        else:
-            neg_scores.extend(token_scores.tolist())
+            if is_relevant:
+                pos_scores.append(float(score))
+            else:
+                neg_scores.append(float(score))
 
     return pos_scores, neg_scores
 
 
 def collect_token_scores(
-    model: models.ColBERT,
     index: indexes.Base,
-    documents_embeddings: List[torch.Tensor],
-    documents_ids: List[str],
     queries: Dict[str, str],
     queries_embeddings: List[torch.Tensor],
     qrels: Dict[str, Dict[str, int]],
-    k: int = 100,
-    k_token: int = 40000,
+    k_token: int = 1000,
     batch_size: int = 32,
+    relevance_threshold: int = 1,
+    sample_queries: Optional[int] = None,
     verbose: bool = True,
 ) -> TokenScoreData:
     """
-    Collect token-level similarity scores for retrieved documents.
+    Collect token-level similarity scores from index retrieval results.
 
     For each query:
-    1. Retrieve top-k documents using the index
-    2. For each retrieved document, compute all pairwise token similarities
-    3. Segment scores into positive (relevant) and negative (non-relevant)
+    1. Retrieve top-k_token tokens per query token using the index
+    2. Extract scores directly from index results
+    3. Segment scores into positive (relevant) and negative (non-relevant) based on qrels
+
+    Parameters
+    ----------
+    index
+        The pre-built index to query.
+    queries
+        Mapping from query_id -> query text.
+    queries_embeddings
+        List of query embeddings (one tensor per query).
+    qrels
+        Mapping from query_id -> {doc_id -> relevance}.
+    k_token
+        Number of top tokens to retrieve per query token.
+    batch_size
+        Batch size for index querying.
+    relevance_threshold
+        Minimum relevance score to consider a document as positive.
+    sample_queries
+        If set, randomly sample this many queries (for faster analysis).
+    verbose
+        Whether to show progress bar.
+
+    Returns
+    -------
+    TokenScoreData
+        Container with positive/negative token score distributions.
     """
-    # Create document ID to embedding mapping
-    doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_ids)}
-
-    # Initialize retriever
-    retriever = retrieve.ColBERT(index=index, verbose=verbose)
-
-    # Retrieve documents for all queries
-    logger.info("Retrieving top-%d documents for %d queries...", k, len(queries))
-
-    # Use XTR-style retrieval to get candidates (we just need doc IDs, not full reranking)
-    # Actually, let's just call the index directly to get candidates
     all_pos_scores = []
     all_neg_scores = []
-    num_pos_docs = 0
-    num_neg_docs = 0
+    num_pos_tokens = 0
+    num_neg_tokens = 0
 
     query_ids = list(queries.keys())
 
+    # Sample queries if requested
+    if sample_queries is not None and sample_queries < len(query_ids):
+        logger.info("Sampling %d out of %d queries", sample_queries, len(query_ids))
+        import random
+        random.seed(42)  # For reproducibility
+        sampled_indices = random.sample(range(len(query_ids)), sample_queries)
+        query_ids = [query_ids[i] for i in sampled_indices]
+        queries_embeddings = [queries_embeddings[i] for i in sampled_indices]
+        logger.info("Sampled query IDs: %s", query_ids[:10])
+
     # Process in batches
     for batch_start in tqdm(range(0, len(queries_embeddings), batch_size),
-                           desc="Processing queries", disable=not verbose):
+                           desc="Retrieving tokens", disable=not verbose):
         batch_end = min(batch_start + batch_size, len(queries_embeddings))
         batch_query_embeddings = queries_embeddings[batch_start:batch_end]
         batch_query_ids = query_ids[batch_start:batch_end]
 
-        # Get initial candidates from index
+        # Query the index (returns doc IDs and scores for each token)
         index_results = index(batch_query_embeddings, k=k_token)
 
         # For each query in batch
-        for q_idx, (query_id, query_emb) in enumerate(zip(batch_query_ids, batch_query_embeddings)):
-            # Get unique document IDs from all query tokens
-            query_doc_ids_per_token = index_results["documents_ids"][q_idx]
-            unique_doc_ids = list(set(
-                doc_id
-                for token_doc_ids in query_doc_ids_per_token
-                for doc_id in token_doc_ids
-            ))
-
-            # Limit to top-k unique documents (by first occurrence)
-            unique_doc_ids = unique_doc_ids[:k]
-
-            # Get embeddings for these documents
-            doc_embeddings_list = []
-            valid_doc_ids = []
-            for doc_id in unique_doc_ids:
-                if doc_id in doc_id_to_idx:
-                    doc_embeddings_list.append(documents_embeddings[doc_id_to_idx[doc_id]])
-                    valid_doc_ids.append(doc_id)
-
-            if not valid_doc_ids:
-                continue
-
+        for q_idx, query_id in enumerate(batch_query_ids):
             # Get qrels for this query
             qrels_for_query = qrels.get(query_id, {})
 
-            # Compute token scores
-            pos_scores, neg_scores = compute_token_scores_for_documents(
-                query_emb, doc_embeddings_list, valid_doc_ids, qrels_for_query
+            # Extract token-level doc IDs and scores
+            token_doc_ids = index_results["documents_ids"][q_idx]  # (num_query_tokens, k_token)
+            token_distances = index_results["distances"][q_idx]     # (num_query_tokens, k_token)
+
+            # Convert distances to similarity scores (ScaNN returns squared L2 distances for inner product)
+            # For cosine similarity with normalized embeddings, distance = 2 * (1 - cosine_sim)
+            # So: cosine_sim = 1 - distance/2
+            # But actually, ScaNN configured for max inner product returns negative distances
+            # Let's just use the distances as-is (higher = more similar)
+            token_scores = token_distances  # Keep as-is for now
+
+            # Extract and segment scores
+            pos_scores, neg_scores = extract_token_scores_from_retrieval(
+                query_id=query_id,
+                token_doc_ids=token_doc_ids,
+                token_scores=token_scores,
+                qrels_for_query=qrels_for_query,
+                relevance_threshold=relevance_threshold,
             )
 
             all_pos_scores.extend(pos_scores)
             all_neg_scores.extend(neg_scores)
-
-            # Count documents
-            for doc_id in valid_doc_ids:
-                is_relevant = doc_id in qrels_for_query and qrels_for_query[doc_id] > 0
-                if is_relevant:
-                    num_pos_docs += 1
-                else:
-                    num_neg_docs += 1
+            num_pos_tokens += len(pos_scores)
+            num_neg_tokens += len(neg_scores)
 
     # Convert to numpy arrays
     pos_scores_arr = np.array(all_pos_scores, dtype=np.float32)
@@ -220,11 +236,9 @@ def collect_token_scores(
         all_scores=all_scores_arr,
         pos_scores=pos_scores_arr,
         neg_scores=neg_scores_arr,
-        num_queries=len(queries),
-        num_pos_docs=num_pos_docs,
-        num_neg_docs=num_neg_docs,
-        num_pos_tokens=len(pos_scores_arr),
-        num_neg_tokens=len(neg_scores_arr),
+        num_queries=len(query_ids),
+        num_pos_tokens=num_pos_tokens,
+        num_neg_tokens=num_neg_tokens,
     )
 
 
@@ -504,8 +518,6 @@ def save_score_data(
         "model_name": data.model_name,
         "dataset_name": data.dataset_name,
         "num_queries": data.num_queries,
-        "num_pos_docs": data.num_pos_docs,
-        "num_neg_docs": data.num_neg_docs,
         "num_pos_tokens": data.num_pos_tokens,
         "num_neg_tokens": data.num_neg_tokens,
         "created_at": datetime.now().isoformat(),
@@ -551,7 +563,6 @@ def main(cfg: DictConfig) -> None:
 
         # Load dataset once (shared across models)
         documents, queries, qrels = load_dataset(dataset_id, lowercase=cfg.dataset.lowercase)
-        documents_ids = [doc["id"] for doc in documents]
 
         # Collect results for all models on this dataset
         all_model_data: List[TokenScoreData] = []
@@ -565,18 +576,8 @@ def main(cfg: DictConfig) -> None:
             query_length = resolve_query_length(dataset_id, cfg.model.query_len)
             doc_length = cfg.model.doc_len
 
-            # Build model
-            model = models.ColBERT(
-                model_name_or_path=model_name,
-                document_length=doc_length,
-                query_length=query_length,
-            )
-            if cfg.model.compile:
-                model.compile()
-            model_dtype = get_torch_dtype(cfg.model.dtype)
-            if next(model.parameters()).dtype != model_dtype:
-                model = model.to(model_dtype)
-
+            # Build model (for query encoding only)
+            model = build_model(cfg, model_name, query_length, doc_length)
             embedding_size = get_embedding_size(model)
 
             # Build cache paths
@@ -589,20 +590,35 @@ def main(cfg: DictConfig) -> None:
                 lowercase=cfg.dataset.lowercase,
             )
 
-            # Encode documents
-            logger.info("Encoding documents...")
-            documents_embeddings = encode_documents_with_cache(
-                model=model,
-                documents=documents,
-                batch_size=cfg.encode.batch_size,
-                shard_size=cfg.encode.shard_size,
-                embedding_dtype=embedding_dtype,
-                move_to_cpu=cfg.encode.move_embeddings_to_cpu,
-                cache_paths=cache_paths,
-                cache_enabled=cfg.cache.enable,
+            # Build index config to load existing index
+            index_configs = build_index_configs(
+                cfg=cfg,
+                dataset_slug=dataset_slug,
+                model_name=model_name,
+                embedding_size=embedding_size,
+                doc_length=doc_length,
+                lowercase=cfg.dataset.lowercase,
             )
 
-            # Encode queries
+            if not index_configs:
+                raise ValueError("No index configuration found. Check your config.")
+
+            # Load existing index (fail if not found)
+            index_config = index_configs[0]
+            logger.info("Loading index: %s", index_config["name"])
+            logger.info("Index init kwargs: %s", index_config["init_kwargs"])
+
+            index: indexes.Base = index_config["index_class"](**index_config["init_kwargs"])
+
+            if not getattr(index, "_documents_added", False):
+                raise ValueError(
+                    f"Index not found or empty. Please run eval_model_irds_v3.py first to build the index.\n"
+                    f"Expected index at: {index_config['init_kwargs'].get('index_folder')}/{index_config['init_kwargs'].get('name')}"
+                )
+
+            logger.info("Index loaded successfully with %d documents", len(index.doc_id_to_embedding_range))
+
+            # Encode queries (or load from cache)
             logger.info("Encoding queries...")
             queries_embeddings = encode_queries_with_cache(
                 model=model,
@@ -611,44 +627,20 @@ def main(cfg: DictConfig) -> None:
                 embedding_dtype=embedding_dtype,
                 move_to_cpu=cfg.encode.move_embeddings_to_cpu,
                 cache_paths=cache_paths,
-                cache_enabled=cfg.cache.enable,
+                cache_enabled=cfg.cache.enable_queries,
             )
 
-            # Build index
-            index_configs = build_index_configs(
-                cfg=cfg,
-                dataset_slug=dataset_slug,
-                model_name=model_name,
-                embedding_size=embedding_size,
-                doc_embed_key=cache_paths.doc_hash,
-            )
-
-            # Use first index config (typically ScaNN)
-            index_config = index_configs[0]
-            index: indexes.Base = index_config["index_class"](**index_config["init_kwargs"])
-
-            # Add documents to index if needed
-            if not getattr(index, "_documents_added", False):
-                logger.info("Building index...")
-                index.add_documents(
-                    documents_ids=documents_ids,
-                    documents_embeddings=documents_embeddings,
-                    **index_config.get("add_documents_kwargs", {}),
-                )
-
-            # Collect token scores
-            logger.info("Collecting token scores...")
+            # Collect token scores from retrieval
+            logger.info("Collecting token scores from retrieval...")
             score_data = collect_token_scores(
-                model=model,
                 index=index,
-                documents_embeddings=documents_embeddings,
-                documents_ids=documents_ids,
                 queries=queries,
                 queries_embeddings=queries_embeddings,
                 qrels=qrels,
-                k=cfg.retrieve.k,
                 k_token=cfg.retrieve.k_token,
                 batch_size=cfg.retrieve.batch_size,
+                relevance_threshold=cfg.analysis.get("relevance_threshold", 1),
+                sample_queries=cfg.analysis.get("sample_queries", None),
                 verbose=True,
             )
 
@@ -659,8 +651,6 @@ def main(cfg: DictConfig) -> None:
             # Log statistics
             logger.info("Token score statistics:")
             logger.info("  - Queries: %d", score_data.num_queries)
-            logger.info("  - Positive docs: %d", score_data.num_pos_docs)
-            logger.info("  - Negative docs: %d", score_data.num_neg_docs)
             logger.info("  - Positive tokens: %d", score_data.num_pos_tokens)
             logger.info("  - Negative tokens: %d", score_data.num_neg_tokens)
             if len(score_data.pos_scores) > 0:

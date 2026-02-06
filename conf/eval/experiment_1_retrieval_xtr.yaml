@@ -1,0 +1,31 @@
+defaults:
+  - eval_model_irds_v3
+  - _self_
+
+# Only run query encoding and retrieval (assumes docs/indexes already exist)
+stages:
+  - encode_queries
+  - retrieve
+  - evaluate
+
+model:
+  name_or_path:
+    - "OVERRIDE"
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+    - "beir/trec-covid"
+    - "beir/nq"
+
+# XTR retrieval with varying k_token
+retrieve:
+  mode: "XTR"
+  configs:
+    - k_token: 100
+    - k_token: 400
+    - k_token: 1000
+    - k_token: 4000
+    - k_token: 10000
+    - k_token: 40000
+    - k_token: 100000

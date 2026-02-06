@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=experiment_2_imputation
-#SBATCH --array=0-39%8
+#SBATCH --array=0-74%4
 #SBATCH --output=logs/experiment_2_imputation_%a.out
 #SBATCH --error=logs/experiment_2_imputation_%a.err
 #SBATCH --time=48:00:00
@@ -20,8 +20,10 @@ IMPUTATIONS=(
 
 # Model paths
 MODELS=(
-  "output/experiment_1_contrastive_colbert_bs196_50k/final"
-  "output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k_bugfix/final"
+  "output/experiment_1_contrastive_colbert_bs196_50k/checkpoint-50000"
+  "output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k_bugfix/checkpoint-50000"
+  "lightonai/GTE-ModernColBERT-v1"
+  "robro612/xtr-base-en-pylate"
 )
 
 # Datasets (ordered roughly by size, smallest first)
@@ -29,7 +31,6 @@ DATASETS=(
   "beir/nfcorpus/test"
   "beir/fiqa/test"
   "beir/trec-covid"
-  "lotte/lifestyle/dev/search"
 )
 
 # Calculate indices from array task ID
@@ -37,7 +38,7 @@ DATASETS=(
 # This ensures jobs with same (model, dataset) are 8 apart in the array
 # With %8 limit, only one job per (model, dataset) runs at a time
 #
-# 5 imputations × 2 models × 4 datasets = 40 jobs (0-39)
+# 5 imputations × 5 models × 3 datasets = 75 jobs (0-74)
 IDX=${SLURM_ARRAY_TASK_ID:-0}
 NUM_MODELS=${#MODELS[@]}
 NUM_DATASETS=${#DATASETS[@]}
@@ -60,7 +61,7 @@ echo ""
 
 for K_TOKEN in 10000 40000; do
   echo "Running k_token=${K_TOKEN}"
-  python eval_model_irds_v2.py \
+  python eval_model_irds_v3.py \
     retrieve="xtr" \
     "retrieve/imputation=${IMPUTATION}" \
     "model.name_or_path=[${MODEL_PATH}]" \

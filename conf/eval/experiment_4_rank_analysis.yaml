@@ -1,0 +1,37 @@
+defaults:
+  - eval_model_irds_v3
+  - _self_
+
+# Override: only build indexes (encode_docs is auto-included as dependency)
+stages:
+  - encode_queries
+  - build_index
+
+model:
+  name_or_path:
+    - "output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k/checkpoint-50000"
+    - "output/experiment_1_contrastive_xtr_primeqa_kprime_128_bs196_50k_bugfix/checkpoint-50000"
+    - "output/experiment_1_contrastive_colbert_bs196_50k/checkpoint-50000"
+    - "lightonai/GTE-ModernColBERT-v1"
+    - "robro612/xtr-base-en-pylate"
+
+dataset:
+  names:
+    - "beir/nfcorpus/test"
+    - "beir/fiqa/test"
+    - "beir/trec-covid"
+    - "beir/nq"
+
+cache:
+  enable_queries: true
+
+# Analysis-specific settings (used by experiment_4 analysis script, not eval_model_irds_v3)
+analysis:
+  k_token: 4000              # Number of neighbors per query token
+  relevance_threshold: 1     # Minimum qrel relevance to count as "gold"
+  batch_size: 32             # Query batch size for index retrieval
+
+output:
+  results_dir: "results/token_rank_analysis"
+  save_data: true            # Save raw counts as JSON
+  figure_format: "png"       # png or pdf

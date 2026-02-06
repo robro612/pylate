@@ -18,9 +18,12 @@ dataset:
   lowercase: false
 
 retrieve:
-  k: 100  # Number of documents to retrieve per query
-  k_token: 40000  # Initial candidates per query token
+  k_token: 1000  # Number of tokens to retrieve per query token
   batch_size: 32
+
+analysis:
+  relevance_threshold: 1  # Minimum relevance score to consider a document as positive
+  sample_queries: null  # If set, randomly sample this many queries (null = use all)
 
 encode:
   batch_size: 1000
@@ -28,10 +31,11 @@ encode:
   move_embeddings_to_cpu: true
 
 cache:
-  enable: true
+  enable_queries: true
+  enable_docs: true
   dir: "embedding_cache"
   embedding_dtype: "fp32"
-  schema_version: 2
+  schema_version: 3
 
 output:
   figures_dir: "figures/token_score_distribution"

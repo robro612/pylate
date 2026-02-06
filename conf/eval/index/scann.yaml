@@ -3,7 +3,7 @@ types:
 save: true
 folder: "indexes"
 override: false
-schema_version: 2
+schema_version: 3
 load_dir: null
 scann:
   num_neighbors: 10

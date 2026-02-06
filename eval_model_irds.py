@@ -23,6 +23,8 @@ import numpy as np
 from pylate import evaluation, indexes, models, retrieve
 import ir_datasets
 
+raise RuntimeError("This script is deprecated. Use eval_model_irds_v3.py instead.")
+
 # Configure logging to show INFO level messages
 logging.basicConfig(
     level=logging.INFO,
@@ -155,18 +157,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Types of indexes to test (default: ['Flat'])",
         nargs="+",
         choices=["Flat", "ScaNN", "Voyager", "PLAID"],
-    )
-    parser.add_argument(
-        "--limit_queries",
-        type=int,
-        default=None,
-        help="Limit the number of queries to test (default: None)",
-    )
-    parser.add_argument(
-        "--limit_documents",
-        type=int,
-        default=None,
-        help="Limit the number of documents to test (default: None)",
     )
     parser.add_argument(
         "--verbose",
@@ -662,7 +652,7 @@ def get_index_configs(
                 "num_neighbors": args.num_neighbors,
                 "num_leaves": args.num_leaves,
                 "num_leaves_to_search": args.num_leaves_to_search,
-                "verbose": True,
+                "verbose_level": "all",
                 "use_autopilot": args.use_autopilot,
                 "store_embeddings": True,  # Store embeddings for all indexes (so XTR indices can be used subsequently for ColBERT retrieval)
                 "index_folder": "indexes" if args.save_index else None,  # Save indices in the indexes directory
@@ -734,8 +724,6 @@ def test_index(
     save_runfile: bool = False,
     encode_batch_size: int = 2000,
     retrieval_batch_size: int = 1,
-    limit_queries: Optional[int] = None,
-    limit_documents: Optional[int] = None,
     shard_size: Optional[int] = None,
     cache_embeddings: Optional[bool] = None,
     cache_dir: Optional[str] = None,
@@ -797,10 +785,9 @@ def test_index(
     print(f"{index_name} retrieval time: {retrieve_time:.2f} seconds")
     
     # Remove query_id from scores, needed for FiQA dataset
-    for (query_id, query), query_scores in zip(queries.items(), scores):
-        for score in query_scores:
-            if score["id"] == query_id:
-                query_scores.remove(score)
+    for query_id, query_scores in zip(queries.keys(), scores):
+        filtered_scores = [score for score in query_scores if score["id"] != query_id]
+        query_scores[:] = filtered_scores
     
     # Evaluate
     evaluation_scores = evaluation.evaluate(
@@ -841,8 +828,6 @@ def test_index(
             "retrieval_mode": retrieval_mode,
             "encode_batch_size": encode_batch_size,
             "retrieval_batch_size": retrieval_batch_size,
-            "limit_queries": limit_queries,
-            "limit_documents": limit_documents,
             "shard_size": shard_size,
             "cache_embeddings": cache_embeddings,
             "cache_dir": cache_dir,
@@ -865,7 +850,7 @@ def test_index(
         sanitized_dataset_name = sanitize_dataset_name(dataset_name)
         run_filename = (
             f"{sanitized_model_name}_{sanitized_dataset_name}_{index_name}_{retrieval_mode}"
-            f"_{model_dtype}_{embedding_dtype}_qlen{query_length}_dlen{doc_length}.json"
+            f"_{model_dtype}_{embedding_dtype}_qlen{query_length}_dlen{doc_length}_k{k}_ktoken{k_token}.json"
         )
         run_filepath = runfiles_dir / run_filename
         
@@ -1050,10 +1035,6 @@ def main() -> None:
         print(f"Testing {len(index_configs)} indexes: {args.index_types}")
         print(f"Index configurations: {index_configs}")
 
-        if args.limit_queries:
-            queries_embeddings = queries_embeddings[:args.limit_queries]
-        if args.limit_documents:
-            documents_embeddings = documents_embeddings[:args.limit_documents]
 
         print(f"Embedding size: {embedding_size}")
         print(f"Number of documents: {len(documents_ids)}")
@@ -1086,8 +1067,6 @@ def main() -> None:
                 save_runfile=args.save_runfile,
                 encode_batch_size=args.encode_batch_size,
                 retrieval_batch_size=args.retrieve_batch_size,
-                limit_queries=args.limit_queries,
-                limit_documents=args.limit_documents,
                 shard_size=args.shard_size,
                 cache_embeddings=args.cache_embeddings,
                 cache_dir=args.cache_dir,

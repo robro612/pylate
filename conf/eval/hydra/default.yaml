@@ -20,16 +20,6 @@ job_logging:
     handlers: [console]
 hydra_logging:
   version: 1
-  disable_existing_loggers: false
-  formatters:
-    simple:
-      format: "[%(asctime)s] %(message)s"
-      datefmt: "%H:%M:%S"
-  handlers:
-    console:
-      class: logging.StreamHandler
-      formatter: simple
-      stream: ext://sys.stdout
+  disable_existing_loggers: true
   root:
-    level: INFO
-    handlers: [console]
+    handlers: []
