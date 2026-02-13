@@ -18,6 +18,8 @@ import pandas as pd
 
 from pylate import evaluation, indexes, models, retrieve
 from pylate.models import ColBERT
+from pylate.models.ProxyAttentionColBERT import ProxyAttentionColBERT
+from pylate.models.ConstBERT import ConstBERT
 from pylate.models.compression import (
     CompressionConfig,
     IDFPruningConfig,
@@ -84,6 +86,7 @@ def _encode_worker(
     batch_size: int,
     result_queue: mp.Queue,
     worker_idx: int,
+    model_type: str = "ColBERT",
 ) -> None:
     """Worker function for multi-GPU encoding. Runs in a separate process."""
     # Set the device for this worker
@@ -91,15 +94,27 @@ def _encode_worker(
 
     # Import and load model in this process
     from pylate import models
-    model = models.ColBERT(
-        model_name_or_path=model_name,
-        document_length=document_length,
-        query_length=query_length,
-        trust_remote_code=True,
-        device=device,
-    )
+    from pylate.models.ConstBERT import ConstBERT
+
+    if model_type == "ConstBERT":
+        model = ConstBERT.load(path=model_name, document_length=document_length)
+        model = model.to(device)
+    else:
+        model = models.ColBERT(
+            model_name_or_path=model_name,
+            document_length=document_length,
+            query_length=query_length,
+            trust_remote_code=True,
+            device=device,
+        )
 
     # Encode documents
+    # For ConstBERT, don't request attention scores since compression is via learned projection
+    if model_type == "ConstBERT":
+        extra_artifacts = {"input_ids": True, "attention_scores": False}
+    else:
+        extra_artifacts = {"input_ids": True, "attention_scores": True}
+
     embeddings, artifacts = model.encode(
         sentences=sentences,
         batch_size=batch_size,
@@ -107,7 +122,7 @@ def _encode_worker(
         show_progress_bar=True,
         convert_to_tensor=False,  # Keep as numpy for pickling
         normalize_embeddings=False,
-        return_extra_artifacts={"input_ids": True, "attention_scores": True},
+        return_extra_artifacts=extra_artifacts,
     )
 
     # Convert tensors to CPU numpy for pickling
@@ -136,6 +151,7 @@ def encode_multi_gpu(
     sentences: list[str],
     batch_size: int,
     num_gpus: int | None = None,
+    model_type: str = "ColBERT",
 ) -> tuple[list, dict]:
     """
     Encode documents using multiple GPUs in parallel.
@@ -154,6 +170,8 @@ def encode_multi_gpu(
         Batch size for encoding
     num_gpus : int | None
         Number of GPUs to use. If None, uses all available GPUs.
+    model_type : str
+        Type of model: "ColBERT" or "ConstBERT"
 
     Returns
     -------
@@ -166,12 +184,17 @@ def encode_multi_gpu(
     if num_gpus <= 1:
         # Fall back to single GPU encoding
         from pylate import models
-        model = models.ColBERT(
-            model_name_or_path=model_name,
-            document_length=document_length,
-            query_length=query_length,
-            trust_remote_code=True,
-        )
+        if model_type == "ConstBERT":
+            model = ConstBERT.load(path=model_name, document_length=document_length)
+            extra_artifacts = {"input_ids": True, "attention_scores": False}
+        else:
+            model = models.ColBERT(
+                model_name_or_path=model_name,
+                document_length=document_length,
+                query_length=query_length,
+                trust_remote_code=True,
+            )
+            extra_artifacts = {"input_ids": True, "attention_scores": True}
         return model.encode(
             sentences=sentences,
             batch_size=batch_size,
@@ -179,7 +202,7 @@ def encode_multi_gpu(
             show_progress_bar=True,
             convert_to_tensor=True,
             normalize_embeddings=False,
-            return_extra_artifacts={"input_ids": True, "attention_scores": True},
+            return_extra_artifacts=extra_artifacts,
         )
 
     print(f"  Using {num_gpus} GPUs for parallel encoding")
@@ -201,7 +224,7 @@ def encode_multi_gpu(
     for i, chunk in enumerate(chunks):
         p = ctx.Process(
             target=_encode_worker,
-            args=(i, model_name, document_length, query_length, chunk, batch_size, result_queue, i),
+            args=(i, model_name, document_length, query_length, chunk, batch_size, result_queue, i, model_type),
         )
         p.start()
         processes.append(p)
@@ -231,29 +254,262 @@ def encode_multi_gpu(
     return all_embeddings, all_artifacts
 
 
-def load_model(model_name: str, dataset_name: str, document_length: int | None = None) -> ColBERT:
+def is_proxy_attention_model(model_path: str) -> bool:
     """
-    Load and initialize the ColBERT model.
+    Check if a model path contains a ProxyAttentionColBERT model.
+
+    Checks for config.yaml with model.type == "proxy_attention" or
+    config_sentence_transformers.json with proxy_attention_params.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the model directory
+
+    Returns
+    -------
+    bool
+        True if the model is a ProxyAttentionColBERT
+    """
+    model_path = Path(model_path)
+
+    # Check config.yaml (training config)
+    config_yaml_path = model_path / "config.yaml"
+    if config_yaml_path.exists():
+        try:
+            import yaml
+            with open(config_yaml_path, "r") as f:
+                config = yaml.safe_load(f)
+            if config.get("model", {}).get("type") == "proxy_attention":
+                return True
+        except Exception:
+            pass
+
+    # Check config_sentence_transformers.json (saved model config)
+    config_st_path = model_path / "config_sentence_transformers.json"
+    if config_st_path.exists():
+        try:
+            with open(config_st_path, "r") as f:
+                config = json.load(f)
+            if "proxy_attention_params" in config:
+                return True
+        except Exception:
+            pass
+
+    # Check for proxy_embeddings directory (definitive sign of ProxyAttentionColBERT)
+    if (model_path / "proxy_embeddings").exists():
+        return True
+
+    return False
+
+
+def get_proxy_attention_config(model_path: str) -> dict:
+    """
+    Get ProxyAttentionColBERT configuration from model path.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the model directory
+
+    Returns
+    -------
+    dict
+        Configuration with num_proxy_tokens, num_select_tokens, etc.
+    """
+    model_path = Path(model_path)
+
+    # Try config.yaml first (training config)
+    config_yaml_path = model_path / "config.yaml"
+    if config_yaml_path.exists():
+        try:
+            import yaml
+            with open(config_yaml_path, "r") as f:
+                config = yaml.safe_load(f)
+            variant_args = config.get("model", {}).get("variant_args", {})
+            return {
+                "num_proxy_tokens": variant_args.get("num_proxy_tokens", 32),
+                "num_select_tokens": variant_args.get("num_select_tokens", 32),
+                "use_cluster_pooling": variant_args.get("use_cluster_pooling", True),
+                "proxy_tau": variant_args.get("proxy_tau", 1.0),
+            }
+        except Exception:
+            pass
+
+    # Try config_sentence_transformers.json
+    config_st_path = model_path / "config_sentence_transformers.json"
+    if config_st_path.exists():
+        try:
+            with open(config_st_path, "r") as f:
+                config = json.load(f)
+            proxy_params = config.get("proxy_attention_params", {})
+            return {
+                "num_proxy_tokens": proxy_params.get("num_proxy_tokens", 32),
+                "num_select_tokens": proxy_params.get("num_select_tokens", 32),
+                "use_cluster_pooling": proxy_params.get("use_cluster_pooling", True),
+                "proxy_tau": proxy_params.get("proxy_tau", 1.0),
+            }
+        except Exception:
+            pass
+
+    # Default values
+    return {
+        "num_proxy_tokens": 32,
+        "num_select_tokens": 32,
+        "use_cluster_pooling": True,
+        "proxy_tau": 1.0,
+    }
+
+
+def is_constbert_model(model_path: str) -> bool:
+    """
+    Check if a model path contains a ConstBERT model.
+
+    Checks for config_sentence_transformers.json with model_type == "ConstBERT"
+    or constbert_variant/constbert_seq_length parameters.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the model directory
+
+    Returns
+    -------
+    bool
+        True if the model is a ConstBERT model
+    """
+    model_path = Path(model_path)
+
+    # Check config_sentence_transformers.json
+    config_st_path = model_path / "config_sentence_transformers.json"
+    if config_st_path.exists():
+        try:
+            with open(config_st_path, "r") as f:
+                config = json.load(f)
+            # Check for model_type == "ConstBERT"
+            if config.get("model_type") == "ConstBERT":
+                return True
+            # Check for constbert_variant or constbert_seq_length
+            if "constbert_variant" in config or "constbert_seq_length" in config:
+                return True
+        except Exception:
+            pass
+
+    # Check for constbert_projection directory (definitive sign of ConstBERT)
+    if (model_path / "constbert_projection").exists():
+        return True
+
+    return False
+
+
+def get_constbert_config(model_path: str) -> dict:
+    """
+    Get ConstBERT configuration from model path.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the model directory
+
+    Returns
+    -------
+    dict
+        Configuration with constbert_variant, constbert_seq_length, etc.
+    """
+    model_path = Path(model_path)
+
+    # Try config_sentence_transformers.json
+    config_st_path = model_path / "config_sentence_transformers.json"
+    if config_st_path.exists():
+        try:
+            with open(config_st_path, "r") as f:
+                config = json.load(f)
+            return {
+                "constbert_variant": config.get("constbert_variant", "flatten"),
+                "constbert_seq_length": config.get("constbert_seq_length", 32),
+                "document_length": config.get("document_length", 300),
+            }
+        except Exception:
+            pass
+
+    # Default values
+    return {
+        "constbert_variant": "flatten",
+        "constbert_seq_length": 32,
+        "document_length": 300,
+    }
+
+
+def load_model(
+    model_name: str,
+    dataset_name: str,
+    document_length: int | None = None,
+    num_select_tokens: int | None = None,
+) -> ColBERT | ProxyAttentionColBERT | ConstBERT:
+    """
+    Load and initialize the ColBERT, ProxyAttentionColBERT, or ConstBERT model.
 
     Parameters
     ----------
     model_name : str
         Name/path of the model to load
-    document_length : int | None
-        Maximum document length. If None, uses model's max length.
     dataset_name : str
         Dataset name to determine query length
+    document_length : int | None
+        Maximum document length. If None, uses model's max length.
+    num_select_tokens : int | None
+        For ProxyAttentionColBERT, override the number of tokens to select.
+        If None, uses the model's default.
 
     Returns
     -------
-    ColBERT
+    ColBERT | ProxyAttentionColBERT | ConstBERT
         Initialized model
     """
     print("\n" + "=" * 80)
     print("Loading model...")
     print("=" * 80)
 
-    # First load model to get its max_length if document_length not specified
+    # Check if this is a ConstBERT model
+    if is_constbert_model(model_name):
+        print(f"  Detected ConstBERT model")
+        constbert_config = get_constbert_config(model_name)
+        print(f"  ConstBERT config: {constbert_config}")
+
+        load_kwargs = {"document_length": document_length or 300}
+        model = ConstBERT.load(path=model_name, **load_kwargs)
+
+        print(f"✓ Loaded ConstBERT: {model_name}")
+        print(f"  Document length: {model.document_length}")
+        print(f"  Query length: {model.query_length}")
+        print(f"  Variant: {model.projection_variant}")
+        print(f"  Output seq length: {model.constbert_seq_length}")
+
+        return model
+
+    # Check if this is a ProxyAttentionColBERT model
+    if is_proxy_attention_model(model_name):
+        print(f"  Detected ProxyAttentionColBERT model")
+        proxy_config = get_proxy_attention_config(model_name)
+        print(f"  Proxy config: {proxy_config}")
+
+        # Override num_select_tokens if specified
+        load_kwargs = {"document_length": document_length or 300}
+        if num_select_tokens is not None:
+            load_kwargs["num_select_tokens"] = num_select_tokens
+            print(f"  Overriding num_select_tokens: {num_select_tokens}")
+
+        model = ProxyAttentionColBERT.load(path=model_name, **load_kwargs)
+
+        print(f"✓ Loaded ProxyAttentionColBERT: {model_name}")
+        print(f"  Document length: {model.document_length}")
+        print(f"  Query length: {model.query_length}")
+        print(f"  Num proxy tokens: {model.num_proxy_tokens}")
+        print(f"  Num select tokens: {model.num_select_tokens}")
+
+        return model
+
+    # Standard ColBERT loading
     if document_length is None:
         # Load tokenizer to get max_length
         from transformers import AutoTokenizer
@@ -698,7 +954,7 @@ def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[Com
 
 def print_experiment_statistics(
     stats: dict[str, Any],
-    configs: list[CompressionConfig | None],
+    configs: list[CompressionConfig | None] | list[int],
 ) -> None:
     """
     Print experiment statistics.
@@ -708,7 +964,7 @@ def print_experiment_statistics(
     stats : dict
         Statistics dictionary with keys: num_documents, encoding_time, config_token_counts, avg_tokens_per_doc
     configs : list
-        List of compression configs
+        List of compression configs (or list of int for ProxyAttentionColBERT num_select_tokens)
     """
     print("\n" + "=" * 80)
     print("EXPERIMENT STATISTICS")
@@ -721,7 +977,13 @@ def print_experiment_statistics(
     # Create DataFrame for token counts
     data = []
     for i, config in enumerate(configs):
-        config_name = config.description if config else "Baseline"
+        # Handle both compression configs and proxy num_select_tokens (int)
+        if isinstance(config, int):
+            config_name = f"ProxyAttention num_select={config}"
+        elif config is None:
+            config_name = "Baseline"
+        else:
+            config_name = config.description
         data.append(
             {
                 "Config": config_name,
@@ -1160,6 +1422,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of GPUs to use for multi-GPU encoding. If not specified, uses all available GPUs.",
     )
+    parser.add_argument(
+        "--num_select_tokens",
+        type=str,
+        default=None,
+        help="For ProxyAttentionColBERT: comma-separated list of num_select_tokens values to evaluate (e.g., '8,16,24,32'). If not specified, uses default values.",
+    )
     return parser.parse_args()
 
 
@@ -1168,11 +1436,42 @@ def main() -> None:
     args = parse_args()
     overall_start = time.time()
 
-    # Load model
-    model: ColBERT = load_model(args.model_name, args.dataset_name, args.document_length)
+    # Check if this is a ProxyAttentionColBERT or ConstBERT model
+    is_proxy_model = is_proxy_attention_model(args.model_name)
+    is_constbert = is_constbert_model(args.model_name)
+    proxy_config = None
+    constbert_config = None
+    num_select_values = None
 
-    # Load dataset
+    if is_constbert:
+        constbert_config = get_constbert_config(args.model_name)
+        print("\n" + "=" * 80)
+        print("CONSTBERT EXPERIMENT")
+        print("=" * 80)
+        print(f"Model: {args.model_name}")
+        print(f"Variant: {constbert_config['constbert_variant']}")
+        print(f"Fixed output seq length: {constbert_config['constbert_seq_length']}")
+    elif is_proxy_model:
+        proxy_config = get_proxy_attention_config(args.model_name)
+        # Parse num_select_tokens values
+        if args.num_select_tokens:
+            num_select_values = [int(x.strip()) for x in args.num_select_tokens.split(",")]
+        else:
+            num_select_values = [4, 8, 12, 16, 20, 24, 28, 32]
+        print("\n" + "=" * 80)
+        print("PROXY ATTENTION COLBERT EXPERIMENT")
+        print("=" * 80)
+        print(f"Model: {args.model_name}")
+        print(f"Testing num_select_tokens values: {num_select_values}")
+        print(f"Num proxy tokens (fixed): {proxy_config['num_proxy_tokens']}")
+
+    # Load dataset first (needed for both model types)
     documents, queries, qrels = load_dataset(args.dataset_name)
+
+    # Load model (for standard ColBERT and ConstBERT, load once; for proxy, we'll reload per config)
+    model = None
+    if not is_proxy_model:
+        model = load_model(args.model_name, args.dataset_name, args.document_length)
 
     # Set up experiment output directory and results file path
     if args.append_to:
@@ -1187,7 +1486,33 @@ def main() -> None:
         print(f"\n✓ Appending to existing results file: {results_jsonl_path}")
     else:
         # Normal mode: create new experiment
-        model_dir = sanitize_name(args.model_name.split("/")[-1])
+        if is_constbert:
+            # For ConstBERT, create a descriptive name
+            # Format: ConstBERT-{variant}-C{seq_length}
+            variant = constbert_config.get("constbert_variant", "flatten")
+            seq_len = constbert_config.get("constbert_seq_length", 32)
+            model_dir = sanitize_name(f"ConstBERT-{variant}-C{seq_len}")
+        elif is_proxy_model:
+            # For ProxyAttentionColBERT, create a more descriptive name
+            # Format: ProxyAttention-P{num_proxy}-{base_model_name}
+            num_proxy = proxy_config.get("num_proxy_tokens", 32)
+            # Try to extract base model name from the training config
+            base_model_name = "GTE-ModernColBERT"  # default
+            config_yaml_path = Path(args.model_name) / "config.yaml"
+            if config_yaml_path.exists():
+                try:
+                    import yaml
+                    with open(config_yaml_path, "r") as f:
+                        train_config = yaml.safe_load(f)
+                    base_model = train_config.get("model", {}).get("model_name_or_path", "")
+                    if base_model:
+                        # Extract short name from full path (e.g., "lightonai/GTE-ModernColBERT-v1" -> "GTE-ModernColBERT-v1")
+                        base_model_name = base_model.split("/")[-1]
+                except Exception:
+                    pass
+            model_dir = sanitize_name(f"ProxyAttention-P{num_proxy}-{base_model_name}")
+        else:
+            model_dir = sanitize_name(args.model_name.split("/")[-1])
         dataset_dir = sanitize_name(args.dataset_name)
         if args.experiment_output_dir is None:
             experiment_output_dir = (
@@ -1204,72 +1529,108 @@ def main() -> None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_jsonl_path = experiment_output_dir / f"results_{run_id}.jsonl"
 
-    # Load compression configs
+    # Load compression configs (or create configs for ProxyAttentionColBERT/ConstBERT)
     print("\n" + "=" * 80)
     print("Loading compression configurations...")
     print("=" * 80)
-    if args.configs_file:
-        configs = load_configs_from_jsonl(Path(args.configs_file), model)
-        print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
+
+    if is_constbert:
+        # For ConstBERT, there's only one config - the fixed output length
+        # No compression configs needed - model outputs fixed length directly
+        configs = [None]  # Single baseline config
+        print(f"✓ ConstBERT: Single config (fixed output length = {constbert_config['constbert_seq_length']})")
+        print("\nConfigurations:")
+        print(f"  [0] ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)")
+    elif is_proxy_model:
+        # For ProxyAttentionColBERT, configs are num_select_tokens values
+        configs = num_select_values  # List of integers
+        print(f"✓ Created {len(configs)} ProxyAttention configs (num_select_tokens values)")
+        print("\nConfigurations:")
+        for i, num_select in enumerate(configs):
+            print(f"  [{i}] ProxyAttention num_select={num_select}")
     else:
-        configs = create_default_configs(model, kmeans_gpu=args.kmeans_gpu)
-        print(f"✓ Created {len(configs)} default configs")
-        if args.kmeans_gpu:
-            print("  (GPU enabled for spherical pooling kmeans)")
-    
-    print("\nConfigurations:")
-    for i, config in enumerate(configs):
-        if config is None:
-            print(f"  [{i}] Baseline (no compression)")
+        if args.configs_file:
+            configs = load_configs_from_jsonl(Path(args.configs_file), model)
+            print(f"✓ Loaded {len(configs)} configs from {args.configs_file}")
         else:
-            print(f"  [{i}] {config.description}")
+            configs = create_default_configs(model, kmeans_gpu=args.kmeans_gpu)
+            print(f"✓ Created {len(configs)} default configs")
+            if args.kmeans_gpu:
+                print("  (GPU enabled for spherical pooling kmeans)")
 
-    # Encode documents once with artifacts (input_ids needed for IDF pruning)
-    # Use normalize_embeddings=False to get unnormalized embeddings for importance scoring
-    print("\n" + "=" * 80)
-    print("Encoding documents (unnormalized for importance scoring)...")
-    print("=" * 80)
-    encoding_start = time.time()
+        print("\nConfigurations:")
+        for i, config in enumerate(configs):
+            if config is None:
+                print(f"  [{i}] Baseline (no compression)")
+            else:
+                print(f"  [{i}] {config.description}")
 
-    if args.multi_gpu:
-        # Multi-GPU encoding: spawn separate processes for each GPU
-        documents_embeddings, artifacts = encode_multi_gpu(
-            model_name=args.model_name,
-            document_length=model.document_length,
-            query_length=model.query_length,
-            sentences=[document["text"] for document in documents],
-            batch_size=args.batch_size,
-            num_gpus=args.num_gpus,
-        )
-    else:
-        # Single GPU encoding
-        documents_embeddings, artifacts = model.encode(
-            sentences=[document["text"] for document in documents],
-            batch_size=args.batch_size,
-            is_query=False,
+    # For standard ColBERT and ConstBERT: encode documents once upfront
+    # For ProxyAttentionColBERT: encoding happens per-config (inside the loop)
+    documents_embeddings = None
+    artifacts = None
+    queries_embeddings = None
+    encoding_time = 0
+    query_encoding_time = 0
+
+    if not is_proxy_model:  # This includes ConstBERT (encodes once)
+        # Encode documents once with artifacts (input_ids needed for IDF pruning)
+        # Use normalize_embeddings=False to get unnormalized embeddings for importance scoring
+        print("\n" + "=" * 80)
+        print("Encoding documents (unnormalized for importance scoring)...")
+        print("=" * 80)
+        encoding_start = time.time()
+
+        if args.multi_gpu:
+            # Multi-GPU encoding: spawn separate processes for each GPU
+            # Determine model type for multi-GPU encoding
+            if is_constbert:
+                multi_gpu_model_type = "ConstBERT"
+            else:
+                multi_gpu_model_type = "ColBERT"
+            documents_embeddings, artifacts = encode_multi_gpu(
+                model_name=args.model_name,
+                document_length=model.document_length,
+                query_length=model.query_length,
+                sentences=[document["text"] for document in documents],
+                batch_size=args.batch_size,
+                num_gpus=args.num_gpus,
+                model_type=multi_gpu_model_type,
+            )
+        else:
+            # Single GPU encoding
+            # For ConstBERT, don't request attention scores since compression is via learned projection
+            if is_constbert:
+                single_gpu_artifacts = {"input_ids": True, "attention_scores": False}
+            else:
+                single_gpu_artifacts = {"input_ids": True, "attention_scores": True}
+            documents_embeddings, artifacts = model.encode(
+                sentences=[document["text"] for document in documents],
+                batch_size=args.batch_size,
+                is_query=False,
+                show_progress_bar=True,
+                convert_to_tensor=True,
+                normalize_embeddings=False,  # Keep unnormalized for importance scoring
+                return_extra_artifacts=single_gpu_artifacts,
+            )
+
+        encoding_time = time.time() - encoding_start
+        print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
+        print(f"   Embeddings are UNNORMALIZED (for importance-based compression)")
+
+        # Encode queries once
+        print("\n" + "=" * 80)
+        print("Encoding queries...")
+        print("=" * 80)
+        query_encoding_start = time.time()
+        queries_embeddings = model.encode(
+            sentences=list(queries.values()),
+            is_query=True,
             show_progress_bar=True,
+            batch_size=512,
             convert_to_tensor=True,
-            normalize_embeddings=False,  # Keep unnormalized for importance scoring
-            return_extra_artifacts={"input_ids": True, "attention_scores": True},
         )
-
-    encoding_time = time.time() - encoding_start
-    print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
-    print(f"   Embeddings are UNNORMALIZED (for importance-based compression)")
-
-    # Encode queries once
-    print("\n" + "=" * 80)
-    print("Encoding queries...")
-    print("=" * 80)
-    query_encoding_start = time.time()
-    queries_embeddings = model.encode(
-        sentences=list(queries.values()),
-        is_query=True,
-        show_progress_bar=True,
-        batch_size=512,
-        convert_to_tensor=True,
-    )
-    query_encoding_time = time.time() - query_encoding_start
+        query_encoding_time = time.time() - query_encoding_start
 
     # Track statistics
     stats = {
@@ -1284,11 +1645,20 @@ def main() -> None:
 
     # Write initial metadata only if not appending to existing file
     if not args.append_to:
+        # Determine model type
+        if is_constbert:
+            model_type = "ConstBERT"
+        elif is_proxy_model:
+            model_type = "ProxyAttentionColBERT"
+        else:
+            model_type = "ColBERT"
+
         metadata_entry = {
             "type": "metadata",
             "run_id": run_id,
             "timestamp": datetime.now().isoformat(),
             "model_name": args.model_name,
+            "model_type": model_type,
             "dataset_name": args.dataset_name,
             "num_documents": stats.get("num_documents"),
             "num_configs": len(configs),
@@ -1303,8 +1673,14 @@ def main() -> None:
                 "query_encoding_time": stats.get("query_encoding_time"),
                 "total_time": None,  # filled in after all configs
             },
-            "configs": [serialize_config_for_storage(config) for config in configs],
         }
+        if is_constbert:
+            metadata_entry["constbert_config"] = constbert_config
+        elif is_proxy_model:
+            metadata_entry["proxy_config"] = proxy_config
+            metadata_entry["num_select_values"] = num_select_values
+        else:
+            metadata_entry["configs"] = [serialize_config_for_storage(config) for config in configs]
         with open(results_jsonl_path, "w") as f:
             f.write(json.dumps(metadata_entry, default=str) + "\n")
 
@@ -1330,7 +1706,12 @@ def main() -> None:
     for config_idx, config in enumerate(configs):
         # Skip configs if --skip is specified (for resuming experiments)
         if config_idx < args.skip:
-            config_name = "Baseline (no compression)" if config is None else config.description
+            if is_constbert:
+                config_name = f"ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)"
+            elif is_proxy_model:
+                config_name = f"ProxyAttention num_select={config}"
+            else:
+                config_name = "Baseline (no compression)" if config is None else config.description
             print(f"\n[{config_idx}] Skipping: {config_name}")
             # Add placeholder stats for skipped configs
             stats["config_token_counts"].append(0)
@@ -1340,45 +1721,107 @@ def main() -> None:
 
         compression_start = time.time()
 
-        # Apply compression if config is not None (baseline)
-        if config is None:
-            # Baseline: normalize the unnormalized embeddings
-            import torch.nn.functional as F
-            compressed_embeddings = [
-                F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings
-            ]
-        else:
-            compressor = config.create_compressor()
+        if is_constbert:
+            # For ConstBERT: model encodes once with fixed output length
+            # No compression - just use the pre-encoded embeddings
+            config_name = f"ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)"
+            print(f"\n[{config_idx}] Evaluating: {config_name}")
 
-            # Compress with unnormalized embeddings (for importance scoring)
-            compressed_embeddings, _ = compressor.compress_parallel(
-                embeddings=documents_embeddings,
-                artifacts=artifacts,
-                batch_size=args.batch_size,
-                num_workers=8,
-                show_progress=True,
+            # ConstBERT embeddings are already normalized during encoding
+            compressed_embeddings = documents_embeddings
+            compression_time = 0  # No compression step needed
+
+        elif is_proxy_model:
+            # For ProxyAttentionColBERT: config is num_select_tokens (int)
+            num_select = config
+            config_name = f"ProxyAttention num_select={num_select}"
+
+            print(f"\n[{config_idx}] Evaluating: {config_name}")
+
+            # Load model with this num_select_tokens value
+            model = load_model(
+                args.model_name,
+                args.dataset_name,
+                args.document_length,
+                num_select_tokens=num_select,
             )
 
-            # Normalize embeddings AFTER compression
-            import torch.nn.functional as F
-            compressed_embeddings = [
-                F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
-            ]
+            # Encode documents (compression happens during encoding)
+            print("\nEncoding documents...")
+            encoding_start = time.time()
+            current_documents_embeddings = model.encode(
+                sentences=[document["text"] for document in documents],
+                batch_size=args.batch_size,
+                is_query=False,
+                show_progress_bar=True,
+                convert_to_tensor=True,
+            )
+            config_encoding_time = time.time() - encoding_start
+            print(f"✓ Encoded {len(current_documents_embeddings)} documents in {config_encoding_time:.3f}s")
 
-        compression_time = time.time() - compression_start
-        
+            # Update stats encoding time for first config
+            if config_idx == 0 or stats["encoding_time"] == 0:
+                stats["encoding_time"] = config_encoding_time
+
+            # Encode queries (only once, reuse for all configs)
+            if queries_embeddings is None:
+                print("\nEncoding queries...")
+                query_encoding_start = time.time()
+                queries_embeddings = model.encode(
+                    sentences=list(queries.values()),
+                    is_query=True,
+                    show_progress_bar=True,
+                    batch_size=512,
+                    convert_to_tensor=True,
+                )
+                stats["query_encoding_time"] = time.time() - query_encoding_start
+
+            compressed_embeddings = current_documents_embeddings
+            compression_time = config_encoding_time  # For proxy models, encoding IS compression
+
+            # Clean up model to free GPU memory for next iteration
+            del model
+            torch.cuda.empty_cache()
+        else:
+            # Standard ColBERT: apply compression config to pre-encoded embeddings
+            if config is None:
+                # Baseline: normalize the unnormalized embeddings
+                import torch.nn.functional as F
+                compressed_embeddings = [
+                    F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings
+                ]
+            else:
+                compressor = config.create_compressor()
+
+                # Compress with unnormalized embeddings (for importance scoring)
+                compressed_embeddings, _ = compressor.compress_parallel(
+                    embeddings=documents_embeddings,
+                    artifacts=artifacts,
+                    batch_size=args.batch_size,
+                    num_workers=8,
+                    show_progress=True,
+                )
+
+                # Normalize embeddings AFTER compression
+                import torch.nn.functional as F
+                compressed_embeddings = [
+                    F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
+                ]
+
+            compression_time = time.time() - compression_start
+
         # Calculate token statistics
         num_tokens = sum(len(emb) for emb in compressed_embeddings)
         avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
-        
+
         stats["config_token_counts"].append(num_tokens)
         stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
         stats["compression_times"].append(compression_time)
-        
+
         # Evaluate this config
         result = evaluate_config(
             config_idx=config_idx,
-            config=config,
+            config=None if is_proxy_model else config,  # Pass None for proxy models
             documents_embeddings=compressed_embeddings,
             documents=documents,
             queries=queries,
@@ -1395,24 +1838,34 @@ def main() -> None:
             save_retrieval_results=args.save_retrieval_results,
             retrieval_results_output_dir=retrieval_results_output_dir,
         )
+
+        # Override config_name for ConstBERT and proxy models
+        if is_constbert or is_proxy_model:
+            result["config_name"] = config_name
+
         all_evaluation_results.append(result)
         # Stream the result to disk immediately
+        result_entry = {
+            "type": "result",
+            "run_id": run_id,
+            "config_idx": result["config_idx"],
+            "config_name": result["config_name"],
+            "token_count": result["token_count"],
+            "avg_tokens_per_doc": result["avg_tokens_per_doc"],
+            "compression_time": stats["compression_times"][config_idx],
+            "metrics": result["evaluation"],
+            "runfile_path": result.get("runfile_path"),
+        }
+        if is_constbert:
+            result_entry["constbert_variant"] = constbert_config["constbert_variant"]
+            result_entry["constbert_seq_length"] = constbert_config["constbert_seq_length"]
+        elif is_proxy_model:
+            result_entry["num_select_tokens"] = configs[result["config_idx"]]
+            result_entry["num_proxy_tokens"] = proxy_config["num_proxy_tokens"]
+        else:
+            result_entry["config"] = serialize_config_for_storage(configs[result["config_idx"]])
         with open(results_jsonl_path, "a") as f:
-            f.write(json.dumps(
-                {
-                    "type": "result",
-                    "run_id": run_id,
-                    "config_idx": result["config_idx"],
-                    "config_name": result["config_name"],
-                    "config": serialize_config_for_storage(configs[result["config_idx"]]),
-                    "token_count": result["token_count"],
-                    "avg_tokens_per_doc": result["avg_tokens_per_doc"],
-                    "compression_time": stats["compression_times"][config_idx],
-                    "metrics": result["evaluation"],
-                    "runfile_path": result.get("runfile_path"),
-                },
-                default=str,
-            ) + "\n")
+            f.write(json.dumps(result_entry, default=str) + "\n")
 
     stats["total_time"] = time.time() - overall_start
 
@@ -1432,21 +1885,23 @@ def main() -> None:
     with open(results_jsonl_path, "w") as f:
         f.write(json.dumps(final_metadata, default=str) + "\n")
         for result in all_evaluation_results:
-            f.write(json.dumps(
-                {
-                    "type": "result",
-                    "run_id": run_id,
-                    "config_idx": result["config_idx"],
-                    "config_name": result["config_name"],
-                    "config": serialize_config_for_storage(configs[result["config_idx"]]),
-                    "token_count": result["token_count"],
-                    "avg_tokens_per_doc": result["avg_tokens_per_doc"],
-                    "compression_time": stats["compression_times"][result["config_idx"]],
-                    "metrics": result["evaluation"],
-                    "runfile_path": result.get("runfile_path"),
-                },
-                default=str,
-            ) + "\n")
+            result_entry = {
+                "type": "result",
+                "run_id": run_id,
+                "config_idx": result["config_idx"],
+                "config_name": result["config_name"],
+                "token_count": result["token_count"],
+                "avg_tokens_per_doc": result["avg_tokens_per_doc"],
+                "compression_time": stats["compression_times"][result["config_idx"]],
+                "metrics": result["evaluation"],
+                "runfile_path": result.get("runfile_path"),
+            }
+            if is_proxy_model:
+                result_entry["num_select_tokens"] = configs[result["config_idx"]]
+                result_entry["num_proxy_tokens"] = proxy_config["num_proxy_tokens"]
+            else:
+                result_entry["config"] = serialize_config_for_storage(configs[result["config_idx"]])
+            f.write(json.dumps(result_entry, default=str) + "\n")
     
     # Create or update runfile manifest if saving runfiles
     if args.save_runfiles and runfile_output_dir is not None:

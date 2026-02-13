@@ -82,9 +82,10 @@ class Distillation(torch.nn.Module):
         queries_embeddings = torch.nn.functional.normalize(
             self.model(sentence_features[0], is_query=True)["token_embeddings"], p=2, dim=-1
         )
-        # Compute the bs * n_ways embeddings
+        # Compute the bs * n_ways embeddings and capture the model-aligned attention mask
+        doc_outputs = self.model(sentence_features[1], is_query=False)
         documents_embeddings = torch.nn.functional.normalize(
-            self.model(sentence_features[1], is_query=False)["token_embeddings"], p=2, dim=-1
+            doc_outputs["token_embeddings"], p=2, dim=-1
         )
 
         # Reshape them to (bs, n_ways)
@@ -108,10 +109,27 @@ class Distillation(torch.nn.Module):
         masks = extract_skiplist_mask(
             sentence_features=sentence_features, skiplist=skiplist
         )
-
-        documents_embeddings_mask = masks[1].view(
+        # Precompute skiplist-based document mask reshaped to (bs, n_ways, T?)
+        pre_doc_mask = masks[1].view(
             queries_embeddings.size(0), -1, *masks[1].shape[1:]
         )
+
+        # Prefer the model's output attention_mask (aligned to token_embeddings) when available.
+        # This is important for models that change token counts between input and output
+        # (e.g., ProxyAttention, MemoryToken), so the mask matches the embeddings' seq length.
+        if "attention_mask" in doc_outputs and doc_outputs["attention_mask"] is not None:
+            model_aligned_mask = doc_outputs["attention_mask"].view(
+                queries_embeddings.size(0), -1, *doc_outputs["attention_mask"].shape[1:]
+            )
+            # If shapes match, intersect with skiplist-based mask to preserve filtering
+            if model_aligned_mask.shape == pre_doc_mask.shape:
+                documents_embeddings_mask = (
+                    (model_aligned_mask > 0) & (pre_doc_mask > 0)
+                ).to(model_aligned_mask.dtype)
+            else:
+                documents_embeddings_mask = model_aligned_mask
+        else:
+            documents_embeddings_mask = pre_doc_mask
         scores = self.score_metric(
             queries_embeddings,
             documents_embeddings,

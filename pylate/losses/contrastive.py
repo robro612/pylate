@@ -143,11 +143,14 @@ class Contrastive(nn.Module):
             The labels for the contrastive loss. Not used in this implementation, but kept for compatibility with Trainer.
 
         """
-        embeddings = [
-            torch.nn.functional.normalize(
-                self.model(sentence_feature, is_query=(idx == 0))["token_embeddings"], p=2, dim=-1
-            )
+        # Encode once to get both embeddings and model-aligned attention masks
+        outputs = [
+            self.model(sentence_feature, is_query=(idx == 0))
             for idx, sentence_feature in enumerate(sentence_features)
+        ]
+        embeddings = [
+            torch.nn.functional.normalize(out["token_embeddings"], p=2, dim=-1)
+            for out in outputs
         ]
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (
@@ -187,15 +190,29 @@ class Contrastive(nn.Module):
             labels = labels + rank * batch_size
         # Note: the queries mask is not used, if added, take care that the expansion tokens are not masked from scoring (because they might be masked during encoding).
         # We might not need to compute the mask for queries but I let the logic there for now
+        # Prefer model output attention masks for documents (align with embeddings length).
+        doc_output_masks = [out.get("attention_mask", None) for out in outputs[1:]]
+        def _combine_masks(documents_masks, doc_mask):
+            if doc_mask is None:
+                return documents_masks
+            # Prefer model-aligned mask; intersect with skiplist mask when shapes match
+            if hasattr(doc_mask, 'shape') and hasattr(documents_masks, 'shape') and (
+                doc_mask.shape == documents_masks.shape
+            ):
+                return ((doc_mask > 0) & (documents_masks > 0)).to(doc_mask.dtype)
+            return doc_mask
+
         scores = torch.cat(
             [
                 self.score_metric(
                     embeddings[0],
                     group_embeddings,
                     queries_mask=masks[0] if not do_query_expansion else None,
-                    documents_mask=documents_masks,
+                    documents_mask=_combine_masks(documents_masks, doc_mask),
                 )
-                for group_embeddings, documents_masks in zip(embeddings[1:], masks[1:])
+                for group_embeddings, documents_masks, doc_mask in zip(
+                    embeddings[1:], masks[1:], doc_output_masks
+                )
             ],
             dim=1,
         )
