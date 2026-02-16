@@ -528,7 +528,7 @@ def create_default_configs(model: models.ColBERT) -> List[Optional[CompressionCo
     configs: List[Optional[CompressionConfig]] = [None]  # Baseline (no compression)
 
     # Random pruning and pooling baselines
-    for keep_ratio in [0.1, 0.2, 0.33, 0.5]:
+    for keep_ratio in [0.1, 0.2, 0.33, 0.5, 0.75]:
         # Random pruning
         rand_prune_cfg = RandomPruningConfig(
             keep_ratio=keep_ratio,
