@@ -1082,6 +1082,13 @@ def evaluate_config(
                 override=True,
                 index_name=config_index_name,
             )
+        case "scann":
+            config_index = indexes.ScaNN(
+                name=config_index_name,
+                override=True,
+                verbose_level="init",
+                store_embeddings=True,  # Required for reranking
+            )
         case _:
             raise ValueError(f"Invalid index type: {index_type}")
 
@@ -1351,7 +1358,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="plaid",
         help="Index type to use (default: 'plaid')",
-        choices=["flat", "plaid"],
+        choices=["flat", "plaid", "scann"],
     )
     parser.add_argument(
         "--experiment_output_dir",

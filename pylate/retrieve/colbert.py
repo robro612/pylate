@@ -6,7 +6,8 @@ import numpy as np
 import torch
 import time
 
-from ..indexes import PLAID, Voyager
+from ..indexes import PLAID
+from ..indexes.base import Base
 from ..rank import RerankResult, rerank
 from ..utils import iter_batch
 
@@ -93,7 +94,7 @@ class ColBERT:
 
     """
 
-    def __init__(self, index: Voyager | PLAID) -> None:
+    def __init__(self, index: Base) -> None:
         self.index = index
 
     def retrieve(
@@ -128,14 +129,14 @@ class ColBERT:
 
         """
         # PLAID index directly retrieves the documents
-        if isinstance(self.index, PLAID) or not isinstance(self.index, Voyager):
+        if isinstance(self.index, PLAID):
             return self.index(
                 queries_embeddings=queries_embeddings,
                 k=k,
                 subset=subset,
             )
 
-        # Other indexes first generate candidates by calling the index and then rerank them
+        # Other indexes (Voyager, ScaNN) first generate candidates by calling the index and then rerank them
         if k > k_token:
             logger.warning(
                 f"k ({k}) is greater than k_token ({k_token}), setting k_token to k."

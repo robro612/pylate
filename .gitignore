@@ -171,3 +171,8 @@ pylate-index/*
 
 # experimental results / dev artifacts
 results/
+evaluation_results/
+logs/
+
+# hydra config
+.hydra/
