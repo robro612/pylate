@@ -1072,6 +1072,8 @@ def evaluate_config(
     run_id: str | None = None,
     save_retrieval_results: bool = False,
     retrieval_results_output_dir: Path | None = None,
+    plaid_nbits: int = 4,
+    plaid_devices: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate a single compression configuration.
@@ -1113,6 +1115,10 @@ def evaluate_config(
         Whether to save the raw retrieval results (all scores). Defaults to False.
     retrieval_results_output_dir : Path | None, optional
         Directory to save retrieval results. Required if save_retrieval_results is True.
+    plaid_nbits : int, optional
+        Number of bits for PLAID index quantization (default: 4)
+    plaid_devices : list[str] | None, optional
+        Devices for PLAID index (default: ["cuda"])
 
     Returns
     -------
@@ -1137,6 +1143,8 @@ def evaluate_config(
             config_index = indexes.PLAID(
                 override=True,
                 index_name=config_index_name,
+                nbits=plaid_nbits,
+                devices=plaid_devices if plaid_devices is not None else ["cuda"],
             )
         case "scann":
             config_index = indexes.ScaNN(
@@ -1164,7 +1172,7 @@ def evaluate_config(
 
     # Retrieve
     retriever = retrieve.ColBERT(index=config_index)
-    scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+    scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=100)
 
     # Remove query_id from scores, needed for FiQA dataset
     for (query_id, query), query_scores in zip(queries.items(), scores):
@@ -1505,6 +1513,19 @@ def parse_args() -> argparse.Namespace:
         default="fp32",
         choices=["fp32", "fp16", "bf16"],
         help="Model dtype for loading (default: 'fp32'). Options: 'fp32' (float32), 'fp16' (float16), 'bf16' (bfloat16).",
+    )
+    parser.add_argument(
+        "--plaid_nbits",
+        type=int,
+        default=4,
+        help="Number of bits for PLAID index quantization (default: 4)",
+    )
+    parser.add_argument(
+        "--plaid_devices",
+        type=str,
+        nargs="+",
+        default=["cuda"],
+        help="Devices for PLAID index (default: ['cuda']). Can specify multiple devices.",
     )
     return parser.parse_args()
 
@@ -1918,6 +1939,8 @@ def main() -> None:
             run_id=run_id,
             save_retrieval_results=args.save_retrieval_results,
             retrieval_results_output_dir=retrieval_results_output_dir,
+            plaid_nbits=args.plaid_nbits,
+            plaid_devices=args.plaid_devices,
         )
 
         # Override config_name for ConstBERT and proxy models
