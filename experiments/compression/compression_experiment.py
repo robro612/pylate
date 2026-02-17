@@ -1054,6 +1054,277 @@ def print_experiment_statistics(
     print()
 
 
+def evaluate_config_with_shards(
+    config_idx: int,
+    config: CompressionConfig | None,
+    shard_files: list[Path],
+    documents: list[dict],
+    queries: dict,
+    qrels: dict,
+    queries_embeddings: list,
+    dataset_name: str,
+    model_name: str,
+    index_type: str,
+    stats: dict[str, Any],
+    nbits: int = 2,
+    compression_batch_size: int = 1000,
+    global_idf_stats: tuple[dict[int, float], int] | None = None,
+    metrics: list[str] | None = None,
+    save_runfile: bool = False,
+    runfile_output_dir: Path | None = None,
+    run_id: str | None = None,
+    save_retrieval_results: bool = False,
+    retrieval_results_output_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Evaluate a compression config using sharded inputs.
+
+    Loads shards iteratively, compresses each shard, and builds the index incrementally.
+
+    Parameters
+    ----------
+    config_idx : int
+        Index of the configuration
+    config : CompressionConfig | None
+        Compression configuration (None for baseline)
+    shard_files : list[Path]
+        List of shard file paths
+    documents : list[dict]
+        Original documents (for document IDs)
+    queries : dict
+        Query dictionary
+    qrels : dict
+        Query relevance judgments
+    queries_embeddings : list
+        Encoded query embeddings
+    dataset_name : str
+        Dataset name
+    model_name : str
+        Model name
+    index_type : str
+        Type of index ("flat", "plaid", "scann", "faiss_ivfpq")
+    stats : dict
+        Experiment statistics
+    compression_batch_size : int
+        Batch size for compression (default: 1000)
+    global_idf_stats : tuple[dict[int, float], int] | None
+        Optional global IDF statistics (idf_scores, total_docs) to inject into artifacts
+    metrics : list[str] | None
+        Evaluation metrics
+    save_runfile : bool
+        Whether to save runfile
+    runfile_output_dir : Path | None
+        Directory to save runfiles
+    run_id : str | None
+        Run ID
+    save_retrieval_results : bool
+        Whether to save retrieval results
+    retrieval_results_output_dir : Path | None
+        Directory to save retrieval results
+
+    Returns
+    -------
+    dict
+        Evaluation results
+    """
+    config_name = config.description if config else "Baseline"
+    print(f"\n[{config_idx}] Evaluating: {config_name}")
+    print("-" * 80)
+
+    # Check if index type supports incremental addition
+    if index_type not in ["faiss_ivfpq", "plaid"]:
+        raise ValueError(
+            f"Sharded mode only supports 'faiss_ivfpq' and 'plaid' indexes. Got: {index_type}"
+        )
+
+    # Create index (reuse same name to overwrite previous and save disk space)
+    config_index_name = (
+        f"{dataset_name}_{model_name.split('/')[-1]}_index_{index_type}"
+    )
+
+    if index_type == "faiss_ivfpq":
+        config_index = indexes.FaissIVFPQ(
+            name=config_index_name,
+            override=True,
+            verbose_level="init",
+            index_folder="indexes",
+        )
+    else:  # plaid
+        config_index = indexes.PLAID(
+            override=True,
+            index_name=config_index_name,
+            index_folder="indexes",
+            nbits=nbits,
+        )
+
+    # Process shards iteratively
+    total_tokens = 0
+    total_docs = 0
+    compression_time_total = 0
+
+    print(f"Processing {len(shard_files)} shards...")
+    for shard_idx, (embeddings_path, artifacts_path) in enumerate(tqdm(shard_files, desc="Processing shards")):
+        # Load shard (both embeddings and artifacts)
+        shard = load_shard(
+            embeddings_path=embeddings_path,
+            artifacts_path=artifacts_path,
+            load_embeddings=True,
+            load_artifacts=True,
+        )
+        shard_embeddings = shard["embeddings"]
+        shard_doc_ids = shard["document_ids"]
+        shard_artifacts = shard.get("artifacts", {})
+
+        # Inject global IDF stats if provided
+        if global_idf_stats is not None:
+            idf_scores, total_docs = global_idf_stats
+            shard_artifacts["global_idf_scores"] = idf_scores
+            shard_artifacts["global_total_docs"] = total_docs
+
+        # Apply compression if needed
+        compression_start = time.time()
+        if config is None:
+            # Baseline: normalize embeddings
+            import torch.nn.functional as F
+            compressed_embeddings = [
+                F.normalize(emb, p=2, dim=-1) for emb in shard_embeddings
+            ]
+        else:
+            # Compress shard
+            compressor = config.create_compressor()
+            compressed_embeddings, _ = compressor.compress_parallel(
+                embeddings=shard_embeddings,
+                artifacts=shard_artifacts,
+                batch_size=compression_batch_size,
+                num_workers=4,
+                show_progress=False,
+            )
+            # Normalize after compression
+            import torch.nn.functional as F
+            compressed_embeddings = [
+                F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
+            ]
+
+        compression_time_total += time.time() - compression_start
+
+        # Add to index incrementally
+        config_index.add_documents(
+            documents_ids=shard_doc_ids,
+            documents_embeddings=compressed_embeddings,
+        )
+
+        # Update statistics
+        total_tokens += sum(len(emb) for emb in compressed_embeddings)
+        total_docs += len(shard_doc_ids)
+
+        # Free memory
+        del shard, shard_embeddings, compressed_embeddings
+        torch.cuda.empty_cache()
+
+    # Finalize index (required for FaissIVFPQ)
+    if index_type == "faiss_ivfpq":
+        print("Finalizing FAISS index...")
+        config_index.finalize()
+
+    # Update stats
+    avg_tokens_per_doc = total_tokens / total_docs if total_docs > 0 else 0
+    stats["config_token_counts"].append(total_tokens)
+    stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
+    stats["compression_times"].append(compression_time_total)
+
+    print(f"Total tokens: {total_tokens:,}")
+    print(f"Avg tokens/doc: {avg_tokens_per_doc:.1f}")
+    print(f"Compression time: {compression_time_total:.3f}s")
+
+    # Retrieve
+    print("Retrieving...")
+    retriever = retrieve.ColBERT(index=config_index)
+    scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+
+    # Remove query_id from scores (needed for FiQA dataset)
+    for (query_id, query), query_scores in zip(queries.items(), scores):
+        for score in query_scores:
+            if score["id"] == query_id:
+                query_scores.remove(score)
+
+    # Evaluate
+    if metrics is None:
+        metrics = ["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10", "precision@10"]
+
+    from ranx import Qrels, Run, evaluate as ranx_evaluate
+
+    query_list = list(queries.keys())
+
+    # Handle duplicate queries
+    if len(query_list) > len(scores):
+        from pylate.evaluation.beir import add_duplicates
+        scores = add_duplicates(queries=query_list, scores=scores)
+
+    # Create Qrels and Run objects
+    qrels_obj = Qrels(qrels=qrels)
+
+    run_dict = {
+        query: {
+            match["id"]: match["score"]
+            for rank, match in enumerate(iterable=query_matches)
+        }
+        for query, query_matches in zip(query_list, scores)
+    }
+
+    run = Run(run=run_dict)
+
+    # Evaluate
+    evaluation_scores = ranx_evaluate(
+        qrels=qrels_obj,
+        run=run,
+        metrics=metrics,
+        make_comparable=True,
+    )
+
+    # Save runfile if requested
+    runfile_path = None
+    if save_runfile and runfile_output_dir is not None and run_id is not None:
+        runfile_path = runfile_output_dir / f"run-{run_id}.config-{config_idx}.json"
+        run.save(str(runfile_path), kind="json")
+        print(f"Saved runfile to: {runfile_path}")
+
+    # Save retrieval results if requested
+    retrieval_results_path = None
+    if save_retrieval_results and retrieval_results_output_dir is not None and run_id is not None:
+        retrieval_results_path = retrieval_results_output_dir / f"retrieval-{run_id}.config-{config_idx}.json"
+        retrieval_data = {
+            "run_id": run_id,
+            "config_idx": config_idx,
+            "config_name": config_name,
+            "dataset_name": dataset_name,
+            "model_name": model_name,
+            "num_queries": len(query_list),
+            "k": 20,
+            "results": {
+                query_id: query_scores
+                for query_id, query_scores in zip(query_list, scores)
+            }
+        }
+        with open(retrieval_results_path, "w") as f:
+            json.dump(retrieval_data, f, indent=2)
+        print(f"Saved retrieval results to: {retrieval_results_path}")
+
+    # Print results
+    print("Evaluation scores:")
+    for metric, value in evaluation_scores.items():
+        print(f"  {metric}: {value:.4f}")
+
+    return {
+        "config_idx": config_idx,
+        "config_name": config_name,
+        "token_count": total_tokens,
+        "avg_tokens_per_doc": avg_tokens_per_doc,
+        "evaluation": evaluation_scores,
+        "runfile_path": str(runfile_path) if runfile_path else None,
+        "retrieval_results_path": str(retrieval_results_path) if retrieval_results_path else None,
+    }
+
+
 def evaluate_config(
     config_idx: int,
     config: CompressionConfig | None,
@@ -1129,9 +1400,9 @@ def evaluate_config(
     print(f"\n[{config_idx}] Evaluating: {config_name}")
     print("-" * 80)
 
-    # Create a new index for this config
+    # Create a new index (reuse same name to overwrite previous and save disk space)
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_index_{index_type}"
     )
     match index_type:
         case "flat":
@@ -1410,6 +1681,496 @@ def print_results_table(
     return df
 
 
+def discover_shards(sharded_input_dir: Path) -> list[tuple[Path, Path]]:
+    """
+    Discover all shard files in a directory.
+
+    Looks for pairs of files:
+    - shard_NNNNNN_embeddings.pt
+    - shard_NNNNNN_artifacts.pt
+
+    Falls back to legacy format (shard_NNNNNN.pt) if new format not found.
+
+    Parameters
+    ----------
+    sharded_input_dir : Path
+        Directory containing shard files
+
+    Returns
+    -------
+    list[tuple[Path, Path]]
+        Sorted list of (embeddings_path, artifacts_path) tuples
+    """
+    # Try new format first (separate files)
+    embeddings_files = sorted(sharded_input_dir.glob("shard_*_embeddings.pt"))
+
+    if embeddings_files:
+        # New format: separate embeddings and artifacts
+        shard_pairs = []
+        for emb_path in embeddings_files:
+            # Extract shard index from filename
+            shard_idx = emb_path.stem.replace("shard_", "").replace("_embeddings", "")
+            artifacts_path = sharded_input_dir / f"shard_{shard_idx}_artifacts.pt"
+
+            if not artifacts_path.exists():
+                raise ValueError(f"Missing artifacts file for shard {shard_idx}: {artifacts_path}")
+
+            shard_pairs.append((emb_path, artifacts_path))
+
+        if not shard_pairs:
+            raise ValueError(f"No shard files found in {sharded_input_dir}")
+
+        return shard_pairs
+
+    else:
+        # Legacy format: single file with both embeddings and artifacts
+        legacy_files = sorted(sharded_input_dir.glob("shard_*.pt"))
+        if not legacy_files:
+            raise ValueError(f"No shard files found in {sharded_input_dir}")
+
+        # Return as (path, None) to indicate legacy format
+        return [(f, None) for f in legacy_files]
+
+
+def load_shard(
+    embeddings_path: Path,
+    artifacts_path: Path | None = None,
+    load_embeddings: bool = True,
+    load_artifacts: bool = True,
+) -> dict[str, Any]:
+    """
+    Load a single shard from disk.
+
+    Supports two formats:
+    1. New format: Separate embeddings and artifacts files
+    2. Legacy format: Single file with both (artifacts_path=None)
+
+    Parameters
+    ----------
+    embeddings_path : Path
+        Path to embeddings file (or legacy combined file)
+    artifacts_path : Path | None
+        Path to artifacts file (None for legacy format)
+    load_embeddings : bool
+        Whether to load embeddings (default: True)
+    load_artifacts : bool
+        Whether to load artifacts (default: True)
+
+    Returns
+    -------
+    dict
+        Shard data with requested components
+    """
+    result = {}
+
+    if artifacts_path is None:
+        # Legacy format: single file with everything
+        shard = torch.load(embeddings_path, map_location="cpu")
+
+        if load_embeddings:
+            result["embeddings"] = shard.get("embeddings", [])
+        if load_artifacts:
+            result["artifacts"] = shard.get("artifacts", {})
+
+        result["document_ids"] = shard.get("document_ids", [])
+        result["metadata"] = shard.get("metadata", {})
+
+        return result
+
+    # New format: separate files
+    if load_embeddings:
+        emb_data = torch.load(embeddings_path, map_location="cpu")
+        result["embeddings"] = emb_data["embeddings"]
+        result["document_ids"] = emb_data["document_ids"]
+        result["metadata"] = emb_data.get("metadata", {})
+
+    if load_artifacts:
+        art_data = torch.load(artifacts_path, map_location="cpu")
+        result["artifacts"] = art_data["artifacts"]
+
+        # If we didn't load embeddings, get metadata from artifacts file
+        if not load_embeddings:
+            result["document_ids"] = art_data["document_ids"]
+            result["metadata"] = art_data.get("metadata", {})
+
+    return result
+
+
+def get_shard_stats(shard: dict[str, Any]) -> dict[str, int]:
+    """
+    Get statistics for a shard.
+
+    Parameters
+    ----------
+    shard : dict
+        Shard data
+
+    Returns
+    -------
+    dict
+        Statistics including num_documents and num_tokens
+    """
+    num_documents = len(shard["document_ids"])
+    num_tokens = sum(len(emb) for emb in shard["embeddings"])
+    return {
+        "num_documents": num_documents,
+        "num_tokens": num_tokens,
+    }
+
+
+def check_configs_need_global_idf(configs: list[CompressionConfig | None]) -> bool:
+    """
+    Check if any compression configs require global IDF statistics.
+
+    Parameters
+    ----------
+    configs : list[CompressionConfig | None]
+        List of compression configs
+
+    Returns
+    -------
+    bool
+        True if any config needs global IDF stats
+    """
+    for config in configs:
+        if config is None:
+            continue
+
+        for strategy in config.strategies:
+            strategy_type = type(strategy).__name__
+
+            # IDF-based strategies
+            if strategy_type == "IDFPruningStrategy":
+                return True
+            elif strategy_type == "IDFPoolingStrategy":
+                return True
+            # Importance-based strategies with IDF
+            elif strategy_type in ["ImportancePruningStrategy", "ImportancePoolingStrategy"]:
+                if hasattr(strategy.config, "use_idf") and strategy.config.use_idf:
+                    return True
+            # Hybrid strategies with IDF
+            elif strategy_type == "HybridImportanceClusteringPoolingStrategy":
+                if hasattr(strategy.config, "use_idf") and strategy.config.use_idf:
+                    return True
+
+    return False
+
+
+def aggregate_idf_from_shard_metadata(
+    shard_files: list[tuple[Path, Path]],
+) -> tuple[dict[int, float], int]:
+    """
+    Aggregate global IDF statistics from shard metadata (pre-computed during encoding).
+
+    This is much faster than gather_global_idf_stats() because it only loads tiny metadata
+    instead of full artifacts.
+
+    Parameters
+    ----------
+    shard_files : list[tuple[Path, Path]]
+        List of (embeddings_path, artifacts_path) tuples
+
+    Returns
+    -------
+    tuple[dict[int, float], int]
+        (idf_scores, total_documents)
+        - idf_scores: dict mapping token_id -> IDF score
+        - total_documents: total number of documents
+    """
+    import math
+
+    global_token_doc_freq = {}
+    total_docs = 0
+
+    print("\n" + "=" * 80)
+    print("AGGREGATING GLOBAL IDF STATISTICS FROM SHARD METADATA")
+    print("=" * 80)
+    print(f"Processing {len(shard_files)} shards (metadata only)...")
+
+    for embeddings_path, artifacts_path in tqdm(shard_files, desc="Aggregating IDF"):
+        # Load only metadata from embeddings file (tiny)
+        try:
+            emb_data = torch.load(embeddings_path, map_location="cpu")
+            metadata = emb_data.get("metadata", {})
+
+            if "token_doc_freq" not in metadata:
+                # Fallback: metadata doesn't have pre-computed stats, need to compute from artifacts
+                print(f"\nWarning: Shard {embeddings_path.name} missing token_doc_freq in metadata.")
+                print("Falling back to computing from artifacts...")
+                return gather_global_idf_stats(shard_files)
+
+            # Merge document frequencies
+            for token_id, freq in metadata["token_doc_freq"].items():
+                global_token_doc_freq[token_id] = global_token_doc_freq.get(token_id, 0) + freq
+
+            total_docs += metadata["num_documents"]
+
+            # Free memory
+            del emb_data, metadata
+
+        except Exception as e:
+            print(f"\nError loading metadata from {embeddings_path}: {e}")
+            print("Falling back to computing from artifacts...")
+            return gather_global_idf_stats(shard_files)
+
+    # Compute IDF scores
+    idf_scores = {
+        token_id: math.log(total_docs / freq)
+        for token_id, freq in global_token_doc_freq.items()
+    }
+
+    print(f"✓ Aggregated IDF for {len(idf_scores):,} unique tokens")
+    print(f"✓ Total documents: {total_docs:,}")
+
+    return idf_scores, total_docs
+
+
+def gather_global_idf_stats(
+    shard_files: list[tuple[Path, Path]],
+) -> tuple[dict[int, float], int]:
+    """
+    Gather global IDF statistics from all shards by loading artifacts.
+
+    This is a fallback for shards that don't have pre-computed token_doc_freq in metadata.
+    Use aggregate_idf_from_shard_metadata() instead when available (much faster).
+
+    Parameters
+    ----------
+    shard_files : list[tuple[Path, Path]]
+        List of (embeddings_path, artifacts_path) tuples
+
+    Returns
+    -------
+    tuple[dict[int, float], int]
+        (idf_scores, total_documents)
+        - idf_scores: dict mapping token_id -> IDF score
+        - total_documents: total number of documents
+    """
+    import math
+
+    token_doc_freq = {}  # token_id -> number of docs containing it
+    total_docs = 0
+
+    print("\n" + "=" * 80)
+    print("GATHERING GLOBAL IDF STATISTICS (from artifacts)")
+    print("=" * 80)
+    print(f"Processing {len(shard_files)} shards (artifacts only)...")
+
+    for embeddings_path, artifacts_path in tqdm(shard_files, desc="Computing IDF"):
+        # Load only artifacts (not embeddings)
+        shard = load_shard(
+            embeddings_path=embeddings_path,
+            artifacts_path=artifacts_path,
+            load_embeddings=False,
+            load_artifacts=True,
+        )
+
+        artifacts = shard.get("artifacts", {})
+        if "input_ids" not in artifacts:
+            raise ValueError(
+                f"Shard missing input_ids in artifacts. "
+                f"IDF computation requires input_ids."
+            )
+
+        # Count unique tokens per document
+        for input_ids in artifacts["input_ids"]:
+            unique_tokens = torch.unique(input_ids)
+            for token_id in unique_tokens.tolist():
+                token_doc_freq[token_id] = token_doc_freq.get(token_id, 0) + 1
+            total_docs += 1
+
+        # Free memory
+        del shard, artifacts
+        torch.cuda.empty_cache()
+
+    # Compute IDF scores
+    idf_scores = {
+        token_id: math.log(total_docs / freq)
+        for token_id, freq in token_doc_freq.items()
+    }
+
+    print(f"✓ Computed IDF for {len(idf_scores):,} unique tokens")
+    print(f"✓ Total documents: {total_docs:,}")
+
+    return idf_scores, total_docs
+
+
+def encode_and_save_shards(
+    model: ColBERT | ProxyAttentionColBERT | ConstBERT,
+    documents: list[dict],
+    save_shards_dir: Path,
+    shard_size: int = 50000,
+    batch_size: int = 1000,
+    model_type: str = "ColBERT",
+) -> list[Path]:
+    """
+    Encode documents in shards and save to disk.
+
+    Supports resume: if shard files already exist, they are skipped. This allows
+    resuming interrupted encoding jobs without re-encoding already completed shards.
+
+    Parameters
+    ----------
+    model : ColBERT | ProxyAttentionColBERT | ConstBERT
+        Model to use for encoding
+    documents : list[dict]
+        List of documents to encode
+    save_shards_dir : Path
+        Directory to save shards
+    shard_size : int
+        Number of documents per shard (default: 50000)
+    batch_size : int
+        Batch size for encoding (default: 1000)
+    model_type : str
+        Type of model: "ColBERT", "ProxyAttentionColBERT", or "ConstBERT"
+
+    Returns
+    -------
+    list[Path]
+        List of saved shard file paths (both newly encoded and pre-existing)
+    """
+    save_shards_dir.mkdir(parents=True, exist_ok=True)
+    shard_files = []
+
+    # Calculate number of shards
+    num_shards = (len(documents) + shard_size - 1) // shard_size
+    print(f"\nEncoding {len(documents):,} documents into {num_shards} shards")
+    print(f"Shard size: {shard_size} documents")
+    print(f"Encoding batch size: {batch_size}")
+
+    # Track resume statistics
+    num_skipped = 0
+    num_encoded = 0
+
+    for shard_idx in range(num_shards):
+        start_idx = shard_idx * shard_size
+        end_idx = min(start_idx + shard_size, len(documents))
+        shard_documents = documents[start_idx:end_idx]
+
+        # Check if shard already exists (for resume capability)
+        embeddings_path = save_shards_dir / f"shard_{shard_idx:06d}_embeddings.pt"
+        artifacts_path = save_shards_dir / f"shard_{shard_idx:06d}_artifacts.pt"
+
+        embeddings_exists = embeddings_path.exists()
+        artifacts_exists = artifacts_path.exists()
+
+        if embeddings_exists and artifacts_exists:
+            # Shard already exists - skip encoding
+            print(f"\n[Shard {shard_idx + 1}/{num_shards}] ✓ Already exists, skipping (documents {start_idx:,} to {end_idx:,})")
+            shard_files.append((embeddings_path, artifacts_path))
+            num_skipped += 1
+            continue
+        elif embeddings_exists or artifacts_exists:
+            # Incomplete shard (corrupted state) - warn and re-encode
+            print(f"\n[Shard {shard_idx + 1}/{num_shards}] ⚠ Incomplete shard detected, re-encoding...")
+            if embeddings_exists:
+                embeddings_path.unlink()
+            if artifacts_exists:
+                artifacts_path.unlink()
+
+        print(f"\n[Shard {shard_idx + 1}/{num_shards}] Encoding documents {start_idx:,} to {end_idx:,}...")
+
+        # Encode documents in this shard
+        # For ConstBERT, don't request attention scores
+        if model_type == "ConstBERT":
+            extra_artifacts = {"input_ids": True, "attention_scores": False}
+        else:
+            extra_artifacts = {"input_ids": True, "attention_scores": True}
+
+        shard_embeddings, shard_artifacts = model.encode(
+            sentences=[doc["text"] for doc in shard_documents],
+            batch_size=batch_size,
+            is_query=False,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+            normalize_embeddings=False,  # Keep unnormalized for compression
+            return_extra_artifacts=extra_artifacts,
+        )
+
+        # Compute token document frequencies for this shard
+        token_doc_freq = {}
+        if "input_ids" in shard_artifacts:
+            for input_ids in shard_artifacts["input_ids"]:
+                unique_tokens = torch.unique(input_ids)
+                for token_id in unique_tokens.tolist():
+                    token_doc_freq[token_id] = token_doc_freq.get(token_id, 0) + 1
+
+        # Prepare metadata
+        document_ids = [doc["id"] for doc in shard_documents]
+        metadata = {
+            "shard_idx": shard_idx,
+            "total_shards": num_shards,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "num_documents": len(shard_documents),
+            "num_tokens": sum(len(emb) for emb in shard_embeddings),
+            "token_doc_freq": token_doc_freq,  # For IDF aggregation
+        }
+
+        # Save embeddings separately
+        embeddings_path = save_shards_dir / f"shard_{shard_idx:06d}_embeddings.pt"
+        embeddings_data = {
+            "embeddings": shard_embeddings,
+            "document_ids": document_ids,
+            "metadata": metadata,
+        }
+        torch.save(embeddings_data, embeddings_path)
+
+        # Save artifacts separately
+        artifacts_path = save_shards_dir / f"shard_{shard_idx:06d}_artifacts.pt"
+        artifacts_data = {
+            "artifacts": shard_artifacts,
+            "document_ids": document_ids,
+            "metadata": metadata,
+        }
+        torch.save(artifacts_data, artifacts_path)
+
+        shard_files.append((embeddings_path, artifacts_path))
+        num_encoded += 1
+
+        print(f"✓ Saved shard {shard_idx:06d}")
+        print(f"  Embeddings: {embeddings_path}")
+        print(f"  Artifacts: {artifacts_path}")
+        print(f"  Documents: {len(shard_documents)}")
+        print(f"  Tokens: {metadata['num_tokens']:,}")
+
+        # Free memory
+        del shard_embeddings, shard_artifacts, embeddings_data, artifacts_data
+        torch.cuda.empty_cache()
+
+    # Print encoding summary
+    print(f"\n{'=' * 80}")
+    print(f"ENCODING SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"Total shards: {num_shards}")
+    print(f"  Encoded: {num_encoded}")
+    print(f"  Skipped (already exist): {num_skipped}")
+
+    # Save manifest
+    manifest_path = save_shards_dir / "manifest.json"
+    manifest = {
+        "format": "split",  # embeddings and artifacts in separate files
+        "num_shards": num_shards,
+        "total_documents": len(documents),
+        "shard_size": shard_size,
+        "model_type": model_type,
+        "shard_files": [
+            {
+                "embeddings": str(emb_path.name),
+                "artifacts": str(art_path.name),
+            }
+            for emb_path, art_path in shard_files
+        ],
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\n✓ Saved {num_shards} shards to {save_shards_dir}")
+    print(f"✓ Saved manifest to {manifest_path}")
+
+    return shard_files
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Compression experiment evaluation")
@@ -1527,6 +2288,30 @@ def parse_args() -> argparse.Namespace:
         default=["cuda"],
         help="Devices for PLAID index (default: ['cuda']). Can specify multiple devices.",
     )
+    parser.add_argument(
+        "--sharded_input_dir",
+        type=str,
+        default=None,
+        help="Directory containing pre-encoded document shards (.pt files). If provided, loads embeddings from shards instead of encoding. Shards should be named shard_000000.pt, shard_000001.pt, etc.",
+    )
+    parser.add_argument(
+        "--compression_batch_size",
+        type=int,
+        default=1000,
+        help="Batch size for compression when using sharded input (default: 1000). Controls memory usage during compression.",
+    )
+    parser.add_argument(
+        "--save_shards_dir",
+        type=str,
+        default=None,
+        help="Directory to save encoded document shards. If provided, encodes documents in batches and saves to disk as .pt files (shard_000000.pt, etc.). These can later be loaded with --sharded_input_dir.",
+    )
+    parser.add_argument(
+        "--shard_size",
+        type=int,
+        default=50000,
+        help="Number of documents per shard when saving with --save_shards_dir (default: 50000).",
+    )
     return parser.parse_args()
 
 
@@ -1535,9 +2320,67 @@ def main() -> None:
     args = parse_args()
     overall_start = time.time()
 
+    # Determine mode: encode-to-shards, load-shards, or in-memory
+    save_shards = args.save_shards_dir is not None
+    use_sharded_mode = args.sharded_input_dir is not None or save_shards
+    shard_files = None
+
+    if save_shards and args.sharded_input_dir is not None:
+        print("Error: Cannot specify both --save_shards_dir and --sharded_input_dir")
+        sys.exit(1)
+
+    # Check for ProxyAttention/ConstBERT incompatibility with save_shards
+    if save_shards:
+        if is_proxy_attention_model(args.model_name):
+            print("Error: --save_shards_dir is not compatible with ProxyAttentionColBERT models.")
+            print("ProxyAttentionColBERT uses learned compression during encoding, not post-hoc compression configs.")
+            sys.exit(1)
+        if is_constbert_model(args.model_name):
+            print("Error: --save_shards_dir is not compatible with ConstBERT models.")
+            print("ConstBERT uses learned fixed-length projection during encoding, not post-hoc compression configs.")
+            sys.exit(1)
+
+    if use_sharded_mode:
+        # Validate index type for sharded mode
+        if args.index_type not in ["faiss_ivfpq", "plaid"]:
+            print(f"Error: Sharded mode only supports 'faiss_ivfpq' and 'plaid' indexes. Got: {args.index_type}")
+            sys.exit(1)
+
+    if args.sharded_input_dir is not None:
+        # Load existing shards
+        sharded_input_dir = Path(args.sharded_input_dir)
+        if not sharded_input_dir.exists():
+            print(f"Error: Sharded input directory not found: {sharded_input_dir}")
+            sys.exit(1)
+
+        # Discover shard files
+        shard_files = discover_shards(sharded_input_dir)
+        print(f"\n✓ Found {len(shard_files)} shard files in {sharded_input_dir}")
+
+        print(f"\n{'=' * 80}")
+        print("SHARDED MODE: Loading pre-encoded shards")
+        print(f"{'=' * 80}")
+        print(f"Shard directory: {sharded_input_dir}")
+        print(f"Number of shards: {len(shard_files)}")
+        print(f"Index type: {args.index_type}")
+        print(f"Compression batch size: {args.compression_batch_size}")
+
     # Check if this is a ProxyAttentionColBERT or ConstBERT model
-    is_proxy_model = is_proxy_attention_model(args.model_name)
-    is_constbert = is_constbert_model(args.model_name)
+    # For sharded loading (not saving), we don't need to check model type
+    # For saving shards, we need to know the model type to encode properly
+    if save_shards:
+        # When saving shards, check model type to determine encoding behavior
+        is_proxy_model = is_proxy_attention_model(args.model_name)
+        is_constbert = is_constbert_model(args.model_name)
+    elif use_sharded_mode:
+        # When loading shards, model type doesn't matter for the main workflow
+        is_proxy_model = False
+        is_constbert = False
+    else:
+        # Normal in-memory mode
+        is_proxy_model = is_proxy_attention_model(args.model_name)
+        is_constbert = is_constbert_model(args.model_name)
+
     proxy_config = None
     constbert_config = None
     num_select_values = None
@@ -1666,13 +2509,90 @@ def main() -> None:
 
     # For standard ColBERT and ConstBERT: encode documents once upfront
     # For ProxyAttentionColBERT: encoding happens per-config (inside the loop)
+    # For sharded mode: skip encoding, load from shards
     documents_embeddings = None
     artifacts = None
     queries_embeddings = None
     encoding_time = 0
     query_encoding_time = 0
 
-    if not is_proxy_model:  # This includes ConstBERT (encodes once)
+    if save_shards:
+        # Encode and save shards mode
+        print("\n" + "=" * 80)
+        print("SHARDED MODE: Encoding and saving to shards")
+        print("=" * 80)
+
+        save_shards_dir = Path(args.save_shards_dir)
+        print(f"Output directory: {save_shards_dir}")
+        print(f"Shard size: {args.shard_size} documents")
+
+        # Load model if needed
+        if model is None:
+            model = load_model(args.model_name, args.dataset_name, args.document_length, model_dtype=args.model_dtype)
+
+        # Determine model type
+        if is_constbert:
+            encoding_model_type = "ConstBERT"
+        elif is_proxy_model:
+            encoding_model_type = "ProxyAttentionColBERT"
+        else:
+            encoding_model_type = "ColBERT"
+
+        # Encode and save shards
+        encoding_start = time.time()
+        shard_files = encode_and_save_shards(
+            model=model,
+            documents=documents,
+            save_shards_dir=save_shards_dir,
+            shard_size=args.shard_size,
+            batch_size=args.batch_size,
+            model_type=encoding_model_type,
+        )
+        encoding_time = time.time() - encoding_start
+        print(f"\n✓ Total encoding time: {encoding_time:.3f}s")
+
+        # Encode queries
+        print("\n" + "=" * 80)
+        print("Encoding queries...")
+        print("=" * 80)
+        query_encoding_start = time.time()
+        queries_embeddings = model.encode(
+            sentences=list(queries.values()),
+            is_query=True,
+            show_progress_bar=True,
+            batch_size=512,
+            convert_to_tensor=True,
+        )
+        query_encoding_time = time.time() - query_encoding_start
+        print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
+
+    elif use_sharded_mode:
+        # Load existing shards mode (sharded_input_dir provided)
+        print("\n" + "=" * 80)
+        print("SHARDED MODE: Skipping document encoding")
+        print("=" * 80)
+        print("Documents will be loaded from shards during compression/indexing")
+
+        # Still need to load model and encode queries
+        if model is None:
+            model = load_model(args.model_name, args.dataset_name, args.document_length, model_dtype=args.model_dtype)
+
+        # Encode queries
+        print("\n" + "=" * 80)
+        print("Encoding queries...")
+        print("=" * 80)
+        query_encoding_start = time.time()
+        queries_embeddings = model.encode(
+            sentences=list(queries.values()),
+            is_query=True,
+            show_progress_bar=True,
+            batch_size=512,
+            convert_to_tensor=True,
+        )
+        query_encoding_time = time.time() - query_encoding_start
+        print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
+
+    elif not is_proxy_model:  # This includes ConstBERT (encodes once)
         # Encode documents once with artifacts (input_ids needed for IDF pruning)
         # Use normalize_embeddings=False to get unnormalized embeddings for importance scoring
         print("\n" + "=" * 80)
@@ -1785,6 +2705,17 @@ def main() -> None:
         with open(results_jsonl_path, "w") as f:
             f.write(json.dumps(metadata_entry, default=str) + "\n")
 
+    # Check if we need to gather global IDF statistics (for sharded mode)
+    global_idf_stats = None
+    if use_sharded_mode and not is_proxy_model and not is_constbert:
+        if check_configs_need_global_idf(configs):
+            print("\n" + "=" * 80)
+            print("GLOBAL IDF STATISTICS REQUIRED")
+            print("=" * 80)
+            print("Some compression configs require global IDF statistics.")
+            print("Attempting to aggregate from shard metadata...")
+            global_idf_stats = aggregate_idf_from_shard_metadata(shard_files)
+
     # Evaluate each compression config
     print("\n" + "=" * 80)
     print("EVALUATING COMPRESSION CONFIGS")
@@ -1886,62 +2817,94 @@ def main() -> None:
             torch.cuda.empty_cache()
         else:
             # Standard ColBERT: apply compression config to pre-encoded embeddings
-            if config is None:
-                # Baseline: normalize the unnormalized embeddings
-                import torch.nn.functional as F
-                compressed_embeddings = [
-                    F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings
-                ]
+            # Skip if in sharded mode (compression happens in evaluate_config_with_shards)
+            if not use_sharded_mode:
+                if config is None:
+                    # Baseline: normalize the unnormalized embeddings
+                    import torch.nn.functional as F
+                    compressed_embeddings = [
+                        F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings
+                    ]
+                else:
+                    compressor = config.create_compressor()
+
+                    # Compress with unnormalized embeddings (for importance scoring)
+                    compressed_embeddings, _ = compressor.compress_parallel(
+                        embeddings=documents_embeddings,
+                        artifacts=artifacts,
+                        batch_size=args.batch_size,
+                        num_workers=8,
+                        show_progress=True,
+                    )
+
+                    # Normalize embeddings AFTER compression
+                    import torch.nn.functional as F
+                    compressed_embeddings = [
+                        F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
+                    ]
+
+                compression_time = time.time() - compression_start
+
+                # Calculate token statistics (only for non-sharded mode)
+                num_tokens = sum(len(emb) for emb in compressed_embeddings)
+                avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
+
+                stats["config_token_counts"].append(num_tokens)
+                stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
+                stats["compression_times"].append(compression_time)
             else:
-                compressor = config.create_compressor()
-
-                # Compress with unnormalized embeddings (for importance scoring)
-                compressed_embeddings, _ = compressor.compress_parallel(
-                    embeddings=documents_embeddings,
-                    artifacts=artifacts,
-                    batch_size=args.batch_size,
-                    num_workers=8,
-                    show_progress=True,
-                )
-
-                # Normalize embeddings AFTER compression
-                import torch.nn.functional as F
-                compressed_embeddings = [
-                    F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
-                ]
-
-            compression_time = time.time() - compression_start
-
-        # Calculate token statistics
-        num_tokens = sum(len(emb) for emb in compressed_embeddings)
-        avg_tokens_per_doc = num_tokens / len(documents) if documents else 0
-
-        stats["config_token_counts"].append(num_tokens)
-        stats["avg_tokens_per_doc"].append(avg_tokens_per_doc)
-        stats["compression_times"].append(compression_time)
+                # Sharded mode: compression and stats computed in evaluate_config_with_shards
+                compressed_embeddings = None
+                compression_time = 0
 
         # Evaluate this config
-        result = evaluate_config(
-            config_idx=config_idx,
-            config=None if is_proxy_model else config,  # Pass None for proxy models
-            documents_embeddings=compressed_embeddings,
-            documents=documents,
-            queries=queries,
-            qrels=qrels,
-            queries_embeddings=queries_embeddings,
-            dataset_name=args.dataset_name,
-            model_name=args.model_name,
-            index_type=args.index_type,
-            stats=stats,
-            metrics=args.metrics,
-            save_runfile=args.save_runfiles,
-            runfile_output_dir=runfile_output_dir,
-            run_id=run_id,
-            save_retrieval_results=args.save_retrieval_results,
-            retrieval_results_output_dir=retrieval_results_output_dir,
-            plaid_nbits=args.plaid_nbits,
-            plaid_devices=args.plaid_devices,
-        )
+        if use_sharded_mode:
+            # Sharded mode: load shards iteratively, compress, and index
+            result = evaluate_config_with_shards(
+                config_idx=config_idx,
+                config=config,
+                shard_files=shard_files,
+                documents=documents,
+                queries=queries,
+                qrels=qrels,
+                queries_embeddings=queries_embeddings,
+                dataset_name=args.dataset_name,
+                model_name=args.model_name,
+                index_type=args.index_type,
+                stats=stats,
+                nbits=args.plaid_nbits,
+                compression_batch_size=args.compression_batch_size,
+                global_idf_stats=global_idf_stats,
+                metrics=args.metrics,
+                save_runfile=args.save_runfiles,
+                runfile_output_dir=runfile_output_dir,
+                run_id=run_id,
+                save_retrieval_results=args.save_retrieval_results,
+                retrieval_results_output_dir=retrieval_results_output_dir,
+            )
+        else:
+            # Normal mode: use pre-loaded/compressed embeddings
+            result = evaluate_config(
+                config_idx=config_idx,
+                config=None if is_proxy_model else config,  # Pass None for proxy models
+                documents_embeddings=compressed_embeddings,
+                documents=documents,
+                queries=queries,
+                qrels=qrels,
+                queries_embeddings=queries_embeddings,
+                dataset_name=args.dataset_name,
+                model_name=args.model_name,
+                index_type=args.index_type,
+                stats=stats,
+                metrics=args.metrics,
+                save_runfile=args.save_runfiles,
+                runfile_output_dir=runfile_output_dir,
+                run_id=run_id,
+                save_retrieval_results=args.save_retrieval_results,
+                retrieval_results_output_dir=retrieval_results_output_dir,
+                plaid_nbits=args.plaid_nbits,
+                plaid_devices=args.plaid_devices,
+            )
 
         # Override config_name for ConstBERT and proxy models
         if is_constbert or is_proxy_model:
