@@ -377,10 +377,15 @@ class ScaNN(Base):
         
         if self.verbose:
             logger.info(f"[ScaNN] Pre-allocating array for {total_embeddings} embeddings x {embedding_dim} dims ({total_embeddings * embedding_dim * 4 / 1e9:.2f} GB)")
-        
-        # Pre-allocate final float32 array (ScaNN requires float32)
-        flattened_embeddings = np.empty((total_embeddings, embedding_dim), dtype=np.float32)
-        
+
+        numpy_dtype_map = {
+            torch.float32: np.float32,
+            torch.float16: np.float16,
+            torch.bfloat16: np.float16,
+        }
+        numpy_dtype = numpy_dtype_map.get(documents_embeddings[0].dtype, np.float32)
+        flattened_embeddings = np.empty((total_embeddings, embedding_dim), dtype=numpy_dtype)
+
         log_memory("After pre-allocating flattened_embeddings array", self.verbose)
         
         # Fill array in-place, deleting each tensor after copying to free memory
@@ -396,7 +401,7 @@ class ScaNN(Base):
         )
         for i, emb in iterator:
             n = emb.shape[0]
-            flattened_embeddings[offset:offset + n] = emb.to("cpu", dtype=torch.float32).numpy()
+            flattened_embeddings[offset:offset + n] = emb.to("cpu").numpy()
             offset += n
             
             # Log memory periodically
@@ -413,8 +418,8 @@ class ScaNN(Base):
         
         step_time = time.time() - step_start
         if self.verbose:
-            logger.info(f"[ScaNN] Flattened {total_embeddings} embeddings to float32: {step_time:.4f}s")
-        
+            logger.info(f"[ScaNN] Flattened {total_embeddings} embeddings to {numpy_dtype}: {step_time:.4f}s")
+
         # Build position->doc_id array and doc_id->embedding_range mapping
         step_start = time.time()
         self.position_to_doc_id = np.empty(total_embeddings, dtype=object)
