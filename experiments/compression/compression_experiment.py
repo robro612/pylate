@@ -1155,6 +1155,7 @@ def evaluate_config_with_shards(
             index_name=config_index_name,
             index_folder="indexes",
             nbits=nbits,
+            n_samples_kmeans=250_000,
         )
 
     # Process shards iteratively
