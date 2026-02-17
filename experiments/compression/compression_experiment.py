@@ -77,6 +77,30 @@ QUERY_LEN = {
 }
 
 
+def get_torch_dtype(dtype_str: str) -> torch.dtype:
+    """
+    Convert string dtype to torch dtype.
+
+    Parameters
+    ----------
+    dtype_str : str
+        String representation of dtype ('fp32', 'fp16', 'bf16')
+
+    Returns
+    -------
+    torch.dtype
+        Corresponding torch dtype
+    """
+    dtype_map = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    if dtype_str not in dtype_map:
+        raise ValueError(f"Invalid dtype: {dtype_str}. Must be one of {list(dtype_map.keys())}")
+    return dtype_map[dtype_str]
+
+
 def _encode_worker(
     gpu_id: int,
     model_name: str,
@@ -87,6 +111,7 @@ def _encode_worker(
     result_queue: mp.Queue,
     worker_idx: int,
     model_type: str = "ColBERT",
+    model_dtype: str = "fp32",
 ) -> None:
     """Worker function for multi-GPU encoding. Runs in a separate process."""
     # Set the device for this worker
@@ -96,8 +121,15 @@ def _encode_worker(
     from pylate import models
     from pylate.models.ConstBERT import ConstBERT
 
+    # Convert dtype string to torch dtype
+    torch_dtype = get_torch_dtype(model_dtype)
+
     if model_type == "ConstBERT":
-        model = ConstBERT.load(path=model_name, document_length=document_length)
+        model = ConstBERT.load(
+            path=model_name,
+            document_length=document_length,
+            model_kwargs={"torch_dtype": torch_dtype},
+        )
         model = model.to(device)
     else:
         model = models.ColBERT(
@@ -106,6 +138,7 @@ def _encode_worker(
             query_length=query_length,
             trust_remote_code=True,
             device=device,
+            model_kwargs={"torch_dtype": torch_dtype},
         )
 
     # Encode documents
@@ -152,6 +185,7 @@ def encode_multi_gpu(
     batch_size: int,
     num_gpus: int | None = None,
     model_type: str = "ColBERT",
+    model_dtype: str = "fp32",
 ) -> tuple[list, dict]:
     """
     Encode documents using multiple GPUs in parallel.
@@ -172,6 +206,8 @@ def encode_multi_gpu(
         Number of GPUs to use. If None, uses all available GPUs.
     model_type : str
         Type of model: "ColBERT" or "ConstBERT"
+    model_dtype : str
+        Model dtype: "fp32", "fp16", or "bf16"
 
     Returns
     -------
@@ -184,8 +220,13 @@ def encode_multi_gpu(
     if num_gpus <= 1:
         # Fall back to single GPU encoding
         from pylate import models
+        torch_dtype = get_torch_dtype(model_dtype)
         if model_type == "ConstBERT":
-            model = ConstBERT.load(path=model_name, document_length=document_length)
+            model = ConstBERT.load(
+                path=model_name,
+                document_length=document_length,
+                model_kwargs={"torch_dtype": torch_dtype},
+            )
             extra_artifacts = {"input_ids": True, "attention_scores": False}
         else:
             model = models.ColBERT(
@@ -193,6 +234,7 @@ def encode_multi_gpu(
                 document_length=document_length,
                 query_length=query_length,
                 trust_remote_code=True,
+                model_kwargs={"torch_dtype": torch_dtype},
             )
             extra_artifacts = {"input_ids": True, "attention_scores": True}
         return model.encode(
@@ -224,7 +266,7 @@ def encode_multi_gpu(
     for i, chunk in enumerate(chunks):
         p = ctx.Process(
             target=_encode_worker,
-            args=(i, model_name, document_length, query_length, chunk, batch_size, result_queue, i, model_type),
+            args=(i, model_name, document_length, query_length, chunk, batch_size, result_queue, i, model_type, model_dtype),
         )
         p.start()
         processes.append(p)
@@ -445,6 +487,7 @@ def load_model(
     dataset_name: str,
     document_length: int | None = None,
     num_select_tokens: int | None = None,
+    model_dtype: str = "fp32",
 ) -> ColBERT | ProxyAttentionColBERT | ConstBERT:
     """
     Load and initialize the ColBERT, ProxyAttentionColBERT, or ConstBERT model.
@@ -460,6 +503,8 @@ def load_model(
     num_select_tokens : int | None
         For ProxyAttentionColBERT, override the number of tokens to select.
         If None, uses the model's default.
+    model_dtype : str
+        Model dtype: "fp32" (default), "fp16", or "bf16"
 
     Returns
     -------
@@ -470,13 +515,20 @@ def load_model(
     print("Loading model...")
     print("=" * 80)
 
+    # Convert dtype string to torch dtype
+    torch_dtype = get_torch_dtype(model_dtype)
+    print(f"  Model dtype: {model_dtype} ({torch_dtype})")
+
     # Check if this is a ConstBERT model
     if is_constbert_model(model_name):
         print(f"  Detected ConstBERT model")
         constbert_config = get_constbert_config(model_name)
         print(f"  ConstBERT config: {constbert_config}")
 
-        load_kwargs = {"document_length": document_length or 300}
+        load_kwargs = {
+            "document_length": document_length or 300,
+            "model_kwargs": {"torch_dtype": torch_dtype},
+        }
         model = ConstBERT.load(path=model_name, **load_kwargs)
 
         print(f"✓ Loaded ConstBERT: {model_name}")
@@ -494,7 +546,10 @@ def load_model(
         print(f"  Proxy config: {proxy_config}")
 
         # Override num_select_tokens if specified
-        load_kwargs = {"document_length": document_length or 300}
+        load_kwargs = {
+            "document_length": document_length or 300,
+            "model_kwargs": {"torch_dtype": torch_dtype},
+        }
         if num_select_tokens is not None:
             load_kwargs["num_select_tokens"] = num_select_tokens
             print(f"  Overriding num_select_tokens: {num_select_tokens}")
@@ -524,6 +579,7 @@ def load_model(
         document_length=document_length,
         query_length=QUERY_LEN.get(dataset_name, 32),
         trust_remote_code=True,
+        model_kwargs={"torch_dtype": torch_dtype},
     )
 
     print(f"✓ Loaded model: {model_name}")
@@ -1041,7 +1097,7 @@ def evaluate_config(
     model_name : str
         Model name for index naming
     index_type : str
-        Type of index ("flat" or "plaid")
+        Type of index ("flat" or "plaid" or "scann" or "faiss_ivfpq")
     stats : dict
         Experiment statistics
     metrics : list[str] | None, optional
@@ -1069,7 +1125,7 @@ def evaluate_config(
 
     # Create a new index for this config
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}"
     )
     match index_type:
         case "flat":
@@ -1088,6 +1144,14 @@ def evaluate_config(
                 override=True,
                 verbose_level="init",
                 store_embeddings=True,  # Required for reranking
+                index_folder="indexes",
+            )
+        case "faiss_ivfpq":
+            config_index = indexes.FaissIVFPQ(
+                name=config_index_name,
+                override=True,
+                verbose_level="all",
+                index_folder="indexes",
             )
         case _:
             raise ValueError(f"Invalid index type: {index_type}")
@@ -1358,7 +1422,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="plaid",
         help="Index type to use (default: 'plaid')",
-        choices=["flat", "plaid", "scann"],
+        choices=["flat", "plaid", "scann", "faiss_ivfpq"],
     )
     parser.add_argument(
         "--experiment_output_dir",
@@ -1435,6 +1499,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="For ProxyAttentionColBERT: comma-separated list of num_select_tokens values to evaluate (e.g., '8,16,24,32'). If not specified, uses default values.",
     )
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="Model dtype for loading (default: 'fp32'). Options: 'fp32' (float32), 'fp16' (float16), 'bf16' (bfloat16).",
+    )
     return parser.parse_args()
 
 
@@ -1478,7 +1549,7 @@ def main() -> None:
     # Load model (for standard ColBERT and ConstBERT, load once; for proxy, we'll reload per config)
     model = None
     if not is_proxy_model:
-        model = load_model(args.model_name, args.dataset_name, args.document_length)
+        model = load_model(args.model_name, args.dataset_name, args.document_length, model_dtype=args.model_dtype)
 
     # Set up experiment output directory and results file path
     if args.append_to:
@@ -1603,6 +1674,7 @@ def main() -> None:
                 batch_size=args.batch_size,
                 num_gpus=args.num_gpus,
                 model_type=multi_gpu_model_type,
+                model_dtype=args.model_dtype,
             )
         else:
             # Single GPU encoding
@@ -1669,6 +1741,7 @@ def main() -> None:
             "dataset_name": args.dataset_name,
             "num_documents": stats.get("num_documents"),
             "num_configs": len(configs),
+            "model_dtype": args.model_dtype,
             "args": {
                 "index_type": args.index_type,
                 "batch_size": args.batch_size,
@@ -1751,6 +1824,7 @@ def main() -> None:
                 args.dataset_name,
                 args.document_length,
                 num_select_tokens=num_select,
+                model_dtype=args.model_dtype,
             )
 
             # Encode documents (compression happens during encoding)
