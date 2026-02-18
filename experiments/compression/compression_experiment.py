@@ -1139,7 +1139,7 @@ def evaluate_config_with_shards(
 
     # Create index (reuse same name to overwrite previous and save disk space)
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_index_{index_type}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}"
     )
 
     if index_type == "faiss_ivfpq":
@@ -1401,9 +1401,9 @@ def evaluate_config(
     print(f"\n[{config_idx}] Evaluating: {config_name}")
     print("-" * 80)
 
-    # Create a new index (reuse same name to overwrite previous and save disk space)
+    # Create a new index for this config
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_index_{index_type}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}"
     )
     match index_type:
         case "flat":
@@ -2000,7 +2000,7 @@ def encode_and_save_shards(
     model: ColBERT | ProxyAttentionColBERT | ConstBERT,
     documents: list[dict],
     save_shards_dir: Path,
-    shard_size: int = 50000,
+    shard_size: int = 250_000,
     batch_size: int = 1000,
     model_type: str = "ColBERT",
 ) -> list[Path]:
@@ -2235,12 +2235,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable GPU for fastkmeans in spherical pooling (experimental, will fallback to CPU on error)",
     )
     parser.add_argument(
-        "--skip",
-        type=int,
-        default=0,
-        help="Number of configs to skip (for resuming experiments). Skips configs 0 to skip-1.",
-    )
-    parser.add_argument(
         "--append_to",
         type=str,
         default=None,
@@ -2312,6 +2306,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50000,
         help="Number of documents per shard when saving with --save_shards_dir (default: 50000).",
+    )
+    parser.add_argument(
+        "--config_start",
+        type=int,
+        default=None,
+        help="Start index (inclusive) of configs to evaluate (default: 0). "
+             "Use with --config_end to run a slice of configs in parallel jobs.",
+    )
+    parser.add_argument(
+        "--config_end",
+        type=int,
+        default=None,
+        help="End index (exclusive) of configs to evaluate (default: all configs). "
+             "Use with --config_start to run a slice of configs in parallel jobs.",
     )
     return parser.parse_args()
 
@@ -2507,6 +2515,17 @@ def main() -> None:
                 print(f"  [{i}] Baseline (no compression)")
             else:
                 print(f"  [{i}] {config.description}")
+
+    # Determine effective config range for this job
+    effective_start = args.config_start if args.config_start is not None else 0
+    effective_end = args.config_end
+    if effective_end is not None:
+        effective_end = min(effective_end, len(configs))
+
+    if effective_start > 0 or effective_end is not None:
+        end_display = effective_end if effective_end is not None else len(configs)
+        print(f"\n✓ Config slice: [{effective_start}, {end_display}) of {len(configs)} total configs")
+        print(f"  Evaluating {end_display - effective_start} configs in this job")
 
     # For standard ColBERT and ConstBERT: encode documents once upfront
     # For ProxyAttentionColBERT: encoding happens per-config (inside the loop)
@@ -2737,8 +2756,12 @@ def main() -> None:
         retrieval_results_output_dir.mkdir(parents=True, exist_ok=True)
 
     for config_idx, config in enumerate(configs):
-        # Skip configs if --skip is specified (for resuming experiments)
-        if config_idx < args.skip:
+        # Skip configs outside the requested range
+        # Stop at effective_end (no placeholders needed for trailing configs)
+        if effective_end is not None and config_idx >= effective_end:
+            break
+
+        if config_idx < effective_start:
             if is_constbert:
                 config_name = f"ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)"
             elif is_proxy_model:
@@ -2746,7 +2769,7 @@ def main() -> None:
             else:
                 config_name = "Baseline (no compression)" if config is None else config.description
             print(f"\n[{config_idx}] Skipping: {config_name}")
-            # Add placeholder stats for skipped configs
+            # Add placeholder stats for skipped leading configs (maintains stats array alignment)
             stats["config_token_counts"].append(0)
             stats["avg_tokens_per_doc"].append(0)
             stats["compression_times"].append(0)
@@ -2937,8 +2960,8 @@ def main() -> None:
 
     stats["total_time"] = time.time() - overall_start
 
-    # Print experiment statistics
-    print_experiment_statistics(stats, configs)
+    # Print experiment statistics (only for configs that were processed)
+    print_experiment_statistics(stats, configs[:len(stats["config_token_counts"])])
 
     # Print summary table
     df = print_results_table(all_evaluation_results, metrics=args.metrics)

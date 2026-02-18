@@ -176,3 +176,4 @@ logs/
 
 # hydra config
 .hydra/
+shards
