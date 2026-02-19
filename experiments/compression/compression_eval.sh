@@ -16,7 +16,7 @@ set -euo pipefail
 # Args / Mode
 # ----------------------------------------------------------------------------
 SBATCH_MODE=0
-DISPATCH_MODE=0
+DISPATCH_MODE=1
 # Parse flags: --sbatch or --dispatch (mutually exclusive)
 while [[ ${1:-} =~ ^-- ]]; do
   case "${1}" in
@@ -67,16 +67,16 @@ BEIR_DATASETS=(
     # "beir/fiqa/test"
     # "beir/trec-covid"
     # "beir/scifact/test"
-    "beir/scidocs/test"
+    "beir/scidocs"
+    "beir/arguana"
     "beir/webis-touche2020/v2"
     "beir/quora/test"
-    "beir/nq"
-    "beir/hotpotqa/test"
-    "beir/fever/test"
-    "beir/climate-fever"
-    "beir/dbpedia-entity/test"
-    "beir/arguana"
-    "beir/msmarco/dev"
+    # "beir/hotpotqa/test"
+    # "beir/fever/test"
+    # "beir/climate-fever"
+    # "beir/dbpedia-entity/test"
+    # "beir/nq"
+    # "beir/msmarco/dev"
 )
 
 # Override with specific datasets if provided

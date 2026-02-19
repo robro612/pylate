@@ -398,7 +398,7 @@ def encode_documents_with_cache(
                 is_query=False,
                 show_progress_bar=True,
                 convert_to_tensor=True,
-                normalize_embeddings=False,  # Keep unnormalized for compression
+                normalize_embeddings=True,  # Still use normalized embeddings for compression
                 return_extra_artifacts={"input_ids": True, "attention_scores": True},
             )
             # Move artifacts to CPU if needed (to match embeddings device)
@@ -417,6 +417,7 @@ def encode_documents_with_cache(
                 is_query=False,
                 show_progress_bar=True,
                 convert_to_tensor=True,
+                normalize_embeddings=True, # Normalize embeddings for compression
             )
 
         shard_embeddings = cast_embeddings(shard_embeddings, embedding_dtype)
@@ -472,6 +473,7 @@ def encode_queries_with_cache(
         show_progress_bar=True,
         batch_size=batch_size,
         convert_to_tensor=True,
+        normalize_embeddings=True,
     )
     query_embeddings = cast_embeddings(query_embeddings, embedding_dtype)
     if move_to_cpu:
@@ -499,6 +501,34 @@ def serialize_config_for_storage(config: Optional[CompressionConfig]) -> Dict[st
     if config is None:
         return {"type": "baseline", "description": "No compression"}
     return config.serialize()
+
+
+def scan_existing_results(results_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Scan an existing results directory and build a map of config_name → result data.
+
+    This enables content-based resume matching: even if config indices changed
+    between runs (e.g. new keep_ratio values were added), we can still recognise
+    previously-completed experiments by their description string.
+
+    Returns:
+        Dict mapping config_name (str) to the full evaluation dict loaded from
+        ``config_N/evaluation.json``.
+    """
+    existing: Dict[str, Dict[str, Any]] = {}
+    for config_dir in sorted(results_dir.glob("config_*")):
+        eval_file = config_dir / "evaluation.json"
+        if not eval_file.exists():
+            continue
+        try:
+            with open(eval_file, "r") as f:
+                data = json.load(f)
+            name = data.get("config_name")
+            if name:
+                existing[name] = data
+                logger.debug("Found existing result: %s (config_%s)", name, data.get("config_idx"))
+        except Exception as exc:
+            logger.warning("Could not load %s: %s", eval_file, exc)
+    return existing
 
 
 def load_configs_from_jsonl(jsonl_path: Path, model: models.ColBERT) -> List[Optional[CompressionConfig]]:
@@ -617,7 +647,7 @@ def create_default_configs(model: models.ColBERT) -> List[Optional[CompressionCo
 
     # Clustering-based pooling
     for method in ["spherical", "hierarchical"]:
-        for k in [2, 3, 5, 10]:
+        for k in [1.333, 2, 3, 5, 10]:
             pooling_config = PoolingConfig(
                 pool_factor=k,
                 protected_tokens=1,
@@ -971,10 +1001,17 @@ def main(cfg: DictConfig) -> None:
     documents, queries, qrels = load_dataset_irds(dataset_id, lowercase=cfg.dataset.lowercase)
     documents_ids = [doc["id"] for doc in documents]
 
-    # Set up output directories - use Hydra's output directory
-    # This ensures configs are saved alongside results in .hydra/
-    hydra_cfg = HydraConfig.get()
-    results_dir = Path(hydra_cfg.runtime.output_dir)
+    # Set up output directories
+    # When resuming into an existing run directory, write results there instead of
+    # the fresh Hydra output directory so everything stays in one place.
+    resume_dir = cfg.compression.get("resume_dir", None)
+    resume_mode = cfg.compression.get("resume", False)
+    if resume_mode and resume_dir:
+        results_dir = Path(resume_dir)
+        logger.info("Resuming into existing results directory: %s", results_dir)
+    else:
+        hydra_cfg = HydraConfig.get()
+        results_dir = Path(hydra_cfg.runtime.output_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     # Extract run_id from the output directory name (timestamp)
     run_id = results_dir.name
@@ -1055,11 +1092,25 @@ def main(cfg: DictConfig) -> None:
 
     all_results: List[Dict[str, Any]] = []
     skip_count = cfg.compression.get("skip", 0)
-    resume_mode = cfg.compression.get("resume", False)
-    resume_dir = cfg.compression.get("resume_dir", None)
 
-    # If resume_dir is specified, use it to check for existing results
-    check_dir = Path(resume_dir) if resume_dir else results_dir
+    # Build name-based lookup of already-completed configs so we can match
+    # even when config indices have changed between runs (e.g. new keep_ratio
+    # values were added to create_default_configs).
+    existing_by_name: Dict[str, Dict[str, Any]] = {}
+    next_config_idx: Optional[int] = None  # next index for newly-run configs
+    if resume_mode:
+        existing_by_name = scan_existing_results(results_dir)
+        logger.info("Found %d existing results in %s", len(existing_by_name), results_dir)
+        # Determine the next available config index so new results are appended
+        # after the last existing directory (avoids overwriting old results that
+        # may have different index→config mappings).
+        existing_indices = [
+            int(d.name.split("_", 1)[1])
+            for d in results_dir.glob("config_*")
+            if d.is_dir() and d.name.split("_", 1)[1].isdigit()
+        ]
+        next_config_idx = (max(existing_indices) + 1) if existing_indices else 0
+        logger.info("New configs will be numbered starting at config_%d", next_config_idx)
 
     with logging_redirect_tqdm():
         for config_idx, config in enumerate(configs):
@@ -1070,23 +1121,24 @@ def main(cfg: DictConfig) -> None:
                 logger.info("[%d] Skipping (skip=%d): %s", config_idx, skip_count, config_name)
                 continue
 
-            # Smart resumption: check if results already exist
-            if resume_mode:
-                config_result_file = check_dir / f"config_{config_idx}" / "evaluation.json"
-                if config_result_file.exists():
-                    logger.info("[%d] Skipping (already completed): %s", config_idx, config_name)
-                    # Load existing result for summary
-                    try:
-                        with open(config_result_file, "r") as f:
-                            existing_result = json.load(f)
-                        all_results.append(existing_result)
-                    except Exception as e:
-                        logger.warning("[%d] Could not load existing result: %s", config_idx, e)
-                    continue
+            # Smart resumption: match by config *name* (content-based) so that
+            # old runs with a different numbering scheme can still be resumed.
+            if resume_mode and config_name in existing_by_name:
+                logger.info("[%d] Skipping (already completed): %s", config_idx, config_name)
+                all_results.append(existing_by_name[config_name])
+                continue
+
+            # When resuming, assign sequential indices after the last existing
+            # directory so we never overwrite old results.
+            if resume_mode and next_config_idx is not None:
+                run_idx = next_config_idx
+                next_config_idx += 1
+            else:
+                run_idx = config_idx
 
             result = evaluate_compression_config(
                 cfg=cfg,
-                config_idx=config_idx,
+                config_idx=run_idx,
                 config=config,
                 documents=documents,
                 documents_embeddings=documents_embeddings,

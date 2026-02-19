@@ -3,7 +3,7 @@ from typing import Optional, Literal
 
 @dataclass
 class PoolingConfig(CompressionStrategyConfigBase):
-    pool_factor: int = 1
+    pool_factor: float = 1
     protected_tokens: int = 1
     clustering_method: Literal["hierarchical", "spherical"] = "hierarchical"
     # Variant for hierarchical clustering behavior:
@@ -140,7 +140,7 @@ class PoolingStrategy(CompressionStrategy):
     def _pool_embeddings_hierarchical(
         self,
         documents_embeddings: list[torch.Tensor],
-        pool_factor: int,
+        pool_factor: float,
         protected_tokens: int,
     ) -> tuple[list[torch.Tensor], list[list[int]]]:
         """
@@ -267,7 +267,7 @@ class PoolingStrategy(CompressionStrategy):
                 if num_clusters == 0 and num_embeddings > 0:
                     num_clusters = 1
             else:
-                num_clusters = max(num_embeddings // pool_factor, 1)
+                num_clusters = int(max(num_embeddings // pool_factor, 1))
             cluster_labels = hierarchy.fcluster(
                 clusters, t=num_clusters, criterion="maxclust"
             )
@@ -296,7 +296,7 @@ class PoolingStrategy(CompressionStrategy):
     def _pool_embeddings_spherical(
         self,
         documents_embeddings: list[torch.Tensor],
-        pool_factor: int,
+        pool_factor: float,
         protected_tokens: int,
     ) -> tuple[list[torch.Tensor], list[list[int]]]:
         """
@@ -395,8 +395,8 @@ class PoolingStrategy(CompressionStrategy):
                 if num_clusters == 0 and num_embeddings > 0:
                     num_clusters = 1
             else:
-                num_clusters = max(num_embeddings // pool_factor, 1)
-            
+                num_clusters = int(max(num_embeddings // pool_factor, 1))
+
             # If we have fewer embeddings than clusters, just use all embeddings
             if num_clusters >= num_embeddings:
                 pooled_embeddings.append(document_embeddings)
