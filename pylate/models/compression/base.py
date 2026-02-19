@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -24,6 +25,23 @@ from ..utils import TokenTFIDFStats
 # Artifacts can be shape-matched (list[torch.Tensor]) or metadata (Any)
 CompressionArtifacts = dict[str, Union[list[torch.Tensor], Any]]
 
+
+
+def _available_worker_threads() -> int:
+    """
+    Estimate usable CPU worker threads for parallel compression.
+
+    Prefers cpuset-aware affinity on cluster schedulers and keeps one core
+    free for the main thread / system overhead.
+    """
+    try:
+        # Respect CPU affinity limits (e.g., SLURM cgroups/cpuset).
+        cpu_count = len(os.sched_getaffinity(0))
+    except Exception:
+        cpu_count = os.cpu_count() or 1
+
+    # Keep one core free to reduce oversubscription pressure.
+    return max(1, cpu_count - 1)
 
 
 class CompressionStrategyConfigBase(ABC):
@@ -122,7 +140,11 @@ class CompressionStrategy(ABC):
         
         # Determine number of workers
         if num_workers is None:
-            num_workers = min(batch_size, len(embeddings), 8)  # Cap at 8 workers by default
+            num_workers = min(
+                batch_size,
+                len(embeddings),
+                _available_worker_threads(),
+            )
         num_workers = max(1, num_workers)  # At least 1 worker
         
         # If we have very few documents, just use the regular compress method

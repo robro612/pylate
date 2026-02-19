@@ -913,7 +913,7 @@ def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[Com
             keep_ratio=keep_ratio,
             protected_tokens=1,
             min_tokens=8,
-            show_progress_bar=True,
+            show_progress_bar=False,
         )
         attention_pool_strategy = AttentionPoolingStrategy(attention_pool_config)
         attention_pool_compression_config = CompressionConfig(
@@ -995,7 +995,7 @@ def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[Com
                 pool_factor=k,
                 protected_tokens=1,
                 clustering_method=method,
-                show_progress_bar=True,
+                show_progress_bar=False,
                 kmeans_gpu=kmeans_gpu if method == "spherical" else False,
             )
             strategy = PoolingStrategy(pooling_config)
@@ -1137,9 +1137,8 @@ def evaluate_config_with_shards(
             f"Sharded mode only supports 'faiss_ivfpq' and 'plaid' indexes. Got: {index_type}"
         )
 
-    # Create index (reuse same name to overwrite previous and save disk space)
     config_index_name = (
-        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}"
+        f"{dataset_name}_{model_name.split('/')[-1]}_config_{config_idx}_index_{index_type}_run_id_{run_id}"
     )
 
     if index_type == "faiss_ivfpq":
@@ -1187,9 +1186,7 @@ def evaluate_config_with_shards(
         if config is None:
             # Baseline: normalize embeddings
             import torch.nn.functional as F
-            compressed_embeddings = [
-                F.normalize(emb, p=2, dim=-1) for emb in shard_embeddings
-            ]
+            compressed_embeddings = torch.nn.functional.normalize(shard_embeddings, p=2, dim=-1)
         else:
             # Compress shard
             compressor = config.create_compressor()
@@ -1197,8 +1194,8 @@ def evaluate_config_with_shards(
                 embeddings=shard_embeddings,
                 artifacts=shard_artifacts,
                 batch_size=compression_batch_size,
-                num_workers=4,
-                show_progress=False,
+                num_workers=None,
+                show_progress=True,
             )
             # Normalize after compression
             import torch.nn.functional as F
@@ -2172,6 +2169,113 @@ def encode_and_save_shards(
     return shard_files
 
 
+def _query_cache_path(cache_dir: Path) -> Path:
+    return cache_dir / "queries_embeddings.pt"
+
+
+def _idf_cache_path(shard_dir: Path) -> Path:
+    return shard_dir / "idf_stats_cache.pt"
+
+
+def load_idf_stats_cache(shard_dir: Path) -> tuple[dict[int, float], int] | None:
+    cache_path = _idf_cache_path(shard_dir)
+    if not cache_path.exists():
+        return None
+    try:
+        cache_data = torch.load(cache_path, map_location="cpu")
+        idf_scores = cache_data["idf_scores"]
+        total_docs = cache_data["total_docs"]
+        print(f"✓ Loaded cached IDF stats from {cache_path}")
+        print(f"  Unique tokens: {len(idf_scores):,}")
+        print(f"  Total documents: {total_docs:,}")
+        return idf_scores, total_docs
+    except Exception as exc:
+        print(f"Warning: Failed to load IDF stats cache from {cache_path}: {exc}")
+        return None
+
+
+def save_idf_stats_cache(
+    shard_dir: Path,
+    idf_scores: dict[int, float],
+    total_docs: int,
+) -> None:
+    cache_path = _idf_cache_path(shard_dir)
+    torch.save({"idf_scores": idf_scores, "total_docs": total_docs}, cache_path)
+    print(f"✓ Saved IDF stats cache to {cache_path}")
+
+
+def _move_embeddings_to_cpu(embeddings: Any) -> Any:
+    if torch.is_tensor(embeddings):
+        return embeddings.detach().cpu()
+    if isinstance(embeddings, list):
+        return [emb.detach().cpu() if torch.is_tensor(emb) else emb for emb in embeddings]
+    return embeddings
+
+
+def load_query_embeddings_cache(
+    cache_dir: Path,
+    queries: dict,
+    model_name: str,
+    dataset_name: str,
+    model_dtype: str,
+    query_length: int,
+) -> list | None:
+    cache_path = _query_cache_path(cache_dir)
+    if not cache_path.exists():
+        return None
+
+    try:
+        cache_data = torch.load(cache_path, map_location="cpu")
+    except Exception as exc:
+        print(f"Warning: Failed to load cached queries from {cache_path}: {exc}")
+        return None
+
+    if not isinstance(cache_data, dict) or "embeddings" not in cache_data or "metadata" not in cache_data:
+        print(f"Warning: Invalid query cache format in {cache_path}. Re-encoding queries.")
+        return None
+
+    metadata = cache_data.get("metadata", {})
+    expected_metadata = {
+        "model_name": model_name,
+        "dataset_name": dataset_name,
+        "model_dtype": model_dtype,
+        "query_length": query_length,
+        "num_queries": len(queries),
+        "query_ids": list(queries.keys()),
+    }
+    for key, expected_value in expected_metadata.items():
+        if metadata.get(key) != expected_value:
+            print(f"Warning: Query cache metadata mismatch for '{key}'. Re-encoding queries.")
+            return None
+
+    return cache_data["embeddings"]
+
+
+def save_query_embeddings_cache(
+    cache_dir: Path,
+    queries_embeddings: list,
+    queries: dict,
+    model_name: str,
+    dataset_name: str,
+    model_dtype: str,
+    query_length: int,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _query_cache_path(cache_dir)
+    cache_data = {
+        "embeddings": _move_embeddings_to_cpu(queries_embeddings),
+        "metadata": {
+            "model_name": model_name,
+            "dataset_name": dataset_name,
+            "model_dtype": model_dtype,
+            "query_length": query_length,
+            "num_queries": len(queries),
+            "query_ids": list(queries.keys()),
+        },
+    }
+    torch.save(cache_data, cache_path)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Compression experiment evaluation")
@@ -2321,6 +2425,14 @@ def parse_args() -> argparse.Namespace:
         help="End index (exclusive) of configs to evaluate (default: all configs). "
              "Use with --config_start to run a slice of configs in parallel jobs.",
     )
+    parser.add_argument(
+        "--config_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit list of config indices to evaluate (e.g. --config_indices 3 7 25 36). "
+             "Cannot be used together with --config_start or --config_end.",
+    )
     return parser.parse_args()
 
 
@@ -2328,6 +2440,11 @@ def main() -> None:
     """Main execution function."""
     args = parse_args()
     overall_start = time.time()
+
+    # Validate mutual exclusivity of config selection arguments
+    if args.config_indices is not None and (args.config_start is not None or args.config_end is not None):
+        print("Error: --config_indices cannot be used together with --config_start or --config_end.")
+        sys.exit(1)
 
     # Determine mode: encode-to-shards, load-shards, or in-memory
     save_shards = args.save_shards_dir is not None
@@ -2516,13 +2633,22 @@ def main() -> None:
             else:
                 print(f"  [{i}] {config.description}")
 
-    # Determine effective config range for this job
+    # Determine effective config selection for this job
+    effective_indices = None  # None means use slice logic below
     effective_start = args.config_start if args.config_start is not None else 0
     effective_end = args.config_end
     if effective_end is not None:
         effective_end = min(effective_end, len(configs))
 
-    if effective_start > 0 or effective_end is not None:
+    if args.config_indices is not None:
+        effective_indices = set(args.config_indices)
+        invalid = effective_indices - set(range(len(configs)))
+        if invalid:
+            print(f"Error: --config_indices contains out-of-range indices: {sorted(invalid)} "
+                  f"(valid range: 0-{len(configs) - 1})")
+            sys.exit(1)
+        print(f"\n✓ Config indices: {sorted(effective_indices)} ({len(effective_indices)} configs in this job)")
+    elif effective_start > 0 or effective_end is not None:
         end_display = effective_end if effective_end is not None else len(configs)
         print(f"\n✓ Config slice: [{effective_start}, {end_display}) of {len(configs)} total configs")
         print(f"  Evaluating {end_display - effective_start} configs in this job")
@@ -2550,6 +2676,43 @@ def main() -> None:
         if model is None:
             model = load_model(args.model_name, args.dataset_name, args.document_length, model_dtype=args.model_dtype)
 
+        # Encode queries (with cache)
+        print("\n" + "=" * 80)
+        print("Encoding queries...")
+        print("=" * 80)
+        cache_path = _query_cache_path(save_shards_dir)
+        queries_embeddings = load_query_embeddings_cache(
+            cache_dir=save_shards_dir,
+            queries=queries,
+            model_name=args.model_name,
+            dataset_name=args.dataset_name,
+            model_dtype=args.model_dtype,
+            query_length=model.query_length,
+        )
+        if queries_embeddings is not None:
+            query_encoding_time = 0
+            print(f"✓ Loaded cached queries from {cache_path}")
+        else:
+            query_encoding_start = time.time()
+            queries_embeddings = model.encode(
+                sentences=list(queries.values()),
+                is_query=True,
+                show_progress_bar=True,
+                batch_size=512,
+                convert_to_tensor=True,
+            )
+            query_encoding_time = time.time() - query_encoding_start
+            save_query_embeddings_cache(
+                cache_dir=save_shards_dir,
+                queries_embeddings=queries_embeddings,
+                queries=queries,
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                model_dtype=args.model_dtype,
+                query_length=model.query_length,
+            )
+            print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
+
         # Determine model type
         if is_constbert:
             encoding_model_type = "ConstBERT"
@@ -2571,21 +2734,6 @@ def main() -> None:
         encoding_time = time.time() - encoding_start
         print(f"\n✓ Total encoding time: {encoding_time:.3f}s")
 
-        # Encode queries
-        print("\n" + "=" * 80)
-        print("Encoding queries...")
-        print("=" * 80)
-        query_encoding_start = time.time()
-        queries_embeddings = model.encode(
-            sentences=list(queries.values()),
-            is_query=True,
-            show_progress_bar=True,
-            batch_size=512,
-            convert_to_tensor=True,
-        )
-        query_encoding_time = time.time() - query_encoding_start
-        print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
-
     elif use_sharded_mode:
         # Load existing shards mode (sharded_input_dir provided)
         print("\n" + "=" * 80)
@@ -2597,20 +2745,43 @@ def main() -> None:
         if model is None:
             model = load_model(args.model_name, args.dataset_name, args.document_length, model_dtype=args.model_dtype)
 
-        # Encode queries
+        # Encode queries (with cache)
         print("\n" + "=" * 80)
         print("Encoding queries...")
         print("=" * 80)
-        query_encoding_start = time.time()
-        queries_embeddings = model.encode(
-            sentences=list(queries.values()),
-            is_query=True,
-            show_progress_bar=True,
-            batch_size=512,
-            convert_to_tensor=True,
+        cache_dir = Path(args.sharded_input_dir)
+        cache_path = _query_cache_path(cache_dir)
+        queries_embeddings = load_query_embeddings_cache(
+            cache_dir=cache_dir,
+            queries=queries,
+            model_name=args.model_name,
+            dataset_name=args.dataset_name,
+            model_dtype=args.model_dtype,
+            query_length=model.query_length,
         )
-        query_encoding_time = time.time() - query_encoding_start
-        print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
+        if queries_embeddings is not None:
+            query_encoding_time = 0
+            print(f"✓ Loaded cached queries from {cache_path}")
+        else:
+            query_encoding_start = time.time()
+            queries_embeddings = model.encode(
+                sentences=list(queries.values()),
+                is_query=True,
+                show_progress_bar=True,
+                batch_size=512,
+                convert_to_tensor=True,
+            )
+            query_encoding_time = time.time() - query_encoding_start
+            save_query_embeddings_cache(
+                cache_dir=cache_dir,
+                queries_embeddings=queries_embeddings,
+                queries=queries,
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                model_dtype=args.model_dtype,
+                query_length=model.query_length,
+            )
+            print(f"✓ Encoded {len(queries_embeddings)} queries in {query_encoding_time:.3f}s")
 
     elif not is_proxy_model:  # This includes ConstBERT (encodes once)
         # Encode documents once with artifacts (input_ids needed for IDF pruning)
@@ -2733,8 +2904,14 @@ def main() -> None:
             print("GLOBAL IDF STATISTICS REQUIRED")
             print("=" * 80)
             print("Some compression configs require global IDF statistics.")
-            print("Attempting to aggregate from shard metadata...")
-            global_idf_stats = aggregate_idf_from_shard_metadata(shard_files)
+            shard_dir = shard_files[0][0].parent
+            cached = load_idf_stats_cache(shard_dir)
+            if cached is not None:
+                global_idf_stats = cached
+            else:
+                print("Attempting to aggregate from shard metadata...")
+                global_idf_stats = aggregate_idf_from_shard_metadata(shard_files)
+                save_idf_stats_cache(shard_dir, global_idf_stats[0], global_idf_stats[1])
 
     # Evaluate each compression config
     print("\n" + "=" * 80)
@@ -2756,24 +2933,32 @@ def main() -> None:
         retrieval_results_output_dir.mkdir(parents=True, exist_ok=True)
 
     for config_idx, config in enumerate(configs):
-        # Skip configs outside the requested range
-        # Stop at effective_end (no placeholders needed for trailing configs)
-        if effective_end is not None and config_idx >= effective_end:
-            break
+        # Skip configs outside the requested selection
+        if effective_indices is not None:
+            if config_idx not in effective_indices:
+                # Add placeholder stats to maintain array alignment by config_idx
+                stats["config_token_counts"].append(0)
+                stats["avg_tokens_per_doc"].append(0)
+                stats["compression_times"].append(0)
+                continue
+        else:
+            # Slice mode: stop at effective_end, skip before effective_start
+            if effective_end is not None and config_idx >= effective_end:
+                break
 
-        if config_idx < effective_start:
-            if is_constbert:
-                config_name = f"ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)"
-            elif is_proxy_model:
-                config_name = f"ProxyAttention num_select={config}"
-            else:
-                config_name = "Baseline (no compression)" if config is None else config.description
-            print(f"\n[{config_idx}] Skipping: {config_name}")
-            # Add placeholder stats for skipped leading configs (maintains stats array alignment)
-            stats["config_token_counts"].append(0)
-            stats["avg_tokens_per_doc"].append(0)
-            stats["compression_times"].append(0)
-            continue
+            if config_idx < effective_start:
+                if is_constbert:
+                    config_name = f"ConstBERT (fixed {constbert_config['constbert_seq_length']} tokens)"
+                elif is_proxy_model:
+                    config_name = f"ProxyAttention num_select={config}"
+                else:
+                    config_name = "Baseline (no compression)" if config is None else config.description
+                print(f"\n[{config_idx}] Skipping: {config_name}")
+                # Add placeholder stats for skipped leading configs (maintains stats array alignment)
+                stats["config_token_counts"].append(0)
+                stats["avg_tokens_per_doc"].append(0)
+                stats["compression_times"].append(0)
+                continue
 
         compression_start = time.time()
 
@@ -2857,7 +3042,7 @@ def main() -> None:
                         embeddings=documents_embeddings,
                         artifacts=artifacts,
                         batch_size=args.batch_size,
-                        num_workers=8,
+                        num_workers=None,
                         show_progress=True,
                     )
 
