@@ -154,7 +154,7 @@ def _encode_worker(
         is_query=False,
         show_progress_bar=True,
         convert_to_tensor=False,  # Keep as numpy for pickling
-        normalize_embeddings=False,
+        normalize_embeddings=True,
         return_extra_artifacts=extra_artifacts,
     )
 
@@ -243,7 +243,7 @@ def encode_multi_gpu(
             is_query=False,
             show_progress_bar=True,
             convert_to_tensor=True,
-            normalize_embeddings=False,
+            normalize_embeddings=True,
             return_extra_artifacts=extra_artifacts,
         )
 
@@ -935,7 +935,7 @@ def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[Com
             description=f"Leverage score pruning keep_ratio={keep_ratio}",
         )
         configs.append(config)
-    
+
         # # Global IDF pruning configs
         # pruning_config = IDFPruningConfig(
         #     mode="global",
@@ -953,7 +953,7 @@ def create_default_configs(model: ColBERT, kmeans_gpu: bool = False) -> list[Com
         #     description=f"Global IDF pruning keep_ratio={keep_ratio}",
         # )
         # configs.append(config)
-    
+
         # Document-wise IDF pruning configs
         pruning_config = IDFPruningConfig(
             mode="document",
@@ -1182,12 +1182,14 @@ def evaluate_config_with_shards(
             shard_artifacts["global_total_docs"] = total_docs
 
         # Apply compression if needed
+        import torch.nn.functional as F
         compression_start = time.time()
         if config is None:
             # Baseline: normalize embeddings
-            import torch.nn.functional as F
-            compressed_embeddings = torch.nn.functional.normalize(shard_embeddings, p=2, dim=-1)
+            compressed_embeddings = [F.normalize(emb, p=2, dim=-1) for emb in shard_embeddings]
         else:
+            # Normalize before compression (safety guard; shards are normalized at encode time)
+            shard_embeddings = [F.normalize(emb, p=2, dim=-1) for emb in shard_embeddings]
             # Compress shard
             compressor = config.create_compressor()
             compressed_embeddings, _ = compressor.compress_parallel(
@@ -1198,7 +1200,6 @@ def evaluate_config_with_shards(
                 show_progress=True,
             )
             # Normalize after compression
-            import torch.nn.functional as F
             compressed_embeddings = [
                 F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
             ]
@@ -2081,7 +2082,7 @@ def encode_and_save_shards(
             is_query=False,
             show_progress_bar=True,
             convert_to_tensor=True,
-            normalize_embeddings=False,  # Keep unnormalized for compression
+            normalize_embeddings=True,
             return_extra_artifacts=extra_artifacts,
         )
 
@@ -2700,6 +2701,7 @@ def main() -> None:
                 show_progress_bar=True,
                 batch_size=512,
                 convert_to_tensor=True,
+                normalize_embeddings=True,
             )
             query_encoding_time = time.time() - query_encoding_start
             save_query_embeddings_cache(
@@ -2770,6 +2772,7 @@ def main() -> None:
                 show_progress_bar=True,
                 batch_size=512,
                 convert_to_tensor=True,
+                normalize_embeddings=True,
             )
             query_encoding_time = time.time() - query_encoding_start
             save_query_embeddings_cache(
@@ -2785,9 +2788,8 @@ def main() -> None:
 
     elif not is_proxy_model:  # This includes ConstBERT (encodes once)
         # Encode documents once with artifacts (input_ids needed for IDF pruning)
-        # Use normalize_embeddings=False to get unnormalized embeddings for importance scoring
         print("\n" + "=" * 80)
-        print("Encoding documents (unnormalized for importance scoring)...")
+        print("Encoding documents...")
         print("=" * 80)
         encoding_start = time.time()
 
@@ -2821,13 +2823,12 @@ def main() -> None:
                 is_query=False,
                 show_progress_bar=True,
                 convert_to_tensor=True,
-                normalize_embeddings=False,  # Keep unnormalized for importance scoring
+                normalize_embeddings=True,
                 return_extra_artifacts=single_gpu_artifacts,
             )
 
         encoding_time = time.time() - encoding_start
         print(f"✓ Encoded {len(documents_embeddings)} documents in {encoding_time:.3f}s")
-        print(f"   Embeddings are UNNORMALIZED (for importance-based compression)")
 
         # Encode queries once
         print("\n" + "=" * 80)
@@ -2840,6 +2841,7 @@ def main() -> None:
             show_progress_bar=True,
             batch_size=512,
             convert_to_tensor=True,
+            normalize_embeddings=True,
         )
         query_encoding_time = time.time() - query_encoding_start
 
@@ -2997,6 +2999,7 @@ def main() -> None:
                 is_query=False,
                 show_progress_bar=True,
                 convert_to_tensor=True,
+                normalize_embeddings=True,
             )
             config_encoding_time = time.time() - encoding_start
             print(f"✓ Encoded {len(current_documents_embeddings)} documents in {config_encoding_time:.3f}s")
@@ -3015,6 +3018,7 @@ def main() -> None:
                     show_progress_bar=True,
                     batch_size=512,
                     convert_to_tensor=True,
+                    normalize_embeddings=True,
                 )
                 stats["query_encoding_time"] = time.time() - query_encoding_start
 
@@ -3037,7 +3041,10 @@ def main() -> None:
                 else:
                     compressor = config.create_compressor()
 
-                    # Compress with unnormalized embeddings (for importance scoring)
+                    # Normalize before compression (safety guard; embeddings normalized at encode time)
+                    import torch.nn.functional as F
+                    documents_embeddings = [F.normalize(emb, p=2, dim=-1) for emb in documents_embeddings]
+
                     compressed_embeddings, _ = compressor.compress_parallel(
                         embeddings=documents_embeddings,
                         artifacts=artifacts,
@@ -3047,7 +3054,6 @@ def main() -> None:
                     )
 
                     # Normalize embeddings AFTER compression
-                    import torch.nn.functional as F
                     compressed_embeddings = [
                         F.normalize(emb, p=2, dim=-1) for emb in compressed_embeddings
                     ]
