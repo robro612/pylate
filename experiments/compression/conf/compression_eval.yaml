@@ -1,0 +1,82 @@
+# Compression evaluation configuration
+# Usage: python compression_eval.py model.name_or_path=<model> dataset.name=<dataset>
+
+model:
+  name_or_path: "lightonai/GTE-ModernColBERT-v1"
+  doc_len: 300
+  query_len: null  # Auto-detect from dataset
+  dtype: "fp16"
+  compile: false
+
+dataset:
+  name: "beir/nfcorpus/test"
+  lowercase: false
+
+cache:
+  enable: true
+  dir: "cache/embeddings"
+  schema_version: 1
+  embedding_dtype: "fp16"
+
+encode:
+  batch_size: 1000
+  shard_size: 500000
+  move_embeddings_to_cpu: true
+
+compression:
+  configs_file: null  # Path to JSONL file with compression configs (null = use defaults)
+  indices: null  # List of config indices to run, e.g. [0,3,5] (null = run all)
+  skip: 0  # Number of configs to skip (for resuming)
+  resume: false  # If true, skip configs that already have results (smart resumption)
+  resume_dir: null  # Directory to check for existing results (null = auto-detect from previous runs)
+
+retrieve:
+  k: 100
+  verbose: false
+
+index:
+  # Backend selection and resource controls for PLAID indexing/search
+  use_fast: true        # true = Rust fast-plaid; false = Stanford PLAID (slower/CPU)
+  device: cpu          # null = auto (CUDA if available). Use "cpu" to avoid GPU OOM.
+  nbits: 1              # Residual bits
+  kmeans_niters: 4
+  max_points_per_centroid: 256
+  n_ivf_probe: 8        # search probes; reduce if OOM during search
+  n_full_scores: 8192   # re-rank candidates; reduce to save memory
+  n_samples_kmeans: 250000  # optionally cap KMeans training samples (e.g., 1000000)
+  batch_size: 16384     # internal query batch size for search (lower = less GPU mem)
+  use_triton: null      # leave null to use library default
+  # If a CUDA OOM happens while building the index, automatically retry on CPU.
+  fallback_on_oom: false
+
+metrics:
+  - "map"
+  - "ndcg@10"
+  - "ndcg@100"
+  - "recall@10"
+  - "recall@100"
+  - "mrr@10"
+  - "precision@10"
+
+output:
+  results_dir: "results/compression_eval"
+  save_runfile: true
+  save_jsonl: true
+
+hydra:
+  run:
+    # Output directory: results_dir/timestamp
+    dir: ${output.results_dir}/${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: ${output.results_dir}
+    subdir: ${now:%Y%m%d_%H%M%S}
+  job:
+    chdir: false  # Don't change working directory
+  job_logging:
+    formatters:
+      simple:
+        format: '%(message)s'
+  # Hydra saves configs to .hydra/ subdirectory:
+  #   - config.yaml: full resolved config
+  #   - overrides.yaml: CLI overrides
+  #   - hydra.yaml: Hydra internal config
