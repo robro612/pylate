@@ -145,6 +145,13 @@ class XTR:
             if queries_embeddings.ndim == 2:
                 queries_embeddings = [queries_embeddings]
 
+        # WARP handles retrieval and scoring internally
+        if isinstance(self.index, indexes.WARP):
+            return self.index(
+                queries_embeddings=queries_embeddings,
+                k=k,
+            )
+
         if subset is not None:
             raise NotImplementedError(
                 "Subset filtering is not implemented for XTR retrieval yet."
