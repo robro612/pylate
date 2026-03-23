@@ -17,6 +17,8 @@ import pickle
 import time
 import tracemalloc
 
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
 import torch
 
 from pylate import evaluation, indexes, models, retrieve
@@ -41,7 +43,9 @@ def get_dir_size_mb(path: str) -> float:
 
 
 def cache_path(cache_dir: str, dataset: str, model_short: str, name: str) -> str:
-    return os.path.join(cache_dir, f"{dataset}_{model_short}_{name}.pkl")
+    path = os.path.join(cache_dir, dataset, model_short)
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, f"{name}.pkl")
 
 
 def load_or_encode(
@@ -54,7 +58,8 @@ def load_or_encode(
 ) -> tuple:
     """Load dataset and encode (or load cached) embeddings."""
     os.makedirs(cache_dir, exist_ok=True)
-    model_short = model_name.split("/")[-1]
+    parts = [p for p in model_name.split("/") if p]
+    model_short = "_".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
     # Dataset
     data_cp = cache_path(cache_dir, dataset, model_short, "data")
@@ -69,6 +74,10 @@ def load_or_encode(
         with open(data_cp, "wb") as f:
             pickle.dump((documents, queries, qrels), f)
 
+    # Detect multi-GPU
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_multi_gpu = n_gpus > 1
+
     # Document embeddings
     doc_cp = cache_path(cache_dir, dataset, model_short, "doc_emb")
     if os.path.exists(doc_cp):
@@ -76,16 +85,28 @@ def load_or_encode(
         with open(doc_cp, "rb") as f:
             documents_embeddings = pickle.load(f)
     else:
-        print(f"  Encoding {len(documents)} documents...")
+        print(f"  Encoding {len(documents)} documents ({n_gpus} GPU(s))...")
         model = models.ColBERT(
-            model_name_or_path=model_name, document_length=document_length,
+            model_name_or_path=model_name,
+            document_length=document_length,
+            device="cpu" if use_multi_gpu else None,
         )
-        documents_embeddings = model.encode(
-            sentences=[doc["text"] for doc in documents],
-            batch_size=batch_size,
-            is_query=False,
-            show_progress_bar=True,
-        )
+        if use_multi_gpu:
+            pool = model.start_multi_process_pool()
+            documents_embeddings = model.encode_multi_process(
+                sentences=[doc["text"] for doc in documents],
+                pool=pool,
+                batch_size=batch_size,
+                is_query=False,
+            )
+            model.stop_multi_process_pool(pool)
+        else:
+            documents_embeddings = model.encode(
+                sentences=[doc["text"] for doc in documents],
+                batch_size=batch_size,
+                is_query=False,
+                show_progress_bar=True,
+            )
         with open(doc_cp, "wb") as f:
             pickle.dump(documents_embeddings, f)
         del model
@@ -98,17 +119,28 @@ def load_or_encode(
         with open(query_cp, "rb") as f:
             queries_embeddings = pickle.load(f)
     else:
-        print(f"  Encoding {len(queries)} queries...")
+        print(f"  Encoding {len(queries)} queries ({n_gpus} GPU(s))...")
         model = models.ColBERT(
             model_name_or_path=model_name,
             query_length=QUERY_LEN_MAP.get(dataset),
+            device="cpu" if use_multi_gpu else None,
         )
-        queries_embeddings = model.encode(
-            sentences=list(queries.values()),
-            is_query=True,
-            show_progress_bar=True,
-            batch_size=query_batch_size,
-        )
+        if use_multi_gpu:
+            pool = model.start_multi_process_pool()
+            queries_embeddings = model.encode_multi_process(
+                sentences=list(queries.values()),
+                pool=pool,
+                batch_size=query_batch_size,
+                is_query=True,
+            )
+            model.stop_multi_process_pool(pool)
+        else:
+            queries_embeddings = model.encode(
+                sentences=list(queries.values()),
+                is_query=True,
+                show_progress_bar=True,
+                batch_size=query_batch_size,
+            )
         with open(query_cp, "wb") as f:
             pickle.dump(queries_embeddings, f)
         del model
@@ -239,6 +271,20 @@ def benchmark_search(
         "peak_search_mem_mb": round(peak_mem_mb, 2),
         "n_queries": n_queries,
         **{k: round(v, 4) for k, v in eval_scores.items()},
+    }
+
+
+def get_warp_config(index) -> dict:
+    """Extract WARP search config from a WARP index, empty dict for others."""
+    if not hasattr(index, "bound"):
+        return {}
+    return {
+        "warp_bound": index.bound,
+        "warp_nprobe": index.nprobe,
+        "warp_centroid_score_threshold": index.centroid_score_threshold,
+        "warp_max_candidates": index.max_candidates,
+        "warp_t_prime": index.t_prime,
+        "warp_auto_tune": index.auto_tune,
     }
 
 
@@ -383,6 +429,7 @@ def main():
                     "disk_mb_index_only": round(disk_mb_index_only, 2),
                     "n_documents": len(documents),
                     "n_doc_tokens": n_doc_tokens,
+                    **get_warp_config(index),
                 }
                 all_results.append(row)
                 append_jsonl(args.output, row)
@@ -417,6 +464,7 @@ def main():
                     "disk_mb_index_only": round(disk_mb_index_only, 2),
                     "n_documents": len(documents),
                     "n_doc_tokens": n_doc_tokens,
+                    **get_warp_config(index),
                     **search_result,
                 }
                 all_results.append(row)

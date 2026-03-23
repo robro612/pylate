@@ -81,23 +81,27 @@ class WARP(Base):
         Random seed for reproducibility during index creation.
     auto_tune
         If True, automatically tune search hyperparameters after index creation
-        using a sample of document embeddings as pseudo-queries.
+        using a sample of document embeddings as pseudo-queries. Note: the
+        autotuner tends to over-prune (high centroid_score_threshold, low nprobe),
+        trading quality for speed. The manual defaults below were chosen via
+        parameter sweeps on BEIR datasets to match PLAID/ScaNN quality.
     bound
         Number of centroids to consider per query token during search.
-        If None, uses auto-tuned or default value.
+        Default is 256 (8 * nprobe).
     nprobe
         Number of IVF probes per token during search.
-        If None, uses auto-tuned or default value.
+        Default is 32.
     t_prime
         Missing token penalty parameter. Controls score compensation
-        for tokens that don't match any centroid. If None, uses auto-tuned
-        or default value.
+        for tokens that don't match any centroid. Default is 100,000.
+
     max_candidates
         Maximum number of candidate documents before final sorting.
-        If None, uses auto-tuned or default value.
+        Default is 2048.
     centroid_score_threshold
-        Per-token centroid filtering threshold in [0, 1].
-        If None, uses auto-tuned or default value.
+        Per-token centroid filtering threshold in [0, 1]. Lower values
+        keep more tokens. 0.0 disables filtering and maximizes quality.
+        Default is 0.0.
     batch_size
         Batch size for centroid scoring during search.
     num_threads
@@ -152,12 +156,12 @@ class WARP(Base):
         mmap: bool = True,
         use_triton: bool | None = None,
         seed: int = 42,
-        auto_tune: bool = True,
-        bound: int | None = None,
-        nprobe: int | None = None,
-        t_prime: int | None = None,
-        max_candidates: int | None = None,
-        centroid_score_threshold: float | None = None,
+        auto_tune: bool = False,
+        bound: int = 256,
+        nprobe: int = 32,
+        t_prime: int = 100000,
+        max_candidates: int = 2048,
+        centroid_score_threshold: float = 0.0,
         batch_size: int | None = 8192,
         num_threads: int | None = 1,
     ) -> None:
