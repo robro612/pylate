@@ -833,7 +833,7 @@ class ColBERT(SentenceTransformer):
 
             # Compute cosine similarity and convert to condensed distance matrix
             cos_sim = torch.mm(to_pool, to_pool.t()).numpy()
-            dist_full = 1 - cos_sim
+            dist_full = np.maximum(1 - cos_sim, 0)
             # Extract upper triangle as condensed form for scipy linkage
             condensed = dist_full[np.triu_indices(num_embeddings, k=1)]
 
