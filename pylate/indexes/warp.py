@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import shutil
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -289,10 +290,23 @@ class WARP(Base):
         with open(self.warp_ids_to_documents_ids_path, "wb") as f:
             pickle.dump(warp_ids_to_documents_ids, f)
 
+    @staticmethod
+    def _count_documents_from_doclens(embeddings_path: Path) -> int:
+        """Count total documents from .doclens.npy sidecar files."""
+        if embeddings_path.is_file():
+            doclens_path = embeddings_path.with_suffix(".doclens.npy")
+            return len(np.load(doclens_path))
+        doclens_files = sorted(embeddings_path.glob("*.doclens.npy"))
+        if not doclens_files:
+            raise FileNotFoundError(
+                f"No .doclens.npy files found in {embeddings_path}"
+            )
+        return sum(len(np.load(f)) for f in doclens_files)
+
     def add_documents(
         self,
         documents_ids: str | list[str],
-        documents_embeddings: list[np.ndarray | torch.Tensor],
+        documents_embeddings: list[np.ndarray | torch.Tensor] | str | Path,
         **kwargs,
     ) -> "WARP":
         """Add documents to the index.
@@ -307,6 +321,9 @@ class WARP(Base):
             The document IDs corresponding to each embedding.
         documents_embeddings
             List of document embeddings, each with shape ``(num_tokens, embedding_dim)``.
+            Alternatively, a path to a directory of ``.npy`` + ``.doclens.npy``
+            shard files. When a path is given, embeddings are streamed from disk
+            instead of loaded into memory.
         """
         if self.is_indexed:
             raise ValueError(
@@ -317,16 +334,28 @@ class WARP(Base):
         if isinstance(documents_ids, str):
             documents_ids = [documents_ids]
 
-        documents_embeddings_torch = convert_embeddings_to_torch(documents_embeddings)
+        # Determine whether to use disk path or in-memory embeddings
+        use_disk = isinstance(documents_embeddings, (str, Path))
+        if use_disk:
+            embeddings_path = Path(documents_embeddings)
+            embeddings_source = embeddings_path
+            num_documents = self._count_documents_from_doclens(embeddings_path)
+        else:
+            embeddings_source = convert_embeddings_to_torch(documents_embeddings)
+            num_documents = len(embeddings_source)
 
         # Resolve device for creation (must be a single string)
         create_device = self.device
         if isinstance(create_device, list):
             create_device = create_device[0]
 
-        logger.info("Creating WARP index.")
+        logger.info(
+            "Creating WARP index (%s, %d documents).",
+            "disk" if use_disk else "memory",
+            num_documents,
+        )
         self._warp.create(
-            embeddings_source=documents_embeddings_torch,
+            embeddings_source=embeddings_source,
             device=create_device,
             kmeans_niters=self.kmeans_niters,
             max_points_per_centroid=self.max_points_per_centroid,
@@ -343,7 +372,7 @@ class WARP(Base):
         self._tuned = False
 
         # Store ID mappings
-        warp_ids = list(range(len(documents_embeddings_torch)))
+        warp_ids = list(range(num_documents))
         documents_ids_to_warp_ids = dict(zip(documents_ids, warp_ids))
         warp_ids_to_documents_ids = dict(zip(warp_ids, documents_ids))
         self._save_mappings(documents_ids_to_warp_ids, warp_ids_to_documents_ids)
