@@ -4,6 +4,14 @@ from .base import Base
 from .plaid import PLAID
 from .scann import ScaNN
 from .voyager import Voyager
-from .warp import WARP
+from .warp import WARP, WARPIndexingConfig, WARPSearchConfig
 
-__all__ = ["Base", "Voyager", "PLAID", "ScaNN", "WARP"]
+__all__ = [
+    "Base",
+    "Voyager",
+    "PLAID",
+    "ScaNN",
+    "WARP",
+    "WARPSearchConfig",
+    "WARPIndexingConfig",
+]
