@@ -107,13 +107,40 @@ def main():
         choices=["cached", "standard"],
         help="Loss type: 'cached' for CachedContrastive (GradCache), 'standard' for Contrastive.",
     )
-    parser.add_argument("--k_train", type=int, default=128, help="Top-k for XTR scoring during training.")
+    parser.add_argument(
+        "--k_train",
+        type=str,
+        nargs="+",
+        default=["128"],
+        help="Top-k for XTR scoring. Accepts multiple values as 'k' or 'k:weight' "
+             "(e.g. --k_train 64 256 or --k_train 64:0.3 256:0.7). "
+             "Weights are normalized to sum to 1; if omitted, equal weights are used.",
+    )
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
 
-    run_name = args.run_name or f"xtr-contrastive-modernbert-{args.dataset}-ktrain{args.k_train}"
+    # Parse k_train specs: "k" or "k:weight"
+    k_specs = []
+    for spec in args.k_train:
+        if ":" in spec:
+            k_str, w_str = spec.split(":", 1)
+            k_specs.append((int(k_str), float(w_str)))
+        else:
+            k_specs.append((int(spec), None))
+
+    k_values = [k for k, _ in k_specs]
+    raw_weights = [w for _, w in k_specs]
+    if any(w is not None for w in raw_weights):
+        if not all(w is not None for w in raw_weights):
+            raise ValueError("Either specify weights for all k_train values or none.")
+        weights = raw_weights
+    else:
+        weights = None  # CombinedLoss will use uniform
+
+    k_label = "_".join(str(k) for k in k_values)
+    run_name = args.run_name or f"xtr-contrastive-modernbert-{args.dataset}-ktrain{k_label}"
     output_dir = f"output/{run_name}"
 
     # Wandb config — Trainer handles init on main process only
@@ -137,7 +164,15 @@ def main():
         temperature = torch.nn.Parameter(torch.tensor(args.temperature))
     else:
         temperature = args.temperature
-    score_metric = scores.XTRScores(k=args.k_train) if args.score_fn == "xtr" else scores.colbert_scores
+    if args.score_fn == "colbert":
+        score_metric = scores.colbert_scores
+    elif len(k_values) == 1:
+        score_metric = scores.XTRScores(k=k_values[0])
+    elif weights is not None:
+        score_metric = scores.XTRScores(k=list(zip(k_values, weights)))
+    else:
+        score_metric = scores.XTRScores(k=k_values)
+
     if args.loss == "cached":
         train_loss = losses.CachedContrastive(
             model=model,

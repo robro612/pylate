@@ -1,0 +1,68 @@
+defaults:
+  - model: contrastive_xtr_ft
+  - index: warp
+  - override hydra/job_logging: custom
+  - _self_
+
+datasets:
+  - "beir/nfcorpus/test"
+
+doc_length: 300
+
+query_length:
+  "beir/nfcorpus/test": 32
+  "beir/fiqa/test": 32
+  "beir/scidocs": 48
+  "beir/scifact/test": 48
+  "beir/trec-covid": 48
+  "beir/quora/test": 32
+  "beir/nq": 32
+  "beir/webis-touche2020/v2": 32
+  "beir/arguana/test": 64
+  "beir/climate-fever": 64
+  "beir/dbpedia-entity/test": 32
+  "beir/fever/test": 32
+  "beir/hotpotqa/test": 32
+  "beir/msmarco/dev": 32
+  "lotte/lifestyle/test/search": 32
+  "lotte/pooled/test/search": 32
+  "lotte/recreation/test/search": 32
+  "lotte/science/test/search": 32
+  "lotte/technology/test/search": 32
+  "lotte/writing/test/search": 32
+  "disks45/nocr/trec-robust-2004": 32
+
+encode:
+  batch_size: 4000
+  query_batch_size: 32
+  shard_size: 100000
+  pool_factor: 1
+  pool_method: none
+  protected_tokens: 1
+  dtype: fp32
+  shards: null
+
+cache:
+  dir: "benchmark_cache"
+  enabled: true
+
+search:
+  k: 100
+  k_token: 10000
+  repeats: 1
+
+output:
+  results_file: "benchmark_results.jsonl"
+  index_folder: "benchmark_indexes"
+
+device: null
+
+# Stages to run. Options: encode_docs, encode_queries, build_index, retrieve
+# Later stages depend on earlier ones (retrieve needs an index, etc.)
+# If a dependency's output already exists on disk (cached shards, built index),
+# it will be loaded rather than recomputed.
+stages:
+  - encode_docs
+  - encode_queries
+  - build_index
+  - retrieve

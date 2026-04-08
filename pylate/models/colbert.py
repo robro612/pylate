@@ -81,11 +81,9 @@ class ColBERT(SentenceTransformer):
     embedding_size
         The output size of the projection layer. Default to 128.
     query_prefix
-        Prefix to add to the queries.
+        Prefix to add to the queries. If None, falls back to "[Q] " if not set in the config file. If "" is set, no prefix will be added.
     document_prefix
-        Prefix to add to the documents.
-    add_special_tokens
-        Add the prefix to the inputs.
+        Prefix to add to the documents. If None, falls back to "[D] " if not set in the config file. If "" is set, no prefix will be added.
     truncation
         Truncate the inputs to the encoder max lengths or use sliding window encoding.
     query_length
@@ -208,7 +206,6 @@ class ColBERT(SentenceTransformer):
         bias: bool = False,
         query_prefix: str | None = None,
         document_prefix: str | None = None,
-        add_special_tokens: bool = True,
         truncation: bool = True,
         query_length: int | None = None,
         document_length: int | None = None,
@@ -379,14 +376,20 @@ class ColBERT(SentenceTransformer):
         )
 
         # Try adding the prefixes to the tokenizer. We call resize_token_embeddings twice to ensure the tokens are added only if resize_token_embeddings works. There should be a better way to do this.
-        try:
-            self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
-            self.tokenizer.add_tokens([self.query_prefix, self.document_prefix])
-            self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
-        except NotImplementedError:
-            logger.warning(
-                "The tokenizer does not support resizing the token embeddings, the prefixes token have not been added to vocabulary."
-            )
+        prefix_tokens = [p for p in (self.query_prefix, self.document_prefix) if p]
+        if prefix_tokens:
+            try:
+                self._first_module().auto_model.resize_token_embeddings(
+                    len(self.tokenizer)
+                )
+                self.tokenizer.add_tokens(prefix_tokens)
+                self._first_module().auto_model.resize_token_embeddings(
+                    len(self.tokenizer)
+                )
+            except NotImplementedError:
+                logger.warning(
+                    "The tokenizer does not support resizing the token embeddings, the prefixes token have not been added to vocabulary."
+                )
 
         self.document_prefix_id = self.tokenizer.convert_tokens_to_ids(
             self.document_prefix
@@ -495,6 +498,7 @@ class ColBERT(SentenceTransformer):
         normalize_embeddings: bool = True,
         is_query: bool = True,
         pool_factor: int = 1,
+        pool_method: str = "hierarchical",
         protected_tokens: int = 1,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
@@ -541,6 +545,9 @@ class ColBERT(SentenceTransformer):
         pool_factor
             The factor by which to pool the document embeddings, resulting in 1/pool_factor of the original tokens. If set
             to 1, no pooling is done; if set to 2, 50% of the tokens are kept; if set to 3, 33%, and so on. Defaults to 1.
+        pool_method
+            The pooling method to use. "hierarchical" uses Ward clustering on cosine similarity (O(n^2)).
+            "spherical" uses k-means on L2-normalized embeddings (O(n*k*iters), faster). Defaults to "hierarchical".
         protected_tokens
             The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
 
@@ -565,6 +572,7 @@ class ColBERT(SentenceTransformer):
                         normalize_embeddings=normalize_embeddings,
                         is_query=is_query,
                         pool_factor=pool_factor,
+                        pool_method=pool_method,
                         protected_tokens=protected_tokens,
                     )
 
@@ -742,7 +750,11 @@ class ColBERT(SentenceTransformer):
 
                 # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
                 if pool_factor > 1 and not is_query:
-                    embeddings = self.pool_embeddings_hierarchical(
+                    if pool_method == "spherical":
+                        pool_fn = self.pool_embeddings_spherical
+                    else:
+                        pool_fn = self.pool_embeddings_hierarchical
+                    embeddings = pool_fn(
                         documents_embeddings=embeddings,
                         pool_factor=pool_factor,
                         protected_tokens=protected_tokens,
@@ -861,6 +873,68 @@ class ColBERT(SentenceTransformer):
             pooled = cluster_sums[mask] / cluster_counts[mask].unsqueeze(1)
 
             pooled_embeddings.append(torch.cat([protected, pooled], dim=0))
+
+        return pooled_embeddings
+
+    def pool_embeddings_spherical(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+    ) -> list[torch.Tensor]:
+        """
+        Pools embeddings via flash-kmeans on L2-normalized vectors (spherical k-means).
+
+        Uses flash_kmeans (Triton-accelerated) for fast clustering. Faster than
+        hierarchical pooling, especially for longer documents.
+
+        Parameters
+        ----------
+        documents_embeddings
+            A list of embeddings for each document.
+        pool_factor
+            Factor to determine the number of clusters. Defaults to 1.
+        protected_tokens
+            Number of tokens to protect from pooling at the start of each document. Defaults to 1.
+
+        Returns
+        -------
+            A list of pooled embeddings for each document.
+        """
+        from flash_kmeans import FlashKMeans
+
+        pooled_embeddings = []
+        device = documents_embeddings[0].device if documents_embeddings else "cpu"
+
+        for document_embeddings in documents_embeddings:
+            protected = document_embeddings[:protected_tokens]
+            to_pool = document_embeddings[protected_tokens:]
+
+            num_embeddings = len(to_pool)
+            num_clusters = max(num_embeddings // pool_factor, 1)
+
+            if num_clusters >= num_embeddings:
+                pooled_embeddings.append(document_embeddings.cpu())
+                continue
+
+            # Normalize for spherical k-means — stay on original device
+            normed = torch.nn.functional.normalize(to_pool, dim=-1)
+
+            dim = to_pool.shape[1]
+            kmeans = FlashKMeans(d=dim, k=num_clusters, niter=20)
+            kmeans.fit(normed)
+            assignments = kmeans.predict(normed).long()
+
+            # Average original (unnormalized) embeddings per cluster — all on same device
+            cluster_sums = torch.zeros(num_clusters, dim, dtype=to_pool.dtype, device=device)
+            cluster_counts = torch.zeros(num_clusters, dtype=torch.long, device=device)
+            cluster_sums.scatter_add_(0, assignments.unsqueeze(1).expand_as(to_pool), to_pool)
+            cluster_counts.scatter_add_(0, assignments, torch.ones(num_embeddings, dtype=torch.long, device=device))
+
+            mask = cluster_counts > 0
+            pooled = cluster_sums[mask] / cluster_counts[mask].unsqueeze(1)
+
+            pooled_embeddings.append(torch.cat([protected, pooled], dim=0).cpu())
 
         return pooled_embeddings
 
@@ -1068,9 +1142,13 @@ class ColBERT(SentenceTransformer):
 
         output_queue = pool["output"]
         results_list = sorted(
-            [output_queue.get() for _ in range(last_chunk_id)], key=lambda x: x[0]
+            [output_queue.get() for _ in trange(last_chunk_id, desc="Multi-GPU encoding")],
+            key=lambda x: x[0],
         )
-        return [np.concatenate(result[1]) for result in results_list]
+        embeddings = []
+        for result in results_list:
+            embeddings.extend(result[1])
+        return embeddings
 
     def tokenize(
         self,
@@ -1094,9 +1172,11 @@ class ColBERT(SentenceTransformer):
         """
         # Set max sequence length based on whether the input is a query or document
         max_length = self.query_length if is_query else self.document_length
+        prefix = self.query_prefix if is_query else self.document_prefix
+        use_prefix = bool(prefix)
         self._first_module().max_seq_length = (
-            max_length - 1
-        )  # Subtract 1 for the prefix token
+            max_length - 1 if use_prefix else max_length
+        )
 
         # Pad queries (if query expansion) and handle padding for documents if specified
         tokenize_args = (
@@ -1108,22 +1188,23 @@ class ColBERT(SentenceTransformer):
         # Tokenize the texts
         tokenized_outputs = self._first_module().tokenize(texts, **tokenize_args)
 
-        # Determine prefix ID based on input type
-        prefix_id = self.query_prefix_id if is_query else self.document_prefix_id
+        if use_prefix:
+            # Determine prefix ID based on input type
+            prefix_id = self.query_prefix_id if is_query else self.document_prefix_id
 
-        # Insert prefix token and update attention mask
-        tokenized_outputs["input_ids"] = self.insert_prefix_token(
-            tokenized_outputs["input_ids"], prefix_id
-        )
-        tokenized_outputs["attention_mask"] = self.insert_prefix_token(
-            tokenized_outputs["attention_mask"], 1
-        )
-
-        # Update token type IDs if they exist
-        if "token_type_ids" in tokenized_outputs:
-            tokenized_outputs["token_type_ids"] = self.insert_prefix_token(
-                tokenized_outputs["token_type_ids"], 0
+            # Insert prefix token and update attention mask
+            tokenized_outputs["input_ids"] = self.insert_prefix_token(
+                tokenized_outputs["input_ids"], prefix_id
             )
+            tokenized_outputs["attention_mask"] = self.insert_prefix_token(
+                tokenized_outputs["attention_mask"], 1
+            )
+
+            # Update token type IDs if they exist
+            if "token_type_ids" in tokenized_outputs:
+                tokenized_outputs["token_type_ids"] = self.insert_prefix_token(
+                    tokenized_outputs["token_type_ids"], 0
+                )
 
         # Adjust attention mask for expansion tokens if required
         if is_query and self.attend_to_expansion_tokens:

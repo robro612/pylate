@@ -1,0 +1,5 @@
+type: contrastive
+hf_path: "bclavie/msmarco-10m-triplets"
+hf_name: null
+hf_split: "train"
+tevatron: false

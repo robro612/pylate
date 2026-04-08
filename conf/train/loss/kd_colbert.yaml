@@ -1,0 +1,6 @@
+type: kd
+score_fn: colbert
+k_train: null
+temperature: 1.0
+learnable_temperature: true
+minmax_normalize_scores: false  # false | student | teacher | both (true == both)

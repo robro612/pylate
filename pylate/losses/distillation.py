@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 import torch
 
@@ -21,7 +21,11 @@ class Distillation(torch.nn.Module):
     size_average
         Average by the size of the mini-batch or perform sum.
     normalize_scores
-        Whether to min-max normalize scores before computing the loss.
+        Min-max normalization mode before computing the KL loss. Supported values:
+        - ``False``: normalize neither student nor teacher scores.
+        - ``"student"``: normalize only student scores.
+        - ``"teacher"``: normalize only teacher scores.
+        - ``True`` or ``"both"``: normalize both student and teacher scores.
     temperature
         Temperature to divide scores by before log_softmax.
 
@@ -60,7 +64,7 @@ class Distillation(torch.nn.Module):
         model: ColBERT,
         score_metric: Callable = colbert_kd_scores,
         size_average: bool = True,
-        normalize_scores: bool = True,
+        normalize_scores: bool | Literal["student", "teacher", "both"] = True,
         temperature: float = 1.0,
     ) -> None:
         super(Distillation, self).__init__()
@@ -69,8 +73,25 @@ class Distillation(torch.nn.Module):
         self.loss_function = torch.nn.KLDivLoss(
             reduction="batchmean" if size_average else "sum", log_target=True
         )
-        self.normalize_scores = normalize_scores
+        if isinstance(normalize_scores, bool):
+            # Backward-compatible behavior: True means normalize both.
+            self.normalize_scores = "both" if normalize_scores else "none"
+        else:
+            mode = normalize_scores.lower()
+            allowed_modes = {"student", "teacher", "both"}
+            if mode not in allowed_modes:
+                raise ValueError(
+                    "normalize_scores must be one of False, 'student', 'teacher', or 'both'."
+                )
+            self.normalize_scores = mode
         self.temperature = temperature
+
+    @staticmethod
+    def _minmax_normalize(scores: torch.Tensor) -> torch.Tensor:
+        max_scores, _ = torch.max(scores, dim=1, keepdim=True)
+        min_scores, _ = torch.min(scores, dim=1, keepdim=True)
+        epsilon = 1e-8
+        return (scores - min_scores) / (max_scores - min_scores + epsilon)
 
     def forward(
         self, sentence_features: Iterable[dict[str, torch.Tensor]], labels: torch.Tensor
@@ -124,17 +145,14 @@ class Distillation(torch.nn.Module):
             queries_mask=masks[0] if not do_query_expansion else None,
             documents_mask=documents_embeddings_mask,
         )
-        if self.normalize_scores:
-            # Compute max and min along the num_scores dimension (dim=1)
-            max_scores, _ = torch.max(scores, dim=1, keepdim=True)
-            min_scores, _ = torch.min(scores, dim=1, keepdim=True)
-
-            # Avoid division by zero by adding a small epsilon
-            epsilon = 1e-8
-
-            # Normalize the scores
-            scores = (scores - min_scores) / (max_scores - min_scores + epsilon)
+        if isinstance(scores, list):
+            scores = sum(w * s for s, w in scores)
+        teacher_scores = labels.float()
+        if self.normalize_scores in {"student", "both"}:
+            scores = self._minmax_normalize(scores)
+        if self.normalize_scores in {"teacher", "both"}:
+            teacher_scores = self._minmax_normalize(teacher_scores)
         return self.loss_function(
             torch.nn.functional.log_softmax(scores / self.temperature, dim=-1),
-            torch.nn.functional.log_softmax(labels, dim=-1),
+            torch.nn.functional.log_softmax(teacher_scores, dim=-1),
         )

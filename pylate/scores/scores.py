@@ -234,7 +234,12 @@ class XTRScores:
     Parameters
     ----------
     k
-        Number of top token matches to retain per query token across all Q*N documents.
+        Controls top-k token matching. Accepts:
+        - ``int``: single k value, returns a single score tensor.
+        - ``list[int]``: multiple k values with equal weights, returns
+          ``list[tuple[Tensor, float]]``.
+        - ``list[tuple[int, float]]``: multiple k values with explicit weights
+          (normalized to sum to 1), returns ``list[tuple[Tensor, float]]``.
 
     Examples
     --------
@@ -257,18 +262,67 @@ class XTRScores:
     >>> scores.shape
     torch.Size([2, 4])
 
+    Multi-k returns a list of (scores, weight) tuples:
+
+    >>> result = XTRScores(k=[1, 2])(
+    ...     queries_embeddings=queries_embeddings,
+    ...     documents_embeddings=documents_embeddings,
+    ... )
+    >>> len(result)
+    2
+    >>> result[0][0].shape
+    torch.Size([2, 4])
+
     """
 
     requires_full_batch = True
 
-    def __init__(self, k: int = 128):
-        self.k = k
+    def __init__(self, k: int | list[int] | list[tuple[int, float]] = 128):
+        if isinstance(k, int):
+            self._k_weights: list[tuple[int, float]] | None = None
+            self.k = k
+        else:
+            # list[int] or list[tuple[int, float]]
+            if isinstance(k[0], int):
+                w = 1.0 / len(k)
+                self._k_weights = [(kv, w) for kv in k]
+            else:
+                total = sum(w for _, w in k)
+                self._k_weights = [(kv, w / total) for kv, w in k]
+            self.k = max(kv for kv, _ in self._k_weights)
 
     def compile(self, *args, **kwargs):
         self.__call__ = torch.compile(self.__call__, *args, **kwargs)
 
-    def __call__(self, queries_embeddings, documents_embeddings,
-        queries_mask=None, documents_mask=None):
+    def _score_for_k(
+        self,
+        clubbed: torch.Tensor,
+        k: int,
+        Qb: int,
+        Db: int,
+        Dt: int,
+        queries_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Compute XTR scores from pre-computed clubbed token scores for a single k."""
+        _, indices = clubbed.half().topk(k, dim=-1, sorted=False)
+        mask = torch.zeros_like(clubbed, dtype=torch.bool).scatter_(-1, indices, True)
+        masked = clubbed * mask
+        topk_scores_max = masked.view(Qb, -1, Db, Dt).max(dim=-1).values
+
+        if queries_mask is not None:
+            topk_scores_max = topk_scores_max * queries_mask.unsqueeze(-1)
+
+        scores_sum = topk_scores_max.sum(dim=1)
+        Z = topk_scores_max.gt(0).float().sum(dim=1).clamp_(min=1e-3)
+        return (scores_sum / Z).float()
+
+    def __call__(
+        self,
+        queries_embeddings: list | np.ndarray | torch.Tensor,
+        documents_embeddings: list | np.ndarray | torch.Tensor,
+        queries_mask: torch.Tensor | None = None,
+        documents_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | list[tuple[torch.Tensor, float]]:
         queries_embeddings = convert_to_tensor(queries_embeddings)
         documents_embeddings = convert_to_tensor(documents_embeddings)
 
@@ -284,7 +338,7 @@ class XTRScores:
         # Single large matmul — tensor core friendly
         Q_flat = queries_embeddings.reshape(Qb * Qt, H)
         D_flat = docs_flat.reshape(Db * Dt, H).T
-        scores = (Q_flat @ D_flat).view(Qb, Qt, Db, Dt)   # (Qb, Qt, Db, Dt)
+        scores = (Q_flat @ D_flat).view(Qb, Qt, Db, Dt)
 
         if documents_mask is not None:
             docs_mask_flat = documents_mask.view(Db, Dt)
@@ -292,19 +346,15 @@ class XTRScores:
                 ~docs_mask_flat.bool().unsqueeze(0).unsqueeze(0), -99999
             )
 
-        # Replace topk with threshold mask — fully parallel
-        clubbed = scores.flatten(2, 3) # (Qb, Qt, Db*Dt)
-        _, indices = clubbed.half().topk(self.k, dim=-1, sorted=False,)
-        mask = torch.zeros_like(clubbed, dtype=torch.bool).scatter_(-1, indices, True)
-        masked = clubbed * mask
-        topk_scores_max = masked.view(Qb, Qt, Db, Dt).max(dim=-1).values  # (Qb, Qt, Db)
+        clubbed = scores.flatten(2, 3)  # (Qb, Qt, Db*Dt)
 
-        if queries_mask is not None:
-            topk_scores_max = topk_scores_max * queries_mask.unsqueeze(-1)
+        if self._k_weights is None:
+            return self._score_for_k(clubbed, self.k, Qb, Db, Dt, queries_mask)
 
-        scores_sum = topk_scores_max.sum(dim=1)            # (Qb, Db)
-        Z = topk_scores_max.gt(0).float().sum(dim=1).clamp_(min=1e-3)
-        return (scores_sum / Z).float()
+        return [
+            (self._score_for_k(clubbed, k, Qb, Db, Dt, queries_mask), w)
+            for k, w in self._k_weights
+        ]
 
 
 class XTRKDScores:
@@ -350,12 +400,12 @@ class XTRKDScores:
         )
 
         # Slice out each query's own N documents
-        idx = torch.arange(Q, device=all_scores.device).unsqueeze(1) * N + torch.arange(
-            N, device=all_scores.device
-        )
-        return all_scores.gather(1, idx)
+        def _slice(scores: torch.Tensor) -> torch.Tensor:
+            idx = torch.arange(Q, device=scores.device).unsqueeze(1) * N + torch.arange(
+                N, device=scores.device
+            )
+            return scores.gather(1, idx)
 
-
-# Default instances — backward compatible as bare callables
-xtr_scores = XTRScores()
-xtr_kd_scores = XTRKDScores()
+        if isinstance(all_scores, list):
+            return [(_slice(s), w) for s, w in all_scores]
+        return _slice(all_scores)

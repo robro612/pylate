@@ -1,0 +1,7 @@
+type: kd
+score_fn: xtr
+k_train: [128]
+k_weights: null
+temperature: 0.5
+learnable_temperature: true
+minmax_normalize_scores: false  # false | student | teacher | both (true == both)

@@ -1,0 +1,8 @@
+type: warp
+retrieval:
+  - xtr
+nbits: 2
+random_rotation: false
+use_triton: null
+num_shards: null
+verbose: false

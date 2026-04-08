@@ -1,0 +1,9 @@
+type: plaid
+retrieval:
+  - colbert
+nbits: 2
+random_rotation: false
+use_triton: null
+add_batch_size: 8
+search_batch_size: null
+verbose: false

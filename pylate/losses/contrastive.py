@@ -186,7 +186,7 @@ class Contrastive(nn.Module):
             # Score metrics like xtr_scores require all documents simultaneously for global
             # top-k. Stack groups into (Q, N, Dt, H) and call once.
             N = len(embeddings) - 1
-            scores = self.score_metric(
+            scores_result = self.score_metric(
                 embeddings[0],
                 torch.stack(embeddings[1:], dim=1),
                 queries_mask=masks[0] if not do_query_expansion else None,
@@ -197,7 +197,7 @@ class Contrastive(nn.Module):
             if self.gather_across_devices:
                 labels = labels + get_rank() * batch_size * N
         else:
-            scores = torch.cat(
+            scores_result = torch.cat(
                 [
                     self.score_metric(
                         embeddings[0],
@@ -216,12 +216,19 @@ class Contrastive(nn.Module):
             if self.gather_across_devices:
                 labels = labels + get_rank() * batch_size
 
-        # compute constrastive loss using cross-entropy over the scores
-        loss = F.cross_entropy(
-            input=scores / self.temperature,
-            target=labels,
-            reduction="mean" if self.size_average else "sum",
-        )
+        # Score metric may return a list of (scores, weight) for multi-k scoring
+        if isinstance(scores_result, list):
+            scored_pairs = scores_result
+        else:
+            scored_pairs = [(scores_result, 1.0)]
+
+        loss = torch.tensor(0.0, device=embeddings[0].device)
+        for scores, weight in scored_pairs:
+            loss = loss + weight * F.cross_entropy(
+                input=scores / self.temperature,
+                target=labels,
+                reduction="mean" if self.size_average else "sum",
+            )
 
         # Scale by world size when gathering across device
         if self.gather_across_devices:
