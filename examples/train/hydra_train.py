@@ -3,17 +3,20 @@ Hydra-configured training script for ColBERT/XTR models.
 Supports contrastive, cached_contrastive, and KD training.
 
 Usage examples:
-  # Cached contrastive XTR with bclavie (defaults)
+  # Contrastive XTR (default)
   python examples/train/hydra_train.py
 
-  # KD with XTR scores
-  python examples/train/hydra_train.py dataset=kd_msmarco loss=kd_xtr max_steps=10000 num_epochs=null
+  # Contrastive ColBERT
+  python examples/train/hydra_train.py loss=contrastive_colbert run_name=modernbert_colbert_contrastive
 
-  # Multi-k contrastive
-  python examples/train/hydra_train.py 'loss.k_train=[64,128,256,512]'
+  # Contrastive XTR with specific k
+  python examples/train/hydra_train.py loss=contrastive_xtr 'loss.k_train=[256]' run_name=modernbert_xtr_contrastive_k256
 
-  # Learnable temperature
-  python examples/train/hydra_train.py loss.learnable_temperature=true
+  # Contrastive XTR multi-k
+  python examples/train/hydra_train.py loss=contrastive_xtr 'loss.k_train=[128,256,512]' run_name=modernbert_xtr_contrastive_multik128-256-512
+
+  # Distillation (KD) from a contrastive checkpoint
+  python examples/train/hydra_train.py --config-name distillation loss=kd_xtr 'loss.k_train=[128]' model_name=output/modernbert_xtr_contrastive_k128/final run_name=modernbert_xtr_kd_k128
 
   # Override run name
   python examples/train/hydra_train.py run_name=my-experiment
@@ -120,7 +123,7 @@ def make_run_name(cfg: DictConfig) -> str:
     return "-".join(parts)
 
 
-@hydra.main(config_path="../../conf/train", config_name="config", version_base=None)
+@hydra.main(config_path="../../conf/train", config_name="contrastive", version_base=None)
 def main(cfg: DictConfig):
     loss_cfg = cfg.loss
     dataset_cfg = cfg.dataset
