@@ -131,6 +131,8 @@ class PLAID(Base):
         show_progress: bool = True,
         device: str | list[str] | None = None,
         use_triton: bool | None = None,
+        random_rotation: bool = False,
+        seed: int = 42,
         **kwargs,
     ) -> None:
         self.use_fast = use_fast
@@ -179,6 +181,8 @@ class PLAID(Base):
                 show_progress=show_progress,
                 device=device,
                 use_triton=use_triton,
+                random_rotation=random_rotation,
+                seed=seed,
             )
         else:
             logging.info("📚 Index with Stanford backend.")

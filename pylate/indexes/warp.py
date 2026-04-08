@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,24 @@ from ..rank import RerankResult
 from .base import Base
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_device_config(
+    device: str | list[str] | None,
+) -> str | list[str] | None:
+    """Normalize Hydra/OmegaConf device values to plain Python types.
+
+    Hydra list overrides (e.g. ``device=["cuda:0","cuda:1"]``) can arrive as
+    OmegaConf ListConfig, which behaves like a sequence but is not a list.
+    xtr-warp expects plain ``str``/``list[str]``.
+    """
+    if device is None or isinstance(device, str):
+        return device
+
+    if isinstance(device, Sequence):
+        return [str(d) for d in device]
+
+    return device
 
 
 def convert_embeddings_to_torch(
@@ -107,6 +126,15 @@ class WARP(Base):
         Batch size for centroid scoring during search.
     num_threads
         Number of CPU threads for search parallelism.
+    random_rotation
+        Whether to apply a random orthogonal rotation before indexing.
+        Improves isotropy in some settings but requires in-memory embeddings.
+    num_shards
+        Number of index shards to create for sharded search (e.g., multi-GPU).
+        ``None`` (default) creates a single-shard index.
+    verbose
+        If True, enable extra WARP creation profiling logs and show the
+        progress bar for batched search.
 
     Examples
     --------
@@ -165,6 +193,9 @@ class WARP(Base):
         centroid_score_threshold: float = 0.0,
         batch_size: int | None = 8192,
         num_threads: int | None = 1,
+        random_rotation: bool = False,
+        num_shards: int | None = None,
+        verbose: bool = False,
     ) -> None:
         self.index_folder = index_folder
         self.index_name = index_name
@@ -179,6 +210,9 @@ class WARP(Base):
         self.auto_tune = auto_tune
         self.batch_size = batch_size
         self.num_threads = num_threads
+        self.random_rotation = random_rotation
+        self.num_shards = num_shards
+        self.verbose = verbose
 
         # Search hyperparameters (None = auto-tuned or library default)
         self.bound = bound
@@ -189,9 +223,16 @@ class WARP(Base):
 
         # Resolve device
         if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                n_gpus = torch.cuda.device_count()
+                if num_shards and num_shards > 1 and n_gpus > 1:
+                    self.device = [f"cuda:{i}" for i in range(min(num_shards, n_gpus))]
+                else:
+                    self.device = "cuda"
+            else:
+                self.device = "cpu"
         else:
-            self.device = device
+            self.device = _normalize_device_config(device)
 
         # Create the index directory structure
         self.index_path = os.path.join(index_folder, index_name)
@@ -209,6 +250,15 @@ class WARP(Base):
         self.warp_ids_to_documents_ids_path = os.path.join(
             self.index_path, "warp_ids_to_documents_ids.pkl"
         )
+
+        # Random orthogonal rotation matrix
+        self._rotation_path = os.path.join(self.index_path, "rotation.pt")
+        self._rotation_matrix: torch.Tensor | None = None
+        if self.random_rotation and os.path.exists(self._rotation_path):
+            self._rotation_matrix = torch.load(
+                self._rotation_path, weights_only=True
+            )
+            logger.info("Loaded random rotation matrix from %s", self._rotation_path)
 
         # Initialize the XTRWarp index
         from xtr_warp import XTRWarp
@@ -258,16 +308,11 @@ class WARP(Base):
             top_k=k, queries_embeddings=tune_batch
         )
         if tuned is not None:
-            if self.bound is None:
-                self.bound = tuned[0]
-            if self.nprobe is None:
-                self.nprobe = tuned[1]
-            if self.centroid_score_threshold is None:
-                self.centroid_score_threshold = tuned[2]
-            if self.max_candidates is None:
-                self.max_candidates = tuned[3]
-            if self.t_prime is None:
-                self.t_prime = tuned[4]
+            self.bound = tuned[0]
+            self.nprobe = tuned[1]
+            self.centroid_score_threshold = tuned[2]
+            self.max_candidates = tuned[3]
+            self.t_prime = tuned[4]
             logger.info(
                 "Tuned hyperparameters: bound=%s, nprobe=%s, "
                 "centroid_score_threshold=%s, max_candidates=%s, t_prime=%s",
@@ -303,6 +348,25 @@ class WARP(Base):
             )
         return sum(len(np.load(f)) for f in doclens_files)
 
+    def _create_rotation_matrix(self, dim: int) -> torch.Tensor:
+        """Create and save a random orthogonal rotation matrix via QR decomposition."""
+        gen = torch.Generator().manual_seed(self.seed)
+        random_matrix = torch.randn(dim, dim, generator=gen)
+        Q, _ = torch.linalg.qr(random_matrix)
+        torch.save(Q, self._rotation_path)
+        logger.info("Created random rotation matrix (%d x %d)", dim, dim)
+        return Q
+
+    def _rotate_embeddings(
+        self, embeddings: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Apply the rotation matrix to a list of embedding tensors."""
+        lengths = [emb.shape[0] for emb in embeddings]
+        concatenated = torch.cat(embeddings, dim=0)
+        Q = self._rotation_matrix.to(dtype=concatenated.dtype)
+        rotated = concatenated @ Q.T
+        return list(torch.split(rotated, lengths))
+
     def add_documents(
         self,
         documents_ids: str | list[str],
@@ -336,13 +400,25 @@ class WARP(Base):
 
         # Determine whether to use disk path or in-memory embeddings
         use_disk = isinstance(documents_embeddings, (str, Path))
+        if use_disk and self.random_rotation:
+            raise ValueError(
+                "random_rotation=True requires in-memory embeddings. "
+                "Load shards into memory before calling add_documents "
+                "(see load_shards_to_memory in benchmark_indexes.py)."
+            )
         if use_disk:
-            embeddings_path = Path(documents_embeddings)
+            embeddings_path = Path(documents_embeddings).resolve()
             embeddings_source = embeddings_path
             num_documents = self._count_documents_from_doclens(embeddings_path)
         else:
             embeddings_source = convert_embeddings_to_torch(documents_embeddings)
             num_documents = len(embeddings_source)
+
+        # Apply random rotation if enabled
+        if self.random_rotation and not use_disk:
+            dim = embeddings_source[0].shape[-1]
+            self._rotation_matrix = self._create_rotation_matrix(dim)
+            embeddings_source = self._rotate_embeddings(embeddings_source)
 
         # Resolve device for creation (must be a single string)
         create_device = self.device
@@ -350,33 +426,62 @@ class WARP(Base):
             create_device = create_device[0]
 
         logger.info(
-            "Creating WARP index (%s, %d documents).",
+            "Creating WARP index (%s, %d documents%s).",
             "disk" if use_disk else "memory",
             num_documents,
+            ", rotated" if self.random_rotation else "",
         )
-        self._warp.create(
-            embeddings_source=embeddings_source,
-            device=create_device,
-            kmeans_niters=self.kmeans_niters,
-            max_points_per_centroid=self.max_points_per_centroid,
-            nbits=self.nbits,
-            n_samples_kmeans=self.n_samples_kmeans,
-            seed=self.seed,
-            use_triton_kmeans=self.use_triton,
-        )
+        previous_profile_encode = os.environ.get("XTR_WARP_PROFILE_ENCODE")
+        previous_profile_encode_local = os.environ.get("XTR_WARP_PROFILE_ENCODE_LOCAL")
+        if self.verbose:
+            os.environ["XTR_WARP_PROFILE_ENCODE"] = "1"
+            os.environ["XTR_WARP_PROFILE_ENCODE_LOCAL"] = "1"
+            os.environ["XTR_WARP_VERBOSE"] = "1"  
+
+        try:
+            self._warp.create(
+                embeddings_source=embeddings_source,
+                device=create_device,
+                kmeans_niters=self.kmeans_niters,
+                max_points_per_centroid=self.max_points_per_centroid,
+                nbits=self.nbits,
+                n_samples_kmeans=self.n_samples_kmeans,
+                seed=self.seed,
+                use_triton_kmeans=self.use_triton,
+                num_shards=self.num_shards,
+            )
+        finally:
+            if self.verbose:
+                if previous_profile_encode is None:
+                    os.environ.pop("XTR_WARP_PROFILE_ENCODE", None)
+                else:
+                    os.environ["XTR_WARP_PROFILE_ENCODE"] = previous_profile_encode
+
+                if previous_profile_encode_local is None:
+                    os.environ.pop("XTR_WARP_PROFILE_ENCODE_LOCAL", None)
+                else:
+                    os.environ["XTR_WARP_PROFILE_ENCODE_LOCAL"] = (
+                        previous_profile_encode_local
+                    )
+
+        # Store ID mappings before load so they persist even if load fails
+        warp_ids = list(range(num_documents))
+        documents_ids_to_warp_ids = dict(zip(documents_ids, warp_ids))
+        warp_ids_to_documents_ids = dict(zip(warp_ids, documents_ids))
+        self._save_mappings(documents_ids_to_warp_ids, warp_ids_to_documents_ids)
+
+        # Free GPU memory from the create step before loading for search
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Load the index for searching
         load_device = self.device if isinstance(self.device, (str, list)) else "auto"
         self._warp.load(device=load_device, dtype=self.dtype, mmap=self.mmap)
 
         self._tuned = False
-
-        # Store ID mappings
-        warp_ids = list(range(num_documents))
-        documents_ids_to_warp_ids = dict(zip(documents_ids, warp_ids))
-        warp_ids_to_documents_ids = dict(zip(warp_ids, documents_ids))
-        self._save_mappings(documents_ids_to_warp_ids, warp_ids_to_documents_ids)
-
         self.is_indexed = True
         return self
 
@@ -398,6 +503,7 @@ class WARP(Base):
         | list[np.ndarray]
         | list[torch.Tensor],
         k: int = 10,
+        batch_size: int | None = 1,
     ) -> list[list[RerankResult]]:
         """Query the index for the nearest neighbors of the query embeddings.
 
@@ -408,6 +514,10 @@ class WARP(Base):
             or list of numpy arrays/torch tensors.
         k
             The number of nearest neighbors to return.
+        batch_size
+            If set, queries are issued in batches of this size with a
+            progress bar when ``verbose=True``. If None (default), all queries
+            are sent at once.
 
         Returns
         -------
@@ -422,23 +532,53 @@ class WARP(Base):
 
         queries_embeddings = convert_embeddings_to_torch(queries_embeddings)
 
+        # Apply random rotation to queries (must match rotation applied to documents)
+        if self.random_rotation and self._rotation_matrix is not None:
+            queries_embeddings = self._rotate_embeddings(queries_embeddings)
+
         # Lazy auto-tune on first search using real queries
         if self.auto_tune and not self._tuned:
             self._auto_tune(queries_embeddings, k)
 
-        # Stack into batch tensor for xtr-warp search
-        # xtr-warp accepts list[torch.Tensor] or a single batched tensor
-        search_results = self._warp.search(
-            queries_embeddings=queries_embeddings,
-            top_k=k,
-            num_threads=self.num_threads,
-            bound=self.bound,
-            nprobe=self.nprobe,
-            t_prime=self.t_prime,
-            max_candidates=self.max_candidates,
-            centroid_score_threshold=self.centroid_score_threshold,
-            batch_size=self.batch_size,
-        )
+        # Issue queries in batches or all at once. Progress bar is verbose-only.
+        if batch_size is not None and batch_size < len(queries_embeddings):
+            batch_starts = range(0, len(queries_embeddings), batch_size)
+            if self.verbose:
+                from tqdm.auto import tqdm
+
+                batch_starts = tqdm(
+                    batch_starts,
+                    desc="Searching",
+                    unit="batch",
+                )
+
+            search_results = []
+            for i in batch_starts:
+                batch = queries_embeddings[i : i + batch_size]
+                batch_results = self._warp.search(
+                    queries_embeddings=batch,
+                    top_k=k,
+                    num_threads=self.num_threads,
+                    bound=self.bound,
+                    nprobe=self.nprobe,
+                    t_prime=self.t_prime,
+                    max_candidates=self.max_candidates,
+                    centroid_score_threshold=self.centroid_score_threshold,
+                    batch_size=self.batch_size,
+                )
+                search_results.extend(batch_results)
+        else:
+            search_results = self._warp.search(
+                queries_embeddings=queries_embeddings,
+                top_k=k,
+                num_threads=self.num_threads,
+                bound=self.bound,
+                nprobe=self.nprobe,
+                t_prime=self.t_prime,
+                max_candidates=self.max_candidates,
+                centroid_score_threshold=self.centroid_score_threshold,
+                batch_size=self.batch_size,
+            )
 
         # Convert results to RerankResult format
         results = []

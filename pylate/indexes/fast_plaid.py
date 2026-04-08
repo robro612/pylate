@@ -105,6 +105,8 @@ class FastPlaid(Base):
         show_progress: bool = True,
         device: str | list[str] | None = None,
         use_triton: bool | None = None,
+        random_rotation: bool = False,
+        seed: int = 42,
     ) -> None:
         self.index_folder = index_folder
         self.index_name = index_name
@@ -118,6 +120,8 @@ class FastPlaid(Base):
         self.show_progress = show_progress
         self.device = device
         self.use_triton = use_triton
+        self.random_rotation = random_rotation
+        self.seed = seed
 
         # Create the index directory structure
         self.index_path = os.path.join(index_folder, index_name)
@@ -138,6 +142,15 @@ class FastPlaid(Base):
         self.plaid_ids_to_documents_ids_path = os.path.join(
             self.index_path, "plaid_ids_to_documents_ids.pkl"
         )
+
+        # Random orthogonal rotation matrix
+        self._rotation_path = os.path.join(self.index_path, "rotation.pt")
+        self._rotation_matrix: torch.Tensor | None = None
+        if self.random_rotation and os.path.exists(self._rotation_path):
+            self._rotation_matrix = torch.load(
+                self._rotation_path, weights_only=True
+            )
+            logger.info("Loaded random rotation matrix from %s", self._rotation_path)
 
         # Initialize or load the fast-plaid index
         self.fast_plaid = search.FastPlaid(
@@ -171,6 +184,25 @@ class FastPlaid(Base):
         with open(self.plaid_ids_to_documents_ids_path, "wb") as f:
             pickle.dump(plaid_ids_to_documents_ids, f)
 
+    def _create_rotation_matrix(self, dim: int) -> torch.Tensor:
+        """Create and save a random orthogonal rotation matrix via QR decomposition."""
+        gen = torch.Generator().manual_seed(self.seed)
+        random_matrix = torch.randn(dim, dim, generator=gen)
+        Q, _ = torch.linalg.qr(random_matrix)
+        torch.save(Q, self._rotation_path)
+        logger.info("Created random rotation matrix (%d x %d)", dim, dim)
+        return Q
+
+    def _rotate_embeddings(
+        self, embeddings: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Apply the rotation matrix to a list of embedding tensors."""
+        lengths = [emb.shape[0] for emb in embeddings]
+        concatenated = torch.cat(embeddings, dim=0)
+        Q = self._rotation_matrix.to(dtype=concatenated.dtype)
+        rotated = concatenated @ Q.T
+        return list(torch.split(rotated, lengths))
+
     def add_documents(
         self,
         documents_ids: str | list[str],
@@ -183,6 +215,14 @@ class FastPlaid(Base):
 
         # Convert embeddings to torch tensors
         documents_embeddings_torch = convert_embeddings_to_torch(documents_embeddings)
+
+        # Apply random rotation if enabled (only on initial create)
+        if self.random_rotation and not self.is_indexed:
+            dim = documents_embeddings_torch[0].shape[-1]
+            self._rotation_matrix = self._create_rotation_matrix(dim)
+            documents_embeddings_torch = self._rotate_embeddings(
+                documents_embeddings_torch
+            )
 
         # Load existing mappings
         documents_ids_to_plaid_ids = self._load_documents_ids_to_plaid_ids()
@@ -312,6 +352,10 @@ class FastPlaid(Base):
 
         # Convert queries to torch tensor format expected by fast-plaid
         queries_embeddings = convert_embeddings_to_torch(queries_embeddings)
+
+        # Apply random rotation to queries (must match rotation applied to documents)
+        if self.random_rotation and self._rotation_matrix is not None:
+            queries_embeddings = self._rotate_embeddings(queries_embeddings)
 
         # Convert subset from document IDs to plaid IDs if provided
         plaid_subset = None
