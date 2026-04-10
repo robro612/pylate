@@ -25,8 +25,6 @@ import time
 import tracemalloc
 from pathlib import Path
 
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-
 import hydra
 import ir_datasets
 import numpy as np
@@ -283,6 +281,8 @@ def encode_documents_sharded(
         document_length=cfg.doc_length,
         device="cpu" if use_multi_gpu else None,
     )
+    if cfg.get("compile", False) and not use_multi_gpu:
+        model = torch.compile(model)
 
     pool = None
     if use_multi_gpu:
@@ -391,6 +391,8 @@ def encode_queries(
         model_name_or_path=model_name,
         query_length=query_length,
     )
+    if cfg.get("compile", False):
+        model = torch.compile(model)
 
     encode_start = time.perf_counter()
     query_embeddings = model.encode(
@@ -678,6 +680,8 @@ def benchmark_search(
     k_token: int = 10000,
     device: str | None = None,
     plaid_outer_batch_size: int | None = None,
+    run_save_path: str | None = None,
+    metrics: list | None = None,
 ) -> dict:
     """Run search on a pre-built index and collect metrics."""
     gc.collect()
@@ -737,11 +741,20 @@ def benchmark_search(
     n_queries = len(queries_embeddings)
     qps = n_queries / search_time if search_time > 0 else float("inf")
 
+    if run_save_path is not None:
+        from ranx import Run
+        run_dict = {
+            qid: {d["id"]: float(d["score"]) for d in doc_scores}
+            for qid, doc_scores in zip(query_ids, scores)
+        }
+        os.makedirs(os.path.dirname(run_save_path), exist_ok=True)
+        Run(run_dict).save(run_save_path, kind="trec")
+
     eval_scores = evaluation.evaluate(
         scores=scores,
         qrels=qrels,
         queries=query_ids,
-        metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100", "mrr@10", "mrr@100"],
+        metrics=metrics,
     )
 
     return {
@@ -820,7 +833,7 @@ def load_existing_index(
 # ---------------------------------------------------------------------------
 
 
-@hydra.main(config_path="../conf", config_name="config", version_base=None)
+@hydra.main(config_path="../conf/eval", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(level=logging.INFO)
 
@@ -875,7 +888,7 @@ def main(cfg: DictConfig) -> None:
             num_shards = None
         shard_slug = f"_s{int(num_shards)}" if num_shards and int(num_shards) > 1 else ""
         index_config = OmegaConf.to_container(cfg.index, resolve=True)
-        index_name = f"bench_{dataset_slug}_{index_type}{rotation_slug}{shard_slug}"
+        index_name = f"bench_{model_slug}_{dataset_slug}_{index_type}{rotation_slug}{shard_slug}"
 
         # Track timing for results
         doc_encode_time = 0.0
@@ -974,6 +987,11 @@ def main(cfg: DictConfig) -> None:
                 for run_idx in range(search_repeats):
                     run_label = f" (run {run_idx + 1}/{search_repeats})" if search_repeats > 1 else ""
                     print(f"\n  Searching: {index_type} + {retrieval}{run_label}...")
+                    runs_dir = cfg.output.get("runs_dir")
+                    run_save_path = (
+                        os.path.join(runs_dir, model_slug, f"{dataset_slug}_{index_type}_{retrieval}.run")
+                        if runs_dir else None
+                    )
                     search_result = benchmark_search(
                         index=index,
                         index_type=index_type,
@@ -985,6 +1003,8 @@ def main(cfg: DictConfig) -> None:
                         k_token=cfg.search.get("k_token", 10000),
                         device=device,
                         plaid_outer_batch_size=cfg.index.get("search_batch_size", None),
+                        run_save_path=run_save_path,
+                        metrics=list(cfg.search.metrics),
                     )
                     print(f"  QPS: {search_result['qps']}, NDCG@10: {search_result.get('ndcg@10', 'N/A')}")
                     print(f"  Recall@100: {search_result.get('recall@100', 'N/A')}")

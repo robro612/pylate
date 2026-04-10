@@ -2,7 +2,6 @@
 #SBATCH --job-name=ictir_train
 #SBATCH --array=0-4%4
 #SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=8
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/ictir_train_%A_%a.out
 #SBATCH --mail-type=BEGIN,END,FAIL,ARRAY_TASKS
