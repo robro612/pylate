@@ -57,6 +57,8 @@ api = ["fastapi >= 0.114.1", "uvicorn >= 0.30.6", "batched >= 0.1.2"]
 voyager = ["voyager >= 2.0.9"]
 scann = ["scann >= 1.4.2"]
 warp = ["xtr-warp-rs >= 0.2.0"]
+warp-local = ["xtr-warp-rs @ file:///home/hltcoe/rjha/rjha_exp/xtr-warp-rs"]
+irds-local = ["ir-datasets @ file:///home/hltcoe/rjha/rjha_exp/ir_datasets"]
 
 
 [dependency-groups]

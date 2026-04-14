@@ -500,6 +500,7 @@ class ColBERT(SentenceTransformer):
         pool_factor: int = 1,
         pool_method: str = "hierarchical",
         protected_tokens: int = 1,
+        return_token_ids: bool = False,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
         Computes sentence embeddings.
@@ -550,15 +551,21 @@ class ColBERT(SentenceTransformer):
             "spherical" uses k-means on L2-normalized embeddings (O(n*k*iters), faster). Defaults to "hierarchical".
         protected_tokens
             The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
+        return_token_ids
+            If True, also return the vocabulary token IDs aligned with each embedding vector.
+            Returns a tuple ``(embeddings, token_ids)`` where ``token_ids`` is a list of 1-D
+            int32 numpy arrays (or tensors), one per input sentence.  Incompatible with
+            ``pool_factor > 1`` (raises ``ValueError``).  Defaults to False.
 
         """
         if isinstance(sentences, list):
             # If we have a list of list of sentences, we encode each list separately.
             if isinstance(sentences[0], list):
                 embeddings = []
+                token_ids_nested = [] if return_token_ids else None
 
                 for batch in sentences:
-                    batch_embeddings = self.encode(
+                    batch_result = self.encode(
                         sentences=batch,
                         prompt_name=prompt_name,
                         prompt=prompt,
@@ -574,7 +581,14 @@ class ColBERT(SentenceTransformer):
                         pool_factor=pool_factor,
                         pool_method=pool_method,
                         protected_tokens=protected_tokens,
+                        return_token_ids=return_token_ids,
                     )
+
+                    if return_token_ids:
+                        batch_embeddings, batch_tids = batch_result
+                        token_ids_nested.append(batch_tids)
+                    else:
+                        batch_embeddings = batch_result
 
                     batch_embeddings = (
                         torch.stack(batch_embeddings)
@@ -584,6 +598,8 @@ class ColBERT(SentenceTransformer):
 
                     embeddings.append(batch_embeddings)
 
+                if return_token_ids:
+                    return embeddings, token_ids_nested
                 return embeddings
 
         if self.device.type == "hpu" and not self.is_hpu_graph_enabled:
@@ -648,7 +664,14 @@ class ColBERT(SentenceTransformer):
 
         self.to(device)
 
+        if return_token_ids and pool_factor > 1:
+            raise ValueError(
+                "return_token_ids=True is incompatible with pool_factor > 1 "
+                "because pooling merges multiple tokens into single vectors."
+            )
+
         all_embeddings = []
+        all_token_ids: list | None = [] if return_token_ids else None
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
 
@@ -735,10 +758,12 @@ class ColBERT(SentenceTransformer):
                         masks = out_features["attention_mask"].bool()
 
                 embeddings = []
+                batch_token_ids = [] if return_token_ids else None
                 for (
                     token_embedding,
                     mask,
-                ) in zip(out_features["token_embeddings"], masks):
+                    input_id,
+                ) in zip(out_features["token_embeddings"], masks, features["input_ids"]):
                     token_embedding = (
                         torch.nn.functional.normalize(
                             input=token_embedding[mask], p=2, dim=1
@@ -747,6 +772,8 @@ class ColBERT(SentenceTransformer):
                         else token_embedding[mask]
                     )
                     embeddings.append(token_embedding)
+                    if return_token_ids:
+                        batch_token_ids.append(input_id[mask].cpu().numpy().astype(np.int32))
 
                 # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
                 if pool_factor > 1 and not is_query:
@@ -765,6 +792,8 @@ class ColBERT(SentenceTransformer):
                     embeddings = [embedding.cpu() for embedding in embeddings]
 
                 all_embeddings.extend(embeddings)
+                if return_token_ids:
+                    all_token_ids.extend(batch_token_ids)
 
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
@@ -777,7 +806,10 @@ class ColBERT(SentenceTransformer):
                 tensor=all_embeddings, split_size_or_sections=1, dim=0
             )
 
-        all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+        unsort_indices = np.argsort(length_sorted_idx)
+        all_embeddings = [all_embeddings[idx] for idx in unsort_indices]
+        if return_token_ids:
+            all_token_ids = [all_token_ids[idx] for idx in unsort_indices]
 
         if precision and precision != "float32":
             all_embeddings = quantize_embeddings(
@@ -800,6 +832,11 @@ class ColBERT(SentenceTransformer):
                 embedding.float().numpy() if bloat else embedding.numpy()
                 for embedding in all_embeddings
             ]
+
+        if return_token_ids:
+            if input_was_string:
+                return all_embeddings[0], all_token_ids[0]
+            return all_embeddings, all_token_ids
 
         return all_embeddings[0] if input_was_string else all_embeddings
 

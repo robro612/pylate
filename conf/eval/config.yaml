@@ -47,6 +47,7 @@ encode:
   protected_tokens: 1
   dtype: fp16
   shards: null
+  save_token_ids: false
 
 cache:
   dir: "embeddings_cache"
@@ -69,7 +70,7 @@ search:
     - hit_rate@100
 
 output:
-  results_file: "ictir_results.jsonl"
+  results_file: "results.jsonl"
   index_folder: "indexes"
   runs_dir: "results/runfiles"
 

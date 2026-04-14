@@ -35,6 +35,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
+from plot_style import get_style
 from pylate import indexes, models
 
 logger = logging.getLogger(__name__)
@@ -146,11 +147,13 @@ def plot_distributions(
     output_path: str,
     dpi: int = 150,
     max_kde_samples: int = 100_000,
+    label_styles: dict[str, dict] | None = None,
 ) -> None:
     """Plot KDE score distributions, one curve per model."""
     import matplotlib.pyplot as plt
     from scipy.stats import gaussian_kde
 
+    styles = label_styles or {}
     rng = np.random.default_rng(0)
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -164,8 +167,9 @@ def plot_distributions(
         kde = gaussian_kde(scores, bw_method="scott")
         xs = np.linspace(float(scores.min()), float(scores.max()), 500)
         ys = kde(xs)
-        ax.plot(xs, ys, label=label, linewidth=2)
-        ax.fill_between(xs, ys, alpha=0.15)
+        kw = styles.get(label, {})
+        color = ax.plot(xs, ys, label=label, linewidth=2, **kw)[0].get_color()
+        ax.fill_between(xs, ys, facecolor=color, alpha=0.15)
 
     ax.set_xlabel("Token Similarity Score")
     ax.set_ylabel("Density")
@@ -310,11 +314,17 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.empty_cache()
 
     # --- Plot ---
+    label_styles = {}
+    for model_cfg in cfg.models:
+        label = model_cfg.get("label", model_cfg.name)
+        label_styles[label] = get_style(model_cfg.name)
+
     plot_path = os.path.join(out_dir, cfg.output.plot_file)
     plot_distributions(
         scores_by_label=scores_by_label,
         output_path=plot_path,
         dpi=cfg.output.get("dpi", 150),
+        label_styles=label_styles,
     )
 
 

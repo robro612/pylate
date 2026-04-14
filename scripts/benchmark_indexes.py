@@ -228,6 +228,10 @@ def _doclens_path(cache_dir: Path, idx: int) -> Path:
     return cache_dir / f"doc_shard_{idx:03d}.doclens.npy"
 
 
+def _token_ids_path(cache_dir: Path, idx: int) -> Path:
+    return cache_dir / f"doc_shard_{idx:03d}.token_ids.npy"
+
+
 def encode_documents_sharded(
     model_name: str,
     documents: list[dict],
@@ -251,10 +255,15 @@ def encode_documents_sharded(
     shard_selection = parse_shard_selection(cfg.encode.get("shards", None), num_shards)
     logger.info("Shard selection: %d/%d shards", len(shard_selection), num_shards)
 
+    save_token_ids = cfg.encode.get("save_token_ids", False)
+
     # Check which selected shards are already cached
     cached = set()
     for idx in shard_selection:
-        if _shard_path(cache_dir, idx).exists() and _doclens_path(cache_dir, idx).exists():
+        base_cached = _shard_path(cache_dir, idx).exists() and _doclens_path(cache_dir, idx).exists()
+        if save_token_ids:
+            base_cached = base_cached and _token_ids_path(cache_dir, idx).exists()
+        if base_cached:
             cached.add(idx)
 
     to_encode = [idx for idx in shard_selection if idx not in cached]
@@ -296,6 +305,7 @@ def encode_documents_sharded(
         end = min(start + shard_size, num_documents)
         logger.info("Encoding shard %d/%d (docs %d-%d)", shard_idx + 1, num_shards, start, end - 1)
 
+        shard_token_ids = None
         if use_multi_gpu:
             shard_embeddings = model.encode_multi_process(
                 sentences=[doc["text"] for doc in documents[start:end]],
@@ -306,7 +316,7 @@ def encode_documents_sharded(
                 protected_tokens=cfg.encode.get("protected_tokens", 1),
             )
         else:
-            shard_embeddings = model.encode(
+            encode_result = model.encode(
                 sentences=[doc["text"] for doc in documents[start:end]],
                 batch_size=cfg.encode.batch_size,
                 is_query=False,
@@ -314,7 +324,12 @@ def encode_documents_sharded(
                 pool_factor=pool_factor,
                 pool_method=cfg.encode.get("pool_method", "hierarchical"),
                 protected_tokens=cfg.encode.get("protected_tokens", 1),
+                return_token_ids=save_token_ids,
             )
+            if save_token_ids:
+                shard_embeddings, shard_token_ids = encode_result
+            else:
+                shard_embeddings = encode_result
 
         # Convert to numpy, cast to target dtype, and save
         save_dtype = NUMPY_DTYPES.get(cfg.encode.get("dtype", "fp32"), np.float32)
@@ -329,6 +344,9 @@ def encode_documents_sharded(
         concatenated = np.concatenate(all_tokens, axis=0)
         np.save(_shard_path(cache_dir, shard_idx), concatenated)
         np.save(_doclens_path(cache_dir, shard_idx), np.array(doclens, dtype=np.int32))
+
+        if shard_token_ids is not None:
+            np.save(_token_ids_path(cache_dir, shard_idx), np.concatenate(shard_token_ids))
 
     encode_time = time.perf_counter() - encode_start
 
@@ -430,24 +448,45 @@ def encode_queries(
 # ---------------------------------------------------------------------------
 
 
-def load_shards_to_memory(shard_dir: Path, dtype: torch.dtype = torch.float32) -> list[torch.Tensor]:
-    """Load all .npy + .doclens.npy shards into a list of per-document tensors."""
+def load_shards_to_memory(
+    shard_dir: Path,
+    dtype: torch.dtype = torch.float32,
+    load_token_ids: bool = False,
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[np.ndarray]]:
+    """Load all .npy + .doclens.npy shards into a list of per-document tensors.
+
+    If load_token_ids is True and .token_ids.npy files exist alongside shards,
+    also returns a parallel list of per-document int32 numpy arrays with vocabulary
+    token IDs for each embedding vector.
+    """
     npy_files = sorted(shard_dir.glob("doc_shard_*.npy"))
-    npy_files = [f for f in npy_files if not f.name.endswith(".doclens.npy")]
+    npy_files = [f for f in npy_files if not f.name.endswith((".doclens.npy", ".token_ids.npy"))]
 
     embeddings = []
+    token_ids_list = [] if load_token_ids else None
     for npy_file in npy_files:
         doclens_file = npy_file.with_suffix(".doclens.npy")
         data = np.load(npy_file)
         doclens = np.load(doclens_file)
+
+        # Load token IDs for this shard if requested and available
+        tid_file = npy_file.parent / npy_file.name.replace(".npy", ".token_ids.npy")
+        tid_data = None
+        if load_token_ids and tid_file.exists():
+            tid_data = np.load(tid_file)
+
         offset = 0
         for length in doclens:
             emb = torch.from_numpy(data[offset:offset + length].copy())
             if emb.dtype != dtype:
                 emb = emb.to(dtype)
             embeddings.append(emb)
+            if load_token_ids and tid_data is not None:
+                token_ids_list.append(tid_data[offset:offset + length].copy())
             offset += length
 
+    if load_token_ids:
+        return embeddings, token_ids_list
     return embeddings
 
 
@@ -455,7 +494,7 @@ def count_doc_tokens_from_shards(shard_dir: Path) -> int:
     """Count total token embeddings across all shards."""
     total = 0
     for npy_file in sorted(shard_dir.glob("doc_shard_*.npy")):
-        if npy_file.name.endswith(".doclens.npy"):
+        if npy_file.name.endswith((".doclens.npy", ".token_ids.npy")):
             continue
         total += np.load(npy_file, mmap_mode="r").shape[0]
     return total
@@ -533,7 +572,7 @@ def build_index(
         index = indexes.PLAID(
             index_folder=index_folder,
             index_name=index_name,
-            override=True,
+            override=False,
             nbits=nbits,
             n_samples_kmeans=n_samples_kmeans,
             use_triton=use_triton,
@@ -644,15 +683,26 @@ def build_index(
             override=True,
             store_embeddings=True,
         )
-        logger.info("Loading all shards into memory for ScaNN...")
-        documents_embeddings = load_shards_to_memory(shard_dir)
+        # Auto-detect whether token_ids shards are available
+        has_token_ids = any(shard_dir.glob("doc_shard_*.token_ids.npy"))
+        logger.info(
+            "Loading all shards into memory for ScaNN (token_ids=%s)...",
+            has_token_ids,
+        )
+        load_result = load_shards_to_memory(shard_dir, load_token_ids=has_token_ids)
+        if has_token_ids:
+            documents_embeddings, documents_token_ids = load_result
+        else:
+            documents_embeddings = load_result
+            documents_token_ids = None
         build_start = time.perf_counter()
         index.add_documents(
             documents_ids=doc_ids,
             documents_embeddings=documents_embeddings,
+            documents_token_ids=documents_token_ids,
         )
         build_time = time.perf_counter() - build_start
-        del documents_embeddings
+        del documents_embeddings, documents_token_ids
         gc.collect()
 
     else:

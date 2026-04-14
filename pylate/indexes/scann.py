@@ -130,6 +130,7 @@ class ScaNN(Base):
         # Store (start, length) tuples instead of lists for memory efficiency
         self.doc_id_to_embedding_range = {}  # doc_id -> (start_position, length) tuple
         self.position_to_doc_id = None  # Direct mapping: position -> document ID (numpy array for vectorized indexing)
+        self.position_to_token_id = None  # Direct mapping: position -> vocabulary token ID (int32 numpy array)
         self.flattened_embeddings = (
             None  # Flattened embeddings array (only if store_embeddings=True)
         )
@@ -255,6 +256,7 @@ class ScaNN(Base):
         metadata_path = index_path / "metadata.json"
         doc_id_mapping_path = index_path / "doc_id_to_embedding_range.pkl"
         flattened_embeddings_path = index_path / "flattened_embeddings.npy"
+        token_ids_path = index_path / "token_ids.npy"
 
         try:
             import scann
@@ -334,6 +336,17 @@ class ScaNN(Base):
             else:
                 self.flattened_embeddings = None
 
+            # Load token IDs if available
+            if token_ids_path.exists():
+                self.position_to_token_id = np.load(token_ids_path)
+                if self.verbose:
+                    logger.info(
+                        "[ScaNN] Loaded token IDs with shape %s",
+                        self.position_to_token_id.shape,
+                    )
+            else:
+                self.position_to_token_id = None
+
             self._documents_added = True
 
             if self.verbose:
@@ -343,6 +356,9 @@ class ScaNN(Base):
                 )
                 logger.info(
                     f"[ScaNN]   Total embeddings: {len(self.position_to_doc_id) if self.position_to_doc_id is not None else 0}"
+                )
+                logger.info(
+                    f"[ScaNN]   Token IDs: {'yes' if self.position_to_token_id is not None else 'no'}"
                 )
         except ImportError:
             # Preserve import errors (e.g. optional dependencies) as-is.
@@ -375,6 +391,7 @@ class ScaNN(Base):
         metadata_path = index_path / "metadata.json"
         doc_id_mapping_path = index_path / "doc_id_to_embedding_range.pkl"
         flattened_embeddings_path = index_path / "flattened_embeddings.npy"
+        token_ids_path = index_path / "token_ids.npy"
 
         try:
             if self.verbose:
@@ -409,6 +426,10 @@ class ScaNN(Base):
             if self.store_embeddings and self.flattened_embeddings is not None:
                 np.save(flattened_embeddings_path, self.flattened_embeddings)
 
+            # Save token IDs if available
+            if self.position_to_token_id is not None:
+                np.save(token_ids_path, self.position_to_token_id)
+
             if self.verbose:
                 logger.info(f"[ScaNN] Index saved successfully to {index_path}")
         except Exception as e:
@@ -420,12 +441,26 @@ class ScaNN(Base):
         documents_ids: list[str],
         documents_embeddings: list[torch.Tensor | np.ndarray],
         batch_size: int = 128,
+        documents_token_ids: list[np.ndarray] | None = None,
     ) -> "ScaNN":
         """Add documents to the index.
 
         Note: This method only supports adding all documents at once.
         Subsequent calls will raise an error.
         batch_size is kept for API compatibility but not used.
+
+        Parameters
+        ----------
+        documents_ids
+            List of document IDs, one per document.
+        documents_embeddings
+            List of embedding arrays, one per document, each with shape (n_tokens, dim).
+        batch_size
+            Kept for API compatibility but not used.
+        documents_token_ids
+            Optional list of int32 arrays, one per document, each with shape (n_tokens,)
+            giving the vocabulary token ID for every embedding vector. When provided,
+            enables token-level retrieval analysis (score distributions, lexical match rates).
         """
         # Enforce single add - check if documents already exist
         if self._documents_added:
@@ -532,6 +567,21 @@ class ScaNN(Base):
             self.position_to_doc_id[offset : offset + num_tokens] = doc_id
             offset += num_tokens
 
+        # Flatten token IDs if provided
+        if documents_token_ids is not None:
+            self.position_to_token_id = np.concatenate(
+                [tid.astype(np.int32) for tid in documents_token_ids]
+            )
+            if self.position_to_token_id.shape[0] != total_embeddings:
+                raise ValueError(
+                    f"Token ID count ({self.position_to_token_id.shape[0]}) does not match "
+                    f"total embedding count ({total_embeddings})."
+                )
+            if self.verbose:
+                logger.info(
+                    f"[ScaNN] Stored {total_embeddings} token IDs alongside embeddings."
+                )
+
         # Build the ScaNN index with all embeddings
         if len(flattened_embeddings) > 0:
             if self.verbose:
@@ -627,10 +677,17 @@ class ScaNN(Base):
         documents = [list(chunk) for chunk in np.split(all_doc_ids, splits)]
         distances_list = [list(chunk) for chunk in np.split(all_distances, splits)]
 
-        return {
+        result = {
             "documents_ids": documents,
             "distances": distances_list,  # Keep as list to handle variable-length query tokens (ragged)
         }
+
+        # Include token IDs of the matched neighbors if available
+        if self.position_to_token_id is not None:
+            all_token_ids = self.position_to_token_id[neighbors]
+            result["token_ids"] = [list(chunk) for chunk in np.split(all_token_ids, splits)]
+
+        return result
 
     def get_documents_embeddings(
         self, documents_ids: list[list[str]]
