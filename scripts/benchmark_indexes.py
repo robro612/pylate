@@ -569,12 +569,20 @@ def build_index(
         plaid_kwargs = {}
         if plaid_search_batch_size is not None:
             plaid_kwargs["batch_size"] = int(plaid_search_batch_size)
+        n_full_scores = index_cfg.get("n_full_scores", None) if index_cfg else None
+        if n_full_scores is not None:
+            plaid_kwargs["n_full_scores"] = int(n_full_scores)
+        centroid_score_threshold = index_cfg.get("centroid_score_threshold", None) if index_cfg else None
+        if centroid_score_threshold is not None:
+            plaid_kwargs["centroid_score_threshold"] = float(centroid_score_threshold)
+        use_fast = index_cfg.get("use_fast", True) if index_cfg else True
         index = indexes.PLAID(
             index_folder=index_folder,
             index_name=index_name,
             override=False,
             nbits=nbits,
             n_samples_kmeans=n_samples_kmeans,
+            use_fast=use_fast,
             use_triton=use_triton,
             random_rotation=random_rotation,
             show_progress=verbose,
@@ -852,11 +860,19 @@ def load_existing_index(
         plaid_kwargs = {}
         if plaid_search_batch_size is not None:
             plaid_kwargs["batch_size"] = int(plaid_search_batch_size)
+        n_full_scores = index_cfg.get("n_full_scores", None) if index_cfg else None
+        if n_full_scores is not None:
+            plaid_kwargs["n_full_scores"] = int(n_full_scores)
+        centroid_score_threshold = index_cfg.get("centroid_score_threshold", None) if index_cfg else None
+        if centroid_score_threshold is not None:
+            plaid_kwargs["centroid_score_threshold"] = float(centroid_score_threshold)
+        use_fast = index_cfg.get("use_fast", True) if index_cfg else True
         index = indexes.PLAID(
             index_folder=index_folder,
             index_name=index_name,
             override=False,
             nbits=nbits,
+            use_fast=use_fast,
             random_rotation=random_rotation,
             show_progress=verbose,
             **plaid_kwargs,
@@ -1075,6 +1091,9 @@ def main(cfg: DictConfig) -> None:
                         "disk_mb": round(disk_mb, 2),
                         "index_size_mb": round(disk_mb, 2),
                         "nbits": cfg.index.get("nbits", 4),
+                        "n_full_scores": getattr(getattr(index, '_index', None), 'n_full_scores', None),
+                        "use_fast": cfg.index.get("use_fast", True),
+                        "centroid_score_threshold": cfg.index.get("centroid_score_threshold", None),
                         "index_config": index_config,
                         "pool_factor": pool_factor,
                         "pool_method": pool_method if pool_factor > 1 else "none",

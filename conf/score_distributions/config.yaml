@@ -7,55 +7,7 @@ num_queries: 100  # null = use all queries
 
 doc_length: 300
 
-models:
-  # - name: colbert
-  #   path: "colbert-ir/colbertv2.0"
-  #   label: "ColBERTv2"
-  #   scann_index: null  # path to pre-built ScaNN index (for retrieval.mode=scann)
-  # - name: gte_moderncolbert_v1
-  #   path: "lightonai/GTE-ModernColBERT-v1"
-  #   label: "GTE-ModernColBERT-v1"
-  #   scann_index: null
-  # - name: google_xtr
-  #   path: "robro612/xtr-base-en-pylate"
-  #   label: "XTR (Lee et al. 2023)"
-  #   scann_index: null
-  # - name: mb_colbert_kd
-  #   path: "output/modernbert_colbert_kd/final"
-  #   label: "ColBERT-KD"
-  #   scann_index: null
-  # - name: mb_xtr_kd_k256
-  #   path: "output/modernbert_xtr_kd_k256/final"
-  #   label: "XTR-KD k=256"
-  #   scann_index: null
-  # - name: mb_xtr_kd_k512
-  #   path: "output/modernbert_xtr_kd_k512/final"
-  #   label: "XTR-KD k=512"
-  #   scann_index: null
-  # - name: mb_xtr_kd_multik
-  #   path: "output/modernbert_xtr_kd_multik128-256-512/final"
-  #   label: "XTR-KD multi-k"
-  #   scann_index: null
-  - name: mb_colbert_contrastive
-    path: "output/modernbert_colbert_contrastive/final"
-    label: "ColBERT-C"
-    scann_index: null
-  - name: mb_xtr_contrastive_k128
-    path: "output/modernbert_xtr_contrastive_k128/final"
-    label: "XTR-C k=128"
-    scann_index: null
-  - name: mb_xtr_contrastive_k256
-    path: "output/modernbert_xtr_contrastive_k256/final"
-    label: "XTR-C k=256"
-    scann_index: null
-  - name: mb_xtr_contrastive_k512
-    path: "output/modernbert_xtr_contrastive_k512/final"
-    label: "XTR-C k=512"
-    scann_index: null
-  - name: mb_xtr_contrastive_multik
-    path: "output/modernbert_xtr_contrastive_multik128-256-512/final"
-    label: "XTR-C multi-k"
-    scann_index: null
+models: ???  # set by contrastive.yaml or kd.yaml
 
 retrieval:
   mode: exact      # exact | scann
