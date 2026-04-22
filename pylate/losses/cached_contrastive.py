@@ -12,7 +12,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import get_device_states, set_device_states
 
 from ..models import ColBERT
-from ..scores import colbert_scores
+from ..scores import ScopedBatchScores, colbert_scores
 from ..utils import all_gather, all_gather_with_gradients, get_rank, get_world_size
 from .contrastive import extract_skiplist_mask
 
@@ -423,3 +423,80 @@ class CachedContrastive(nn.Module):
     primaryClass={cs.LG}
 }
 """
+
+
+class CachedContrastive_New(CachedContrastive):
+    """ScopedBatchScores-integrated variant of CachedContrastive."""
+
+    def calculate_loss(self, reps, masks, with_backward: bool = False) -> Tensor:
+        embeddings_anchor = torch.cat(reps[0])
+        embeddings_other = [
+            torch.cat([chunk_embed for chunk_embed in r]) for r in reps[1:]
+        ]
+
+        batch_size = len(embeddings_anchor)
+        labels = torch.tensor(
+            range(batch_size), dtype=torch.long, device=reps[0][0].device
+        )
+        if self.gather_across_devices:
+            embeddings_other = [
+                torch.cat(all_gather_with_gradients(embeddings))
+                for embeddings in embeddings_other
+            ]
+            masks = [
+                masks[0],
+                *[torch.cat(all_gather(mask)) for mask in masks[1:]],
+            ]
+            rank = get_rank()
+            labels = labels + rank * batch_size
+        losses: list[torch.Tensor] = []
+        do_query_expansion = (
+            self.model.do_query_expansion
+            if hasattr(self.model, "do_query_expansion")
+            else self.model.module.do_query_expansion
+        )
+        if not isinstance(self.score_metric, ScopedBatchScores):
+            raise TypeError("CachedContrastive_New requires score_metric=ScopedBatchScores.")
+        N = len(embeddings_other)
+        all_docs = torch.stack(embeddings_other, dim=1)
+        all_docs_mask = torch.stack(masks[1:], dim=1)
+        labels = torch.arange(batch_size, device=reps[0][0].device) * N
+        if self.gather_across_devices:
+            rank = get_rank()
+            labels = labels + rank * batch_size * N
+
+        for begin in tqdm.trange(
+            0,
+            batch_size,
+            self.score_mini_batch_size,
+            desc="Preparing caches",
+            disable=not self.show_progress_bar,
+        ):
+            end = begin + self.score_mini_batch_size
+            scores = self.score_metric(
+                embeddings_anchor[begin:end],
+                all_docs,
+                queries_mask=masks[0][begin:end] if not do_query_expansion else None,
+                documents_mask=all_docs_mask,
+                query_start_index=begin,
+                scoring_scope="global",
+                return_scope="global",
+            )
+            loss_mbatch = F.cross_entropy(
+                input=scores / self.temperature,
+                target=labels[begin:end],
+                reduction="sum",
+            )
+            if self.gather_across_devices:
+                loss_mbatch *= get_world_size()
+
+            if with_backward:
+                loss_mbatch.backward()
+                loss_mbatch = loss_mbatch.detach()
+            losses.append(loss_mbatch)
+
+        loss = sum(losses)
+        if self.size_average:
+            loss /= batch_size
+
+        return loss

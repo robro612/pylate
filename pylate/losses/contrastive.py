@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..models import ColBERT
-from ..scores import colbert_scores
+from ..scores import ScopedBatchScores, colbert_scores
 from ..utils import all_gather, all_gather_with_gradients, get_rank, get_world_size
 
 
@@ -218,6 +218,82 @@ class Contrastive(nn.Module):
 
         # Score metric may return a list of (scores, weight) for multi-k scoring
         if isinstance(scores_result, list):
+            raise TypeError(
+                "Contrastive_New expects a single score tensor, not weighted multi-k scores."
+            )
+        loss = F.cross_entropy(
+            input=scores_result / self.temperature,
+            target=labels,
+            reduction="mean" if self.size_average else "sum",
+        )
+
+        # Scale by world size when gathering across device
+        if self.gather_across_devices:
+            loss *= get_world_size()
+        return loss
+
+
+class Contrastive_New(Contrastive):
+    """ScopedBatchScores-integrated variant of Contrastive.
+
+    Mirrors :class:`Contrastive` behavior but requires
+    :class:`~pylate.scores.ScopedBatchScores`.
+    """
+
+    def forward(
+        self,
+        sentence_features: Iterable[dict[str, Tensor]],
+        labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        embeddings = [
+            torch.nn.functional.normalize(
+                self.model(sentence_feature)["token_embeddings"], p=2, dim=-1
+            )
+            for sentence_feature in sentence_features
+        ]
+        skiplist = (
+            self.model.skiplist
+            if hasattr(self.model, "skiplist")
+            else self.model.module.skiplist
+        )
+        do_query_expansion = (
+            self.model.do_query_expansion
+            if hasattr(self.model, "do_query_expansion")
+            else self.model.module.do_query_expansion
+        )
+        masks = extract_skiplist_mask(
+            sentence_features=sentence_features, skiplist=skiplist
+        )
+        batch_size = embeddings[0].size(0)
+        if self.gather_across_devices:
+            embeddings = [
+                embeddings[0],
+                *[
+                    torch.cat(all_gather_with_gradients(embedding))
+                    for embedding in embeddings[1:]
+                ],
+            ]
+            masks = [
+                masks[0],
+                *[torch.cat(all_gather(mask)) for mask in masks[1:]],
+            ]
+
+        if not isinstance(self.score_metric, ScopedBatchScores):
+            raise TypeError("Contrastive_New requires score_metric=ScopedBatchScores.")
+        N = len(embeddings) - 1
+        scores_result = self.score_metric(
+            embeddings[0],
+            torch.stack(embeddings[1:], dim=1),
+            queries_mask=masks[0] if not do_query_expansion else None,
+            documents_mask=torch.stack(masks[1:], dim=1),
+            scoring_scope="global",
+            return_scope="global",
+        )
+        labels = torch.arange(batch_size, device=embeddings[0].device) * N
+        if self.gather_across_devices:
+            labels = labels + get_rank() * batch_size * N
+
+        if isinstance(scores_result, list):
             scored_pairs = scores_result
         else:
             scored_pairs = [(scores_result, 1.0)]
@@ -230,7 +306,6 @@ class Contrastive(nn.Module):
                 reduction="mean" if self.size_average else "sum",
             )
 
-        # Scale by world size when gathering across device
         if self.gather_across_devices:
             loss *= get_world_size()
         return loss

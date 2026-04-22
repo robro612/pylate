@@ -380,9 +380,10 @@ class ScopedBatchScores:
 
     It also supports:
     - ``scoring_scope``: whether scores are computed against local docs (in the same instance) per query
-      or the full in-batch document pool.
+      or the full in-batch document pool (across all in-batch instances).
     - ``return_scope``: whether to return local ``(B, N)`` scores or global
       ``(B, B*N)`` scores.
+    Scope values set at construction can be overridden per call.
     """
 
     def __init__(
@@ -394,6 +395,7 @@ class ScopedBatchScores:
         doc_batch_chunk: int | None = None,
         doc_nway_chunk: int | None = None,
         xtr_k: int = 128,
+        xtr_topk_cast_half_for_fp32: bool = False,
     ) -> None:
         if mode not in {"colbert", "xtr"}:
             raise ValueError(f"Unsupported mode: {mode}. Expected 'colbert' or 'xtr'.")
@@ -406,6 +408,10 @@ class ScopedBatchScores:
 
         if doc_nway_chunk is not None and doc_nway_chunk <= 0:
             raise ValueError("doc_nway_chunk must be > 0 when provided.")
+        if not isinstance(xtr_k, int):
+            raise TypeError("ScopedBatchScores requires xtr_k to be an int.")
+        if not isinstance(xtr_topk_cast_half_for_fp32, bool):
+            raise TypeError("xtr_topk_cast_half_for_fp32 must be a bool.")
 
         self.mode = mode
         self.scoring_scope = scoring_scope
@@ -414,6 +420,7 @@ class ScopedBatchScores:
         self.doc_batch_chunk = doc_batch_chunk
         self.doc_nway_chunk = doc_nway_chunk
         self._xtr_k = xtr_k
+        self._xtr_topk_cast_half_for_fp32 = xtr_topk_cast_half_for_fp32
 
         if self.scoring_scope not in {"global", "local"}:
             raise ValueError(
@@ -423,27 +430,6 @@ class ScopedBatchScores:
             raise ValueError(
                 f"Unsupported return_scope: {self.return_scope}. Expected 'global' or 'local'."
             )
-        if self.mode == "xtr" and self.scoring_scope != "global":
-            raise ValueError("XTR requires scoring_scope='global'.")
-        if self.mode == "xtr" and self.doc_batch_chunk is not None:
-            raise ValueError(
-                "doc_batch_chunk is only supported for mode='colbert'. "
-                "XTR requires scoring against the full document batch."
-            )
-        if self.mode == "xtr" and self.doc_nway_chunk is not None:
-            raise ValueError(
-                "doc_nway_chunk is only supported for mode='colbert'. "
-                "XTR requires scoring against all N-way documents at once."
-            )
-        if self.return_scope == "global" and self.scoring_scope == "local":
-            raise ValueError(
-                "return_scope='global' requires scoring_scope='global'."
-            )
-        if self.scoring_scope == "local" and self.doc_batch_chunk is not None:
-            raise ValueError(
-                "doc_batch_chunk is not supported for scoring_scope='local'."
-            )
-
     @staticmethod
     def _validate_documents_shape(documents_embeddings: torch.Tensor) -> None:
         if documents_embeddings.ndim != 4:
@@ -473,6 +459,7 @@ class ScopedBatchScores:
         queries_mask: torch.Tensor | None,
         documents_mask: torch.Tensor | None,
         xtr_k: int | None = None,
+        xtr_topk_cast_half_for_fp32: bool = False,
     ) -> torch.Tensor:
         """Reduce token-level similarities to document scores.
 
@@ -492,12 +479,17 @@ class ScopedBatchScores:
                 token_scores = token_scores * documents_mask.unsqueeze(0).unsqueeze(0)
         else:
             if documents_mask is not None:
+                mask_fill_value = torch.finfo(token_scores.dtype).min
                 token_scores = token_scores.masked_fill(
                     ~documents_mask.bool().unsqueeze(0).unsqueeze(0),
-                    -99999,
+                    mask_fill_value,
                 )
             clubbed = token_scores.flatten(2, 3)  # (B, Q, B_docs*D)
-            _, indices = clubbed.half().topk(xtr_k, dim=-1, sorted=False)
+            if xtr_topk_cast_half_for_fp32 and clubbed.dtype == torch.float32:
+                topk_input = clubbed.half()
+            else:
+                topk_input = clubbed
+            _, indices = topk_input.topk(xtr_k, dim=-1, sorted=False)
             topk_mask = torch.zeros_like(clubbed, dtype=torch.bool).scatter_(
                 -1, indices, True
             )
@@ -544,6 +536,7 @@ class ScopedBatchScores:
             queries_mask=queries_mask,
             documents_mask=docs_mask_flat,
             xtr_k=xtr_k,
+            xtr_topk_cast_half_for_fp32=self._xtr_topk_cast_half_for_fp32,
         ).view(queries_embeddings.shape[0], B_docs, N_chunk)
 
     def __call__(
@@ -553,6 +546,8 @@ class ScopedBatchScores:
         queries_mask: torch.Tensor | None = None,
         documents_mask: torch.Tensor | None = None,
         query_start_index: int = 0,
+        scoring_scope: Literal["global", "local"] | None = None,
+        return_scope: Literal["global", "local"] | None = None,
     ) -> torch.Tensor:
         queries_embeddings = convert_to_tensor(queries_embeddings)
         documents_embeddings = convert_to_tensor(documents_embeddings)
@@ -561,13 +556,48 @@ class ScopedBatchScores:
         if query_start_index < 0:
             raise ValueError("query_start_index must be >= 0.")
 
+        effective_scoring_scope = (
+            self.scoring_scope if scoring_scope is None else scoring_scope
+        )
+        effective_return_scope = (
+            self.return_scope if return_scope is None else return_scope
+        )
+        if effective_scoring_scope not in {"global", "local"}:
+            raise ValueError(
+                f"Unsupported scoring_scope: {effective_scoring_scope}. Expected 'global' or 'local'."
+            )
+        if effective_return_scope not in {"global", "local"}:
+            raise ValueError(
+                f"Unsupported return_scope: {effective_return_scope}. Expected 'global' or 'local'."
+            )
+        if self.mode == "xtr" and effective_scoring_scope != "global":
+            raise ValueError("XTR requires scoring_scope='global'.")
+        if self.mode == "xtr" and self.doc_batch_chunk is not None:
+            raise ValueError(
+                "doc_batch_chunk is only supported for mode='colbert'. "
+                "XTR requires scoring against the full document batch."
+            )
+        if self.mode == "xtr" and self.doc_nway_chunk is not None:
+            raise ValueError(
+                "doc_nway_chunk is only supported for mode='colbert'. "
+                "XTR requires scoring against all N-way documents at once."
+            )
+        if effective_return_scope == "global" and effective_scoring_scope == "local":
+            raise ValueError(
+                "return_scope='global' requires scoring_scope='global'."
+            )
+        if effective_scoring_scope == "local" and self.doc_batch_chunk is not None:
+            raise ValueError(
+                "doc_batch_chunk is not supported for scoring_scope='local'."
+            )
+
         B = queries_embeddings.shape[0]
         query_step = self.query_batch_chunk or B
         B_docs_total, N = documents_embeddings.shape[:2]
 
         is_xtr = self.mode == "xtr"
-        local_scoring = self.scoring_scope == "local"
-        local_return = self.return_scope == "local"
+        local_scoring = effective_scoring_scope == "local"
+        local_return = effective_return_scope == "local"
 
         doc_batch_step_global = (
             B_docs_total if is_xtr else (self.doc_batch_chunk or B_docs_total)

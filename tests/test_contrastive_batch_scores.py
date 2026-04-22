@@ -142,24 +142,41 @@ def test_xtr_matches_existing_xtrscores() -> None:
 
 
 def test_xtr_rejects_doc_chunking() -> None:
+    queries = torch.randn(2, 3, 4)
+    docs = torch.randn(2, 2, 5, 4)
     with pytest.raises(ValueError, match="doc_batch_chunk"):
-        ScopedBatchScores(mode="xtr", doc_batch_chunk=2)
+        ScopedBatchScores(mode="xtr", doc_batch_chunk=2)(
+            queries_embeddings=queries,
+            documents_embeddings=docs,
+        )
     with pytest.raises(ValueError, match="doc_nway_chunk"):
-        ScopedBatchScores(mode="xtr", doc_nway_chunk=2)
+        ScopedBatchScores(mode="xtr", doc_nway_chunk=2)(
+            queries_embeddings=queries,
+            documents_embeddings=docs,
+        )
     with pytest.raises(ValueError, match="doc_batch_chunk"):
-        ScopedBatchScores(mode="xtr", doc_batch_chunk=2, doc_nway_chunk=2)
+        ScopedBatchScores(mode="xtr", doc_batch_chunk=2, doc_nway_chunk=2)(
+            queries_embeddings=queries,
+            documents_embeddings=docs,
+        )
 
 
 def test_scope_constraints() -> None:
+    queries = torch.randn(2, 3, 4)
+    docs = torch.randn(2, 2, 5, 4)
+
     with pytest.raises(ValueError, match="return_scope='global'"):
         ScopedBatchScores(
             mode="colbert",
             scoring_scope="local",
             return_scope="global",
-        )
+        )(queries_embeddings=queries, documents_embeddings=docs)
 
     with pytest.raises(ValueError, match="XTR requires scoring_scope='global'"):
-        ScopedBatchScores(mode="xtr", scoring_scope="local")
+        ScopedBatchScores(mode="xtr", scoring_scope="local")(
+            queries_embeddings=queries,
+            documents_embeddings=docs,
+        )
 
     with pytest.raises(ValueError, match="doc_batch_chunk is not supported"):
         ScopedBatchScores(
@@ -167,7 +184,7 @@ def test_scope_constraints() -> None:
             scoring_scope="local",
             return_scope="local",
             doc_batch_chunk=2,
-        )
+        )(queries_embeddings=queries, documents_embeddings=docs)
 
 
 @pytest.mark.parametrize("mode", ["colbert", "xtr"])
