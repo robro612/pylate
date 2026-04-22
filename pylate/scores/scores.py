@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import torch
 
@@ -355,6 +357,300 @@ class XTRScores:
             (self._score_for_k(clubbed, k, Qb, Db, Dt, queries_mask), w)
             for k, w in self._k_weights
         ]
+
+
+class ScopedBatchScores:
+    """Full-batch scorer for contrastive losses with optional chunking.
+
+    This scorer accepts a full query batch ``(B, Q, H)`` and a full 2D
+    document batch ``(B, N, D, H)``.
+
+    Shape convention:
+    - ``B``: batch size
+    - ``Q``: query sequence length
+    - ``N``: n-way documents per query
+    - ``D``: document sequence length
+    - ``H``: hidden dimension
+
+    It supports two scoring modes:
+    - ``"colbert"``: token max-sim ColBERT scoring with chunking across both
+      query batch, document batch, and N-way document dimensions.
+    - ``"xtr"``: global top-k XTR scoring with query-batch chunking only.
+      XTR requires every query chunk to see all documents simultaneously.
+
+    It also supports:
+    - ``scoring_scope``: whether scores are computed against local docs (in the same instance) per query
+      or the full in-batch document pool.
+    - ``return_scope``: whether to return local ``(B, N)`` scores or global
+      ``(B, B*N)`` scores.
+    """
+
+    def __init__(
+        self,
+        mode: Literal["colbert", "xtr"] = "colbert",
+        scoring_scope: Literal["global", "local"] = "global",
+        return_scope: Literal["global", "local"] = "global",
+        query_batch_chunk: int | None = None,
+        doc_batch_chunk: int | None = None,
+        doc_nway_chunk: int | None = None,
+        xtr_k: int = 128,
+    ) -> None:
+        if mode not in {"colbert", "xtr"}:
+            raise ValueError(f"Unsupported mode: {mode}. Expected 'colbert' or 'xtr'.")
+
+        if query_batch_chunk is not None and query_batch_chunk <= 0:
+            raise ValueError("query_batch_chunk must be > 0 when provided.")
+
+        if doc_batch_chunk is not None and doc_batch_chunk <= 0:
+            raise ValueError("doc_batch_chunk must be > 0 when provided.")
+
+        if doc_nway_chunk is not None and doc_nway_chunk <= 0:
+            raise ValueError("doc_nway_chunk must be > 0 when provided.")
+
+        self.mode = mode
+        self.scoring_scope = scoring_scope
+        self.return_scope = return_scope
+        self.query_batch_chunk = query_batch_chunk
+        self.doc_batch_chunk = doc_batch_chunk
+        self.doc_nway_chunk = doc_nway_chunk
+        self._xtr_k = xtr_k
+
+        if self.scoring_scope not in {"global", "local"}:
+            raise ValueError(
+                f"Unsupported scoring_scope: {self.scoring_scope}. Expected 'global' or 'local'."
+            )
+        if self.return_scope not in {"global", "local"}:
+            raise ValueError(
+                f"Unsupported return_scope: {self.return_scope}. Expected 'global' or 'local'."
+            )
+        if self.mode == "xtr" and self.scoring_scope != "global":
+            raise ValueError("XTR requires scoring_scope='global'.")
+        if self.mode == "xtr" and self.doc_batch_chunk is not None:
+            raise ValueError(
+                "doc_batch_chunk is only supported for mode='colbert'. "
+                "XTR requires scoring against the full document batch."
+            )
+        if self.mode == "xtr" and self.doc_nway_chunk is not None:
+            raise ValueError(
+                "doc_nway_chunk is only supported for mode='colbert'. "
+                "XTR requires scoring against all N-way documents at once."
+            )
+        if self.return_scope == "global" and self.scoring_scope == "local":
+            raise ValueError(
+                "return_scope='global' requires scoring_scope='global'."
+            )
+        if self.scoring_scope == "local" and self.doc_batch_chunk is not None:
+            raise ValueError(
+                "doc_batch_chunk is not supported for scoring_scope='local'."
+            )
+
+    @staticmethod
+    def _validate_documents_shape(documents_embeddings: torch.Tensor) -> None:
+        if documents_embeddings.ndim != 4:
+            raise ValueError(
+                "documents_embeddings must be 4D with shape (B, N, D, H) "
+                f"for full-batch scoring, got shape {tuple(documents_embeddings.shape)}."
+            )
+
+    @staticmethod
+    def _compute_token_scores(
+        queries_embeddings: torch.Tensor,
+        documents_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        B = queries_embeddings.shape[0]
+        Q = queries_embeddings.shape[1]
+        B_docs = documents_embeddings.shape[0]
+        D = documents_embeddings.shape[1]
+        H = queries_embeddings.shape[-1]
+
+        q_flat = queries_embeddings.reshape(B * Q, H)
+        d_flat = documents_embeddings.reshape(B_docs * D, H).T
+        return (q_flat @ d_flat).view(B, Q, B_docs, D)
+
+    @staticmethod
+    def _reduce_scores(
+        token_scores: torch.Tensor,
+        queries_mask: torch.Tensor | None,
+        documents_mask: torch.Tensor | None,
+        xtr_k: int | None = None,
+    ) -> torch.Tensor:
+        """Reduce token-level similarities to document scores.
+
+        Shared path:
+        - optional document masking
+        - max over document tokens
+        - optional query masking
+        - sum over query tokens
+
+        XTR adds global top-k selection and Z-normalization.
+        """
+        B, Q, B_docs, D = token_scores.shape
+
+        if xtr_k is None:
+            # Independent-document path uses multiplicative document masking.
+            if documents_mask is not None:
+                token_scores = token_scores * documents_mask.unsqueeze(0).unsqueeze(0)
+        else:
+            if documents_mask is not None:
+                token_scores = token_scores.masked_fill(
+                    ~documents_mask.bool().unsqueeze(0).unsqueeze(0),
+                    -99999,
+                )
+            clubbed = token_scores.flatten(2, 3)  # (B, Q, B_docs*D)
+            _, indices = clubbed.half().topk(xtr_k, dim=-1, sorted=False)
+            topk_mask = torch.zeros_like(clubbed, dtype=torch.bool).scatter_(
+                -1, indices, True
+            )
+            token_scores = (clubbed * topk_mask).view(B, Q, B_docs, D)
+
+        max_scores = token_scores.max(dim=-1).values  # (B, Q, B_docs)
+        if queries_mask is not None:
+            max_scores = max_scores * queries_mask.unsqueeze(-1)
+
+        scores_sum = max_scores.sum(dim=1)
+        if xtr_k is None:
+            return scores_sum
+
+        Z = max_scores.gt(0).float().sum(dim=1).clamp_(min=1e-3)
+        return (scores_sum / Z).float()
+
+    def _score_chunk(
+        self,
+        queries_embeddings: torch.Tensor,
+        documents_embeddings: torch.Tensor,
+        queries_mask: torch.Tensor | None = None,
+        documents_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score a single (query chunk, doc chunk) pair.
+
+        `documents_embeddings` must be shaped `(B_docs, N_chunk, D, H)` for this
+        chunk. Returns a score block shaped `(B_query, B_docs, N_chunk)`.
+        """
+        B_docs, N_chunk = documents_embeddings.shape[:2]
+        docs_flat = documents_embeddings.reshape(
+            B_docs * N_chunk,
+            documents_embeddings.shape[-2],
+            documents_embeddings.shape[-1],
+        )
+        docs_mask_flat = (
+            None
+            if documents_mask is None
+            else documents_mask.reshape(B_docs * N_chunk, documents_mask.shape[-1])
+        )
+        xtr_k = self._xtr_k if self.mode == "xtr" else None
+        token_scores = self._compute_token_scores(queries_embeddings, docs_flat)
+        return self._reduce_scores(
+            token_scores=token_scores,
+            queries_mask=queries_mask,
+            documents_mask=docs_mask_flat,
+            xtr_k=xtr_k,
+        ).view(queries_embeddings.shape[0], B_docs, N_chunk)
+
+    def __call__(
+        self,
+        queries_embeddings: list | np.ndarray | torch.Tensor,
+        documents_embeddings: list | np.ndarray | torch.Tensor,
+        queries_mask: torch.Tensor | None = None,
+        documents_mask: torch.Tensor | None = None,
+        query_start_index: int = 0,
+    ) -> torch.Tensor:
+        queries_embeddings = convert_to_tensor(queries_embeddings)
+        documents_embeddings = convert_to_tensor(documents_embeddings)
+        self._validate_documents_shape(documents_embeddings)
+
+        if query_start_index < 0:
+            raise ValueError("query_start_index must be >= 0.")
+
+        B = queries_embeddings.shape[0]
+        query_step = self.query_batch_chunk or B
+        B_docs_total, N = documents_embeddings.shape[:2]
+
+        is_xtr = self.mode == "xtr"
+        local_scoring = self.scoring_scope == "local"
+        local_return = self.return_scope == "local"
+
+        doc_batch_step_global = (
+            B_docs_total if is_xtr else (self.doc_batch_chunk or B_docs_total)
+        )
+        doc_nway_step_global = N if is_xtr else (self.doc_nway_chunk or N)
+        reduced_score_chunks = []
+        for b_start in range(0, B, query_step):
+            b_end = min(b_start + query_step, B)
+            b_query = b_end - b_start
+            abs_b_start = query_start_index + b_start
+            abs_b_end = query_start_index + b_end
+            q_chunk_mask = (
+                None if queries_mask is None else queries_mask[b_start:b_end]
+            )
+
+            if local_scoring:
+                if abs_b_end > B_docs_total:
+                    raise ValueError(
+                        "scoring_scope='local' requires matching document rows for each "
+                        "query in the current chunk."
+                    )
+                docs_for_chunk = documents_embeddings[abs_b_start:abs_b_end]
+                docs_mask_for_chunk = (
+                    None
+                    if documents_mask is None
+                    else documents_mask[abs_b_start:abs_b_end]
+                )
+                doc_batch_step = b_query
+                doc_nway_step = self.doc_nway_chunk or N
+            else:
+                docs_for_chunk = documents_embeddings
+                docs_mask_for_chunk = documents_mask
+                doc_batch_step = doc_batch_step_global
+                doc_nway_step = doc_nway_step_global
+
+            q_chunk_scores = torch.empty(
+                b_query,
+                docs_for_chunk.shape[0],
+                N,
+                device=queries_embeddings.device,
+                dtype=queries_embeddings.dtype,
+            )
+            for d_start in range(0, docs_for_chunk.shape[0], doc_batch_step):
+                d_end = min(d_start + doc_batch_step, docs_for_chunk.shape[0])
+                for n_start in range(0, N, doc_nway_step):
+                    n_end = min(n_start + doc_nway_step, N)
+                    docs_chunk = docs_for_chunk[d_start:d_end, n_start:n_end]
+                    docs_mask_chunk = (
+                        None
+                        if docs_mask_for_chunk is None
+                        else docs_mask_for_chunk[d_start:d_end, n_start:n_end]
+                    )
+                    q_chunk_scores[:, d_start:d_end, n_start:n_end] = self._score_chunk(
+                        queries_embeddings=queries_embeddings[b_start:b_end],
+                        documents_embeddings=docs_chunk,
+                        queries_mask=q_chunk_mask,
+                        documents_mask=docs_mask_chunk,
+                    )
+
+            if local_return:
+                if local_scoring:
+                    local_idx = torch.arange(
+                        b_query, device=queries_embeddings.device
+                    )
+                    reduced_score_chunks.append(q_chunk_scores[local_idx, local_idx, :])
+                else:
+                    local_cols = (
+                        torch.arange(
+                            abs_b_start, abs_b_end, device=queries_embeddings.device
+                        ).unsqueeze(1)
+                        * N
+                    ) + torch.arange(N, device=queries_embeddings.device)
+                    reduced_score_chunks.append(
+                        q_chunk_scores.view(b_query, B_docs_total * N).gather(
+                            1, local_cols
+                        )
+                    )
+            else:
+                reduced_score_chunks.append(
+                    q_chunk_scores.view(b_query, B_docs_total * N)
+                )
+
+        return torch.cat(reduced_score_chunks, dim=0)
 
 
 class XTRKDScores:
