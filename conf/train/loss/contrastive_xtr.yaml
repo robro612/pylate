@@ -4,3 +4,7 @@ k_train: [128]
 k_weights: null         # list of floats (must match k_train length), or null for uniform
 temperature: 0.05
 learnable_temperature: true
+scoped_query_batch_chunk: null
+scoped_doc_batch_chunk: null
+scoped_doc_nway_chunk: null
+scoped_xtr_topk_cast_half_for_fp32: false

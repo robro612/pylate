@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Callable, Iterable, Literal
+from typing import Iterable, Literal
 
 import torch
 
 from ..models import ColBERT
-from ..scores import ScopedBatchScores, colbert_kd_scores
+from ..scores import ScopedBatchScores
 from .contrastive import extract_skiplist_mask
 
 
@@ -17,7 +17,8 @@ class Distillation(torch.nn.Module):
     model
         SentenceTransformer model.
     score_metric
-        Function that returns a score between two sequences of embeddings.
+        Scoped batch scoring object. Defaults to
+        ``ScopedBatchScores(mode="colbert")``.
     size_average
         Average by the size of the mini-batch or perform sum.
     normalize_scores
@@ -62,13 +63,13 @@ class Distillation(torch.nn.Module):
     def __init__(
         self,
         model: ColBERT,
-        score_metric: Callable = colbert_kd_scores,
+        score_metric: ScopedBatchScores | None = None,
         size_average: bool = True,
         normalize_scores: bool | Literal["student", "teacher", "both"] = True,
         temperature: float = 1.0,
     ) -> None:
         super(Distillation, self).__init__()
-        self.score_metric = score_metric
+        self.score_metric = score_metric or ScopedBatchScores(mode="colbert")
         self.model = model
         self.loss_function = torch.nn.KLDivLoss(
             reduction="batchmean" if size_average else "sum", log_target=True
@@ -139,58 +140,8 @@ class Distillation(torch.nn.Module):
         documents_embeddings_mask = masks[1].view(
             queries_embeddings.size(0), -1, *masks[1].shape[1:]
         )
-        scores = self.score_metric(
-            queries_embeddings,
-            documents_embeddings,
-            queries_mask=masks[0] if not do_query_expansion else None,
-            documents_mask=documents_embeddings_mask,
-        )
-        if isinstance(scores, list):
-            scores = sum(w * s for s, w in scores)
-        teacher_scores = labels.float()
-        if self.normalize_scores in {"student", "both"}:
-            scores = self._minmax_normalize(scores)
-        if self.normalize_scores in {"teacher", "both"}:
-            teacher_scores = self._minmax_normalize(teacher_scores)
-        return self.loss_function(
-            torch.nn.functional.log_softmax(scores / self.temperature, dim=-1),
-            torch.nn.functional.log_softmax(teacher_scores, dim=-1),
-        )
-
-
-class Distillation_New(Distillation):
-    """ScopedBatchScores-integrated variant of Distillation."""
-
-    def forward(
-        self, sentence_features: Iterable[dict[str, torch.Tensor]], labels: torch.Tensor
-    ) -> torch.Tensor:
-        queries_embeddings = torch.nn.functional.normalize(
-            self.model(sentence_features[0])["token_embeddings"], p=2, dim=-1
-        )
-        documents_embeddings = torch.nn.functional.normalize(
-            self.model(sentence_features[1])["token_embeddings"], p=2, dim=-1
-        )
-        documents_embeddings = documents_embeddings.view(
-            queries_embeddings.size(0), -1, *documents_embeddings.shape[1:]
-        )
-        skiplist = (
-            self.model.skiplist
-            if hasattr(self.model, "skiplist")
-            else self.model.module.skiplist
-        )
-        do_query_expansion = (
-            self.model.do_query_expansion
-            if hasattr(self.model, "do_query_expansion")
-            else self.model.module.do_query_expansion
-        )
-        masks = extract_skiplist_mask(
-            sentence_features=sentence_features, skiplist=skiplist
-        )
-        documents_embeddings_mask = masks[1].view(
-            queries_embeddings.size(0), -1, *masks[1].shape[1:]
-        )
         if not isinstance(self.score_metric, ScopedBatchScores):
-            raise TypeError("Distillation_New requires score_metric=ScopedBatchScores.")
+            raise TypeError("Distillation requires score_metric=ScopedBatchScores.")
         scores = self.score_metric(
             queries_embeddings,
             documents_embeddings,
@@ -201,7 +152,7 @@ class Distillation_New(Distillation):
         )
         if isinstance(scores, list):
             raise TypeError(
-                "Distillation_New expects a single score tensor, not weighted multi-k scores."
+                "Distillation expects a single score tensor, not weighted multi-k scores."
             )
         teacher_scores = labels.float()
         if self.normalize_scores in {"student", "both"}:

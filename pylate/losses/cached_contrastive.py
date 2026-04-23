@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import nullcontext
 from functools import partial
-from typing import Callable, Iterable, Optional
+from typing import Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +12,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import get_device_states, set_device_states
 
 from ..models import ColBERT
-from ..scores import ScopedBatchScores, colbert_scores
+from ..scores import ScopedBatchScores
 from ..utils import all_gather, all_gather_with_gradients, get_rank, get_world_size
 from .contrastive import extract_skiplist_mask
 
@@ -86,7 +86,7 @@ class CachedContrastive(nn.Module):
     model :
         A PyLate ColBERT model
     score_metric
-        ColBERT scoring function. Defaults to colbert_scores.
+        Scoped batch scoring object. Defaults to ``ScopedBatchScores(mode="colbert")``.
     mini_batch_size
         Chunk size for the forward pass. You can keep this small to avoid OOM on large batch sizes.
     size_average
@@ -96,7 +96,9 @@ class CachedContrastive(nn.Module):
     show_progress_bar
         Whether to show a TQDM progress bar for the embedding steps.
     score_mini_batch_size
-        Chunk size for the score calculation step. You can keep this small to avoid OOM on large batch sizes, especially if your score metric creates large intermediate tensors (e.g. xtr_scores). Defaults is None (a.k.a. equal to the mini_batch_size).
+        Chunk size for the score calculation step. You can keep this small to
+        avoid OOM on large batch sizes. Defaults is ``None`` (equal to
+        ``mini_batch_size``).
     Examples
     --------
     >>> from pylate import models, losses
@@ -128,7 +130,7 @@ class CachedContrastive(nn.Module):
     def __init__(
         self,
         model: ColBERT,
-        score_metric: Callable = colbert_scores,
+        score_metric: ScopedBatchScores | None = None,
         mini_batch_size: int = 32,
         size_average: bool = True,
         gather_across_devices: bool = False,
@@ -138,7 +140,7 @@ class CachedContrastive(nn.Module):
     ) -> None:
         super(CachedContrastive, self).__init__()
         self.model = model
-        self.score_metric = score_metric
+        self.score_metric = score_metric or ScopedBatchScores(mode="colbert")
         self.mini_batch_size = mini_batch_size
         self.size_average = size_average
         self.gather_across_devices = gather_across_devices
@@ -228,42 +230,26 @@ class CachedContrastive(nn.Module):
         return loss
 
     def calculate_loss(self, reps, masks, with_backward: bool = False) -> Tensor:
-        """Calculate the cross-entropy loss. No need to cache the gradients. Each sub-list in reps is a list of mini-batch chunk embeddings
-
-        Parameters
-        ----------
-        reps :
-            A list of list of mini-batch chunk embeddings. The first list are the anchors, the second are the positives and the remaining are negatives.
-        masks
-            Tensors containing the skiplist masks associated with each sentence feature (anchor, positives, negatives).
-        with_backward
-            Whether to compute the backward pass or not.
-        """
-        # We first cat them chunk-wise for anchor, positives, negatives
-        embeddings_anchor = torch.cat(reps[0])  # (bsz, hdim)
+        """Calculate cross-entropy loss for cached contrastive training."""
+        embeddings_anchor = torch.cat(reps[0])
         embeddings_other = [
             torch.cat([chunk_embed for chunk_embed in r]) for r in reps[1:]
-        ]  # [(nneg * bsz, hdim)]
+        ]
 
         batch_size = len(embeddings_anchor)
         labels = torch.tensor(
             range(batch_size), dtype=torch.long, device=reps[0][0].device
-        )  # (bsz, (1 + nneg) * bsz)  Example a[i] should match with b[i]
-        # Possibly gather the embeddings across devices to have more in-batch negatives. For GradCache, we only need to gather them to compute the scores matrix and nowhere else.
-        # Note that we only gather the documents embeddings and not the queries embeddings, but are keeping gradients. This is to lower the memory usage, see https://github.com/mlfoundations/open_clip/issues/616
+        )
         if self.gather_across_devices:
             embeddings_other = [
                 torch.cat(all_gather_with_gradients(embeddings))
                 for embeddings in embeddings_other
             ]
-            # Masks [0] is the anchor mask so we do not need to gather it (even though we are not using it for now anyways)
-            # Also, we do gather without gradients for the masks as we do not backpropagate through them
             masks = [
                 masks[0],
                 *[torch.cat(all_gather(mask)) for mask in masks[1:]],
             ]
             rank = get_rank()
-            # Adjust the labels to match the gathered embeddings positions
             labels = labels + rank * batch_size
         losses: list[torch.Tensor] = []
         do_query_expansion = (
@@ -271,18 +257,16 @@ class CachedContrastive(nn.Module):
             if hasattr(self.model, "do_query_expansion")
             else self.model.module.do_query_expansion
         )
-        requires_full_batch = getattr(self.score_metric, "requires_full_batch", False)
-        if requires_full_batch:
-            # Score metrics like xtr_scores need all documents at once for
-            # global top-k selection. Stack groups into (batch, N, Dt, H).
-            N = len(embeddings_other)
-            all_docs = torch.stack(embeddings_other, dim=1)
-            all_docs_mask = torch.stack(masks[1:], dim=1)
-            labels = torch.arange(batch_size, device=reps[0][0].device) * N
-            if self.gather_across_devices:
-                rank = get_rank()
-                labels = labels + rank * batch_size * N
-                
+        if not isinstance(self.score_metric, ScopedBatchScores):
+            raise TypeError("CachedContrastive requires score_metric=ScopedBatchScores.")
+        N = len(embeddings_other)
+        all_docs = torch.stack(embeddings_other, dim=1)
+        all_docs_mask = torch.stack(masks[1:], dim=1)
+        labels = torch.arange(batch_size, device=reps[0][0].device) * N
+        if self.gather_across_devices:
+            rank = get_rank()
+            labels = labels + rank * batch_size * N
+
         for begin in tqdm.trange(
             0,
             batch_size,
@@ -291,58 +275,20 @@ class CachedContrastive(nn.Module):
             disable=not self.show_progress_bar,
         ):
             end = begin + self.score_mini_batch_size
-            if requires_full_batch:
-                scores = self.score_metric(
-                    embeddings_anchor[begin:end],
-                    all_docs,
-                    queries_mask=masks[0][begin:end]
-                    if not do_query_expansion
-                    else None,
-                    documents_mask=all_docs_mask,
-                )
-            else:
-                # Chunk scores over document groups to avoid OOM with large batch sizes
-                scores = torch.cat(
-                    [
-                        torch.cat(
-                            [
-                                self.score_metric(
-                                    embeddings_anchor[begin:end],
-                                    group_embeddings[
-                                        g_start : min(
-                                            g_start + self.score_mini_batch_size,
-                                            len(group_embeddings),
-                                        )
-                                    ],
-                                    queries_mask=masks[0][begin:end]
-                                    if not do_query_expansion
-                                    else None,
-                                    documents_mask=documents_mask[
-                                        g_start : min(
-                                            g_start + self.score_mini_batch_size,
-                                            len(group_embeddings),
-                                        )
-                                    ],
-                                )
-                                for g_start in range(
-                                    0, len(group_embeddings), self.score_mini_batch_size
-                                )
-                            ],
-                            dim=1,
-                        )
-                        for group_embeddings, documents_mask in zip(
-                            embeddings_other, masks[1:]
-                        )
-                    ],
-                    dim=1,
-                )
-            # We don't want to average the loss across the mini-batch as mini-batch sizes can vary, which would create an issue similar to this one: https://huggingface.co/blog/gradient_accumulation#where-does-it-stem-from
+            scores = self.score_metric(
+                embeddings_anchor[begin:end],
+                all_docs,
+                queries_mask=masks[0][begin:end] if not do_query_expansion else None,
+                documents_mask=all_docs_mask,
+                query_start_index=begin,
+                scoring_scope="global",
+                return_scope="global",
+            )
             loss_mbatch = F.cross_entropy(
                 input=scores / self.temperature,
                 target=labels[begin:end],
                 reduction="sum",
             )
-            # Scale by world size when gathering across device
             if self.gather_across_devices:
                 loss_mbatch *= get_world_size()
 
@@ -423,80 +369,3 @@ class CachedContrastive(nn.Module):
     primaryClass={cs.LG}
 }
 """
-
-
-class CachedContrastive_New(CachedContrastive):
-    """ScopedBatchScores-integrated variant of CachedContrastive."""
-
-    def calculate_loss(self, reps, masks, with_backward: bool = False) -> Tensor:
-        embeddings_anchor = torch.cat(reps[0])
-        embeddings_other = [
-            torch.cat([chunk_embed for chunk_embed in r]) for r in reps[1:]
-        ]
-
-        batch_size = len(embeddings_anchor)
-        labels = torch.tensor(
-            range(batch_size), dtype=torch.long, device=reps[0][0].device
-        )
-        if self.gather_across_devices:
-            embeddings_other = [
-                torch.cat(all_gather_with_gradients(embeddings))
-                for embeddings in embeddings_other
-            ]
-            masks = [
-                masks[0],
-                *[torch.cat(all_gather(mask)) for mask in masks[1:]],
-            ]
-            rank = get_rank()
-            labels = labels + rank * batch_size
-        losses: list[torch.Tensor] = []
-        do_query_expansion = (
-            self.model.do_query_expansion
-            if hasattr(self.model, "do_query_expansion")
-            else self.model.module.do_query_expansion
-        )
-        if not isinstance(self.score_metric, ScopedBatchScores):
-            raise TypeError("CachedContrastive_New requires score_metric=ScopedBatchScores.")
-        N = len(embeddings_other)
-        all_docs = torch.stack(embeddings_other, dim=1)
-        all_docs_mask = torch.stack(masks[1:], dim=1)
-        labels = torch.arange(batch_size, device=reps[0][0].device) * N
-        if self.gather_across_devices:
-            rank = get_rank()
-            labels = labels + rank * batch_size * N
-
-        for begin in tqdm.trange(
-            0,
-            batch_size,
-            self.score_mini_batch_size,
-            desc="Preparing caches",
-            disable=not self.show_progress_bar,
-        ):
-            end = begin + self.score_mini_batch_size
-            scores = self.score_metric(
-                embeddings_anchor[begin:end],
-                all_docs,
-                queries_mask=masks[0][begin:end] if not do_query_expansion else None,
-                documents_mask=all_docs_mask,
-                query_start_index=begin,
-                scoring_scope="global",
-                return_scope="global",
-            )
-            loss_mbatch = F.cross_entropy(
-                input=scores / self.temperature,
-                target=labels[begin:end],
-                reduction="sum",
-            )
-            if self.gather_across_devices:
-                loss_mbatch *= get_world_size()
-
-            if with_backward:
-                loss_mbatch.backward()
-                loss_mbatch = loss_mbatch.detach()
-            losses.append(loss_mbatch)
-
-        loss = sum(losses)
-        if self.size_average:
-            loss /= batch_size
-
-        return loss

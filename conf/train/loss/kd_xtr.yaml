@@ -5,3 +5,7 @@ k_weights: null
 temperature: 1.0
 learnable_temperature: true
 minmax_normalize_scores: true  # false | student | teacher | both (true == both)
+scoped_query_batch_chunk: null
+scoped_doc_batch_chunk: null
+scoped_doc_nway_chunk: null
+scoped_xtr_topk_cast_half_for_fp32: false

@@ -12,8 +12,8 @@ Usage examples:
   # Contrastive XTR with specific k
   python examples/train/hydra_train.py loss=contrastive_xtr 'loss.k_train=[256]' run_name=modernbert_xtr_contrastive_k256
 
-  # Contrastive XTR multi-k
-  python examples/train/hydra_train.py loss=contrastive_xtr 'loss.k_train=[128,256,512]' run_name=modernbert_xtr_contrastive_multik128-256-512
+  # Contrastive XTR with query chunking
+  python examples/train/hydra_train.py loss=contrastive_xtr loss.scoped_query_batch_chunk=8 run_name=modernbert_xtr_contrastive_qchunk8
 
   # Distillation (KD) from a contrastive checkpoint
   python examples/train/hydra_train.py --config-name distillation loss=kd_xtr 'loss.k_train=[128]' model_name=output/modernbert_xtr_contrastive_k128/final run_name=modernbert_xtr_kd_k128
@@ -30,8 +30,11 @@ import hydra
 import torch
 from datasets import load_dataset
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
-from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from omegaconf import DictConfig
+from sentence_transformers import (
+    SentenceTransformerTrainer,
+    SentenceTransformerTrainingArguments,
+)
 from transformers import TrainerCallback
 
 from pylate import evaluation, losses, models, scores, utils
@@ -73,26 +76,31 @@ def load_kd_dataset(dataset_cfg: DictConfig):
 
 def build_score_metric(loss_cfg: DictConfig):
     score_fn = loss_cfg.score_fn
-    is_kd = loss_cfg.type == "kd"
+    if score_fn not in {"colbert", "xtr"}:
+        raise ValueError(
+            f"Unsupported scoped score_fn '{score_fn}'. Expected 'colbert' or 'xtr'."
+        )
 
-    if score_fn == "colbert":
-        return scores.colbert_kd_scores if is_kd else scores.colbert_scores
+    xtr_k = 128
+    if score_fn == "xtr":
+        k_train = list(loss_cfg.k_train)
+        if len(k_train) != 1:
+            raise ValueError(
+                "ScopedBatchScores currently supports a single xtr_k. "
+                f"Got k_train={k_train}."
+            )
+        xtr_k = int(k_train[0])
 
-    # XTR
-    k_train = list(loss_cfg.k_train)
-    k_weights = list(loss_cfg.k_weights) if loss_cfg.k_weights is not None else None
-
-    def _k_arg():
-        if len(k_train) == 1:
-            return k_train[0]
-        elif k_weights is not None:
-            return list(zip(k_train, k_weights))
-        else:
-            return k_train
-
-    if is_kd:
-        return scores.XTRKDScores(k=_k_arg())
-    return scores.XTRScores(k=_k_arg())
+    return scores.ScopedBatchScores(
+        mode=score_fn,
+        query_batch_chunk=loss_cfg.get("scoped_query_batch_chunk"),
+        doc_batch_chunk=loss_cfg.get("scoped_doc_batch_chunk"),
+        doc_nway_chunk=loss_cfg.get("scoped_doc_nway_chunk"),
+        xtr_k=xtr_k,
+        xtr_topk_cast_half_for_fp32=bool(
+            loss_cfg.get("scoped_xtr_topk_cast_half_for_fp32", False)
+        ),
+    )
 
 
 def make_run_name(cfg: DictConfig) -> str:
@@ -137,7 +145,7 @@ def main(cfg: DictConfig):
     if is_kd and dataset_cfg.type != "kd":
         raise ValueError(f"KD loss requires a KD dataset (e.g. dataset=kd_msmarco), got '{dataset_cfg.type}'.")
     if not is_kd and dataset_cfg.type == "kd":
-        raise ValueError(f"Contrastive loss requires a contrastive dataset, got kd dataset.")
+        raise ValueError("Contrastive loss requires a contrastive dataset, got kd dataset.")
 
     run_name = cfg.run_name or make_run_name(cfg)
     output_dir = cfg.output_dir or f"output/{run_name}"
@@ -220,6 +228,8 @@ def main(cfg: DictConfig):
         dataloader_drop_last=True,
         dataloader_pin_memory=True,
         ddp_find_unused_parameters=False,
+        seed=int(cfg.get("seed", 42)),
+        data_seed=int(cfg.get("data_seed", cfg.get("seed", 42))),
     )
     if cfg.max_steps is not None:
         training_args_kwargs["max_steps"] = cfg.max_steps

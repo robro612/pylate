@@ -27,6 +27,8 @@ save_total_limit: 1
 logging_steps: 10
 dtype: fp16             # fp16, bf16, or fp32
 compile: true           # torch.compile via HF TrainingArguments
+seed: 42
+data_seed: 42
 
 run_name: null          # auto-generated if null
 output_dir: null        # defaults to output/{run_name}
