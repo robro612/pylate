@@ -1,0 +1,3 @@
+type: kd
+hf_path: "lightonai/ms-marco-en-bge-gemma"
+n_ways: 16

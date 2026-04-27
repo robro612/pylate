@@ -1,0 +1,5 @@
+type: contrastive
+hf_path: "rlhn/rlhn-680K"
+hf_name: null
+hf_split: "train"
+tevatron: true

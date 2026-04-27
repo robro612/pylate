@@ -1,0 +1,5 @@
+type: contrastive
+hf_path: "sentence-transformers/msmarco-bm25"
+hf_name: "triplet"
+hf_split: "train"
+tevatron: false

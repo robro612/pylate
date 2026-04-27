@@ -1,0 +1,25 @@
+defaults:
+  - override hydra/job_logging: custom
+  - _self_
+
+dataset: "beir/fiqa/test"
+num_queries: 100  # null = use all queries
+
+doc_length: 300
+
+models: ???  # set by contrastive.yaml or kd.yaml
+
+retrieval:
+  mode: exact      # exact | scann
+  k_token: 1000   # top-k token scores collected per query token
+
+encode:
+  batch_size: 2000
+
+seed: 42
+device: null  # null = auto-detect (cuda if available, else cpu)
+
+output:
+  dir: "outputs/score_distributions"
+  plot_file: "score_dist_contrastive.pdf"
+  dpi: 300

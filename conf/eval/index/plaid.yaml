@@ -1,0 +1,9 @@
+type: plaid
+retrieval:
+  - colbert
+nbits: 2
+random_rotation: false
+use_triton: null
+add_batch_size: 8 # batch size for number of shards to add at a time
+search_batch_size: 128 # number of queries to process at a time. Default is 1 >> 18 which blows up on MSMARCO's 6980 queries on 9M docs.
+verbose: false

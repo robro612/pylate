@@ -1,0 +1,36 @@
+defaults:
+  - dataset: contrastive_msmarco_bclavie
+  - loss: cached_contrastive_xtr
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+model_name: "answerdotai/ModernBERT-base"
+query_length: 32
+document_length: 512
+query_prefix: ""
+document_prefix: ""
+
+batch_size: 64
+gradient_accumulation_steps: 1
+max_steps: 50000
+num_epochs: null        # alternative to max_steps; set one or the other
+learning_rate: 3e-5
+warmup_steps: 0
+eval_on_start: true
+eval_steps: 500
+save_steps: 1000
+save_total_limit: 1
+logging_steps: 10
+dtype: fp16             # fp16, bf16, or fp32
+compile: true           # torch.compile via HF TrainingArguments
+
+run_name: null          # auto-generated if null
+output_dir: null        # defaults to output/{run_name}
+
+wandb:
+  project: "xtr"
+  group: "contrastive"

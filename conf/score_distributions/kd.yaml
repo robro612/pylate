@@ -1,0 +1,24 @@
+defaults:
+  - config
+  - _self_
+
+models:
+  - name: mb_colbert_kd
+    path: "output/modernbert_colbert_kd/final"
+    label: "ColBERT-KD"
+    scann_index: null
+  - name: mb_xtr_kd_k256
+    path: "output/modernbert_xtr_kd_k256/final"
+    label: "XTR-KD k=256"
+    scann_index: null
+  - name: mb_xtr_kd_k512
+    path: "output/modernbert_xtr_kd_k512/final"
+    label: "XTR-KD k=512"
+    scann_index: null
+  - name: mb_xtr_kd_multik
+    path: "output/modernbert_xtr_kd_multik128-256-512/final"
+    label: "XTR-KD multi-k"
+    scann_index: null
+
+output:
+  plot_file: "score_dist_kd.pdf"
