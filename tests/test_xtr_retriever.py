@@ -41,6 +41,36 @@ def test_xtr_constructor_rejects_plaid_style_indices() -> None:
         retrieve.XTR(index=plaid_like)
 
 
+def test_xtr_retrieve_passthrough_with_warp(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Use __new__ to avoid backend initialization and monkeypatch __call__
+    # to validate that retrieve.XTR delegates directly to WARP.
+    warp_like = indexes.WARP.__new__(indexes.WARP)
+    captured = {}
+
+    def _fake_warp_call(self, queries_embeddings, k=10, subset=None):
+        captured["queries_embeddings"] = queries_embeddings
+        captured["k"] = k
+        captured["subset"] = subset
+        return [[{"id": "d1", "score": 1.23}]]
+
+    monkeypatch.setattr(indexes.WARP, "__call__", _fake_warp_call)
+
+    retriever = retrieve.XTR(index=warp_like, verbose=False)
+    queries = [torch.randn(2, 8, dtype=torch.float32)]
+    subset = ["d1", "d2"]
+    results = retriever.retrieve(
+        queries_embeddings=queries,
+        k=3,
+        k_token=999,  # ignored for WARP pass-through
+        subset=subset,
+    )
+
+    assert results == [[{"id": "d1", "score": 1.23}]]
+    assert captured["queries_embeddings"] == queries
+    assert captured["k"] == 3
+    assert captured["subset"] == subset
+
+
 def test_xtr_retrieve_subset_not_supported() -> None:
     retriever = retrieve.XTR(index=_build_tiny_scann_index())
     with pytest.raises(

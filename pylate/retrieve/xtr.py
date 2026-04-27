@@ -120,13 +120,15 @@ class XTR:
             The number of documents to retrieve.
         k_token
             The number of documents to retrieve from the index per query token.
+            Only used for token-level ANN indexes (e.g. ScaNN/Voyager).
         device
             The device to use for XTR scoring computation. Defaults to 'cpu'.
         batch_size
             The batch size to use for retrieval.
+            Only used for token-level ANN indexes.
         subset
             Optional subset of document IDs to restrict search to.
-            Only supported with certain index types.
+            Supported for end-to-end indexes like WARP.
 
 
         Returns
@@ -144,6 +146,15 @@ class XTR:
         elif isinstance(queries_embeddings, torch.Tensor):
             if queries_embeddings.ndim == 2:
                 queries_embeddings = [queries_embeddings]
+
+        # WARP performs end-to-end XTR retrieval/scoring and already returns
+        # ranked document IDs + scores.
+        if isinstance(self.index, indexes.WARP):
+            return self.index(
+                queries_embeddings=queries_embeddings,
+                k=k,
+                subset=subset,
+            )
 
         if subset is not None:
             raise NotImplementedError(
