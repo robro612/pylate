@@ -14,6 +14,15 @@ document_length: 512
 query_prefix: ""
 document_prefix: ""
 
+query_token_weight_head:
+  enabled: false
+  hidden_dims: []            # [] => single Dense projection to scalar
+  hidden_activation: "gelu"  # relu, gelu, tanh, identity
+  use_residual: false
+  bias: true
+  normalization_mode: "mean1"  # none, sum1, mean1 (mean1 keeps baseline-like score scale)
+  positive_activation: "softplus"  # softplus, relu, exp, identity
+
 batch_size: 16
 gradient_accumulation_steps: 1
 max_steps: 20000

@@ -1,0 +1,2 @@
+- query_token_weight_head.enabled=false
+- run_name=baseline_no_query_weight_head

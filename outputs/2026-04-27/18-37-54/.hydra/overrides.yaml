@@ -1,0 +1,4 @@
+- query_token_weight_head.enabled=true
+- query_token_weight_head.hidden_dims=[256,64]
+- query_token_weight_head.hidden_activation=gelu
+- run_name=with_QWH_mean1norm

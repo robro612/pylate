@@ -1,0 +1,48 @@
+dataset:
+  type: contrastive
+  hf_path: bclavie/msmarco-10m-triplets
+  hf_name: null
+  hf_split: train
+  tevatron: false
+loss:
+  type: cached_contrastive
+  score_fn: xtr
+  k_train:
+  - 128
+  k_weights: null
+  temperature: 0.05
+  learnable_temperature: true
+  mini_batch_size: 32
+model_name: answerdotai/ModernBERT-base
+query_length: 32
+document_length: 512
+query_prefix: ''
+document_prefix: ''
+query_token_weight_head:
+  enabled: true
+  hidden_dims:
+  - 256
+  - 64
+  hidden_activation: gelu
+  use_residual: false
+  bias: true
+  normalize: true
+  positive_activation: softplus
+batch_size: 64
+gradient_accumulation_steps: 1
+max_steps: 50000
+num_epochs: null
+learning_rate: 3.0e-05
+warmup_steps: 0
+eval_on_start: true
+eval_steps: 500
+save_steps: 1000
+save_total_limit: 1
+logging_steps: 10
+dtype: fp16
+compile: true
+run_name: null
+output_dir: null
+wandb:
+  project: xtr
+  group: contrastive

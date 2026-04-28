@@ -6,10 +6,10 @@ from functools import partial
 from typing import Callable, Iterable, Optional
 
 import torch
-import torch.nn.functional as F
 import tqdm
 from torch import Tensor, nn
 from torch.utils.checkpoint import get_device_states, set_device_states
+import torch.nn.functional as F
 
 from ..models import ColBERT
 from ..scores import ColBERTScores
@@ -55,12 +55,13 @@ def _backward_hook(
     assert loss_obj.cache is not None
     assert loss_obj.random_states is not None
     with torch.enable_grad():
-        for sentence_feature, grad, random_states in zip(
-            sentence_features, loss_obj.cache, loss_obj.random_states
+        for idx, (sentence_feature, grad, random_states) in enumerate(
+            zip(sentence_features, loss_obj.cache, loss_obj.random_states)
         ):
             for (reps_mb, _), grad_mb in zip(
                 loss_obj.embed_minibatch_iter(
                     sentence_feature=sentence_feature,
+                    is_query=idx == 0,
                     with_grad=True,
                     copy_random_state=False,
                     random_states=random_states,
@@ -171,6 +172,7 @@ class CachedContrastive(nn.Module):
         sentence_feature: dict[str, Tensor],
         begin: int,
         end: int,
+        is_query: bool,
         with_grad: bool,
         copy_random_state: bool,
         random_state: RandContext | None = None,
@@ -193,14 +195,31 @@ class CachedContrastive(nn.Module):
                     else None
                 )
                 outputs = self.model(sentence_feature_minibatch)
-                # by default, PyLate ColBERT forward returns a dict with "token_embeddings"
-                embeddings = F.normalize(outputs["token_embeddings"], p=2, dim=-1)
+                model_ref = self.model if hasattr(self.model, "prepare_token_embeddings_for_scoring") else self.model.module
+                if is_query:
+                    embeddings, query_token_weights = (
+                        model_ref.prepare_token_embeddings_for_scoring(
+                            outputs=outputs,
+                            is_query=True,
+                            return_query_token_weights=True,
+                        )
+                    )
+                    if query_token_weights is not None:
+                        embeddings = embeddings * query_token_weights.unsqueeze(-1).to(
+                            dtype=embeddings.dtype
+                        )
+                else:
+                    embeddings = model_ref.prepare_token_embeddings_for_scoring(
+                        outputs=outputs,
+                        is_query=False,
+                    )
 
         return embeddings, random_state
 
     def embed_minibatch_iter(
         self,
         sentence_feature: dict[str, Tensor],
+        is_query: bool,
         with_grad: bool,
         copy_random_state: bool,
         random_states: list[RandContext] | None = None,
@@ -224,6 +243,7 @@ class CachedContrastive(nn.Module):
                 sentence_feature=sentence_feature,
                 begin=b,
                 end=e,
+                is_query=is_query,
                 with_grad=with_grad,
                 copy_random_state=copy_random_state,
                 random_state=None if random_states is None else random_states[i],
@@ -355,11 +375,12 @@ class CachedContrastive(nn.Module):
         masks = extract_skiplist_mask(
             sentence_features=sentence_features, skiplist=skiplist
         )
-        for sentence_feature in sentence_features:
+        for idx, sentence_feature in enumerate(sentence_features):
             reps_mbs = []
             random_state_mbs = []
             for reps_mb, random_state in self.embed_minibatch_iter(
                 sentence_feature=sentence_feature,
+                is_query=idx == 0,
                 with_grad=False,
                 copy_random_state=True,
             ):

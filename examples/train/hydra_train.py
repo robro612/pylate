@@ -123,6 +123,53 @@ def make_run_name(cfg: DictConfig) -> str:
     return "-".join(parts)
 
 
+def _build_query_token_weight_head(model: models.ColBERT, cfg: DictConfig):
+    if not cfg.enabled:
+        return None
+
+    activation_map = {
+        "relu": torch.nn.ReLU,
+        "gelu": torch.nn.GELU,
+        "tanh": torch.nn.Tanh,
+        "identity": torch.nn.Identity,
+    }
+    if cfg.hidden_activation not in activation_map:
+        raise ValueError(
+            f"Unsupported hidden_activation '{cfg.hidden_activation}'. "
+            f"Use one of {sorted(activation_map.keys())}."
+        )
+
+    output_dim = model[-1].out_features
+    hidden_dims = [int(dim) for dim in cfg.hidden_dims]
+    if any(dim <= 0 for dim in hidden_dims):
+        raise ValueError("All query_token_weight_head.hidden_dims must be > 0.")
+
+    layer_dims = [output_dim, *hidden_dims, 1]
+    layers = []
+    for i in range(len(layer_dims) - 1):
+        is_last = i == len(layer_dims) - 2
+        activation = (
+            torch.nn.Identity()
+            if is_last
+            else activation_map[cfg.hidden_activation]()
+        )
+        layers.append(
+            models.Dense(
+                in_features=layer_dims[i],
+                out_features=layer_dims[i + 1],
+                bias=cfg.bias,
+                activation_function=activation,
+                use_residual=bool(cfg.use_residual) and not is_last,
+            )
+        )
+
+    return models.QueryTokenWeightHead(
+        layers=layers,
+        normalization_mode=cfg.normalization_mode,
+        positive_activation=cfg.positive_activation,
+    )
+
+
 @hydra.main(config_path="../../conf/train", config_name="contrastive", version_base=None)
 def main(cfg: DictConfig):
     loss_cfg = cfg.loss
@@ -152,6 +199,11 @@ def main(cfg: DictConfig):
         query_prefix=cfg.query_prefix,
         document_prefix=cfg.document_prefix,
     )
+    query_weight_head = _build_query_token_weight_head(
+        model=model, cfg=cfg.query_token_weight_head
+    )
+    if query_weight_head is not None:
+        model.append(query_weight_head)
 
     train_dataset = load_kd_dataset(dataset_cfg) if is_kd else load_contrastive_dataset(dataset_cfg)
 
