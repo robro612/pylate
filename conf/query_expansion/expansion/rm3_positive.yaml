@@ -1,0 +1,19 @@
+mode: rm3_positive
+
+# Fields in each query row containing feedback passages.
+# Using both positives and negatives by default.
+feedback_fields:
+  - positive_passages
+  - negative_passages
+
+# Text field inside each passage object.
+feedback_text_field: text
+
+# RM3-ish hyperparameters.
+feedback_docs: 4
+feedback_terms: 8
+orig_query_weight: 0.7
+
+# Lexical preprocessing.
+min_token_len: 4
+remove_stopwords: true

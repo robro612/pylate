@@ -1,0 +1,7 @@
+mode: hyde
+
+# How to use the generated hypothetical document.
+# append: "<plain_query><hyde_separator><generated_doc>"
+# replace: "<generated_doc>"
+hyde_behavior: append
+hyde_separator: "\n\n"

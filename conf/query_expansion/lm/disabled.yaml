@@ -1,0 +1,10 @@
+enabled: false
+
+# DSPy LM config (used when enabled=true)
+model: "openai/gpt-4o-mini"
+temperature: 0.2
+max_tokens: 220
+
+# Optional (for non-default endpoints/providers)
+api_base: null
+api_key_env: "OPENAI_API_KEY"

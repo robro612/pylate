@@ -1,0 +1,53 @@
+# Encoder model used to (a) match the shard set produced by dynamic_encode_hf_corpus
+# and (b) encode queries. Cache key is keyed off the model + corpus slug.
+model: "lightonai/GTE-ModernColBERT-v1"
+device: "cuda"
+query_dtype: "fp32"  # fp32 | bf16 | fp16
+query_batch_size: 32
+query_length: 512
+max_queries: null
+
+# Encoded-corpus shard directory (output of dynamic_encode_hf_corpus.py).
+shard_dir: "embeddings_cache/Tevatron_webshaper-fineweb-1m-corpus/lightonai_GTE-ModernColBERT-v1/nopool_fp16/docs"
+corpus_slug: "Tevatron_webshaper-fineweb-1m-corpus"
+
+# One or more JSONLs produced by parse_agentir_queries.py — fields {id, query}.
+# All files share the cached centroids/postings; each file produces a separate
+# output JSONL under outputs/centroid_analysis/<key>/<expansion_slug>.jsonl.
+query_jsonls:
+  - "outputs/agentir_queries_Tevatron_AgentIR-data_train_plain.jsonl"
+
+# Sweep these nprobe values in a single pass.
+nprobes: [1, 2, 4, 8, 16, 32]
+
+# Centroid build params (PLAID-style defaults).
+kmeans:
+  niters: 4
+  max_points_per_centroid: 256
+  seed: 42
+  # Override the auto-K (PLAID formula). null → use formula.
+  num_partitions: null
+  # Memory / batching for streaming token assignment.
+  assign_chunk_tokens: 65536
+
+# Where to cache centroids + postings + analysis output.
+cache_root: "outputs/centroid_analysis_cache"
+output_root: "outputs/centroid_analysis"
+rebuild_cache: false
+
+
+hydra:
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stderr
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false
