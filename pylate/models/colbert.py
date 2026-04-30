@@ -25,6 +25,7 @@ from ..hf_hub.model_card import PylateModelCardData
 from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from .Dense import Dense
+from .QueryTokenWeightHead import QueryTokenWeightHead
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,11 @@ class ColBERT(SentenceTransformer):
         tokenizer_kwargs: dict | None = None,
         config_kwargs: dict | None = None,
         model_card_data: PylateModelCardData | None = None,
+        query_token_weight_head: Dense | nn.Module | Iterable[Dense | nn.Module] | None = None,
+        query_token_weight_normalization_mode: Literal["none", "sum1", "mean1"] = "sum1",
+        query_token_weight_activation: Literal[
+            "softplus", "relu", "exp", "identity"
+        ] = "softplus",
     ) -> None:
         self.query_prefix = query_prefix
         self.document_prefix = document_prefix
@@ -335,7 +341,9 @@ class ColBERT(SentenceTransformer):
                 logger.info("Created a PyLate model from base encoder.")
         # Convert ST dense layers to PyLate dense layers
         for i in range(1, len(self)):
-            if not isinstance(self[i], Dense):
+            if isinstance(self[i], Dense):
+                continue
+            if isinstance(self[i], DenseSentenceTransformer):
                 self[i] = Dense.from_sentence_transformers(dense=self[i])
         # If the user defined an output dimension and the last linear dimension is not the same, add a dense layer
         if embedding_size is not None and self[-1].out_features != embedding_size:
@@ -347,6 +355,15 @@ class ColBERT(SentenceTransformer):
                     in_features=self[-1].out_features,
                     out_features=embedding_size,
                     bias=bias,
+                )
+            )
+
+        if query_token_weight_head is not None:
+            self.append(
+                self._build_query_token_weight_head(
+                    query_token_weight_head=query_token_weight_head,
+                    query_token_weight_normalization_mode=query_token_weight_normalization_mode,
+                    query_token_weight_activation=query_token_weight_activation,
                 )
             )
 
@@ -478,6 +495,53 @@ class ColBERT(SentenceTransformer):
         return len(self._modules)
 
     @staticmethod
+    def _build_query_token_weight_head(
+        query_token_weight_head: Dense | nn.Module | Iterable[Dense | nn.Module],
+        query_token_weight_normalization_mode: Literal["none", "sum1", "mean1"],
+        query_token_weight_activation: Literal["softplus", "relu", "exp", "identity"],
+    ) -> QueryTokenWeightHead:
+        if isinstance(query_token_weight_head, (Dense, nn.Module)):
+            layers = [query_token_weight_head]
+        else:
+            layers = list(query_token_weight_head)
+
+        if not layers:
+            raise ValueError(
+                "query_token_weight_head must contain at least one layer if provided."
+            )
+
+        return QueryTokenWeightHead(
+            layers=layers,
+            normalization_mode=query_token_weight_normalization_mode,
+            positive_activation=query_token_weight_activation,
+        )
+
+    def _get_query_token_weight_head(self) -> QueryTokenWeightHead | None:
+        for module in self._modules.values():
+            if isinstance(module, QueryTokenWeightHead):
+                return module
+        return None
+
+    def prepare_token_embeddings_for_scoring(
+        self,
+        outputs: dict[str, torch.Tensor],
+        is_query: bool,
+        normalize_embeddings: bool = True,
+        return_query_token_weights: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        token_embeddings = outputs["token_embeddings"]
+        if normalize_embeddings:
+            token_embeddings = torch.nn.functional.normalize(
+                input=token_embeddings, p=2, dim=-1
+            )
+        query_token_weights = (
+            outputs.get("query_token_weights", None) if is_query else None
+        )
+        if return_query_token_weights:
+            return token_embeddings, query_token_weights
+        return token_embeddings
+
+    @staticmethod
     def insert_prefix_token(input_ids: torch.Tensor, prefix_id: int) -> torch.Tensor:
         """Inserts a prefix token at the beginning of each sequence in the input tensor."""
         prefix_tensor = torch.full(
@@ -504,10 +568,19 @@ class ColBERT(SentenceTransformer):
         padding: bool = False,
         device: str = None,
         normalize_embeddings: bool = True,
+        return_query_token_weights: bool = False,
         is_query: bool = True,
         pool_factor: int = 1,
         protected_tokens: int = 1,
-    ) -> list[torch.Tensor] | ndarray | torch.Tensor:
+    ) -> (
+        list[torch.Tensor]
+        | ndarray
+        | torch.Tensor
+        | tuple[
+            list[torch.Tensor] | ndarray | torch.Tensor,
+            list[torch.Tensor] | ndarray | torch.Tensor,
+        ]
+    ):
         """
         Computes sentence embeddings.
 
@@ -546,6 +619,9 @@ class ColBERT(SentenceTransformer):
         normalize_embeddings
             Whether to normalize returned vectors to have length 1. In that case, the faster dot-product (util.dot_score)
             instead of cosine similarity can be used. Defaults to False.
+        return_query_token_weights
+            Whether to return query token weights alongside query embeddings.
+            Only valid when ``is_query=True``.
         is_query
             Whether the input sentences are queries. If True, the query prefix is added to the input sentences and the
             sequence is padded; otherwise, the document prefix is added and the sequence is not padded. Defaults to True.
@@ -574,6 +650,7 @@ class ColBERT(SentenceTransformer):
                         padding=padding,
                         device=device,
                         normalize_embeddings=normalize_embeddings,
+                        return_query_token_weights=return_query_token_weights,
                         is_query=is_query,
                         pool_factor=pool_factor,
                         protected_tokens=protected_tokens,
@@ -588,6 +665,11 @@ class ColBERT(SentenceTransformer):
                     embeddings.append(batch_embeddings)
 
                 return embeddings
+
+        if return_query_token_weights and not is_query:
+            raise ValueError(
+                "return_query_token_weights=True is only supported when is_query=True."
+            )
 
         if self.device.type == "hpu" and not self.is_hpu_graph_enabled:
             import habana_frameworks.torch as ht
@@ -652,6 +734,7 @@ class ColBERT(SentenceTransformer):
         self.to(device)
 
         all_embeddings = []
+        all_query_weights = [] if return_query_token_weights else None
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
 
@@ -719,6 +802,18 @@ class ColBERT(SentenceTransformer):
                 if self.device.type == "hpu":
                     out_features = copy.deepcopy(out_features)
 
+                prepared = self.prepare_token_embeddings_for_scoring(
+                    outputs=out_features,
+                    is_query=is_query,
+                    normalize_embeddings=normalize_embeddings,
+                    return_query_token_weights=return_query_token_weights and is_query,
+                )
+                if return_query_token_weights and is_query:
+                    token_embeddings, query_token_weights = prepared
+                else:
+                    token_embeddings = prepared
+                    query_token_weights = None
+
                 if not is_query:
                     # Compute the mask for the skiplist (punctuation symbols)
                     skiplist_mask = self.skiplist_mask(
@@ -738,18 +833,14 @@ class ColBERT(SentenceTransformer):
                         masks = out_features["attention_mask"].bool()
 
                 embeddings = []
-                for (
-                    token_embedding,
-                    mask,
-                ) in zip(out_features["token_embeddings"], masks):
-                    token_embedding = (
-                        torch.nn.functional.normalize(
-                            input=token_embedding[mask], p=2, dim=1
-                        )
-                        if normalize_embeddings
-                        else token_embedding[mask]
-                    )
+                query_weights = [] if query_token_weights is not None else None
+                for i, (token_embedding, mask) in enumerate(
+                    zip(token_embeddings, masks)
+                ):
+                    token_embedding = token_embedding[mask]
                     embeddings.append(token_embedding)
+                    if query_weights is not None:
+                        query_weights.append(query_token_weights[i][mask])
 
                 # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
                 if pool_factor > 1 and not is_query:
@@ -762,8 +853,12 @@ class ColBERT(SentenceTransformer):
                 # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
                 if convert_to_numpy:
                     embeddings = [embedding.cpu() for embedding in embeddings]
+                    if query_weights is not None:
+                        query_weights = [weight.cpu() for weight in query_weights]
 
                 all_embeddings.extend(embeddings)
+                if all_query_weights is not None and query_weights is not None:
+                    all_query_weights.extend(query_weights)
 
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
@@ -775,8 +870,19 @@ class ColBERT(SentenceTransformer):
             all_embeddings = torch.split(
                 tensor=all_embeddings, split_size_or_sections=1, dim=0
             )
+            if all_query_weights is not None:
+                all_query_weights = torch.nn.utils.rnn.pad_sequence(
+                    sequences=all_query_weights, batch_first=True, padding_value=0
+                )
+                all_query_weights = torch.split(
+                    tensor=all_query_weights, split_size_or_sections=1, dim=0
+                )
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+        if all_query_weights is not None:
+            all_query_weights = [
+                all_query_weights[idx] for idx in np.argsort(length_sorted_idx)
+            ]
 
         if precision and precision != "float32":
             all_embeddings = quantize_embeddings(
@@ -799,6 +905,13 @@ class ColBERT(SentenceTransformer):
                 embedding.float().numpy() if bloat else embedding.numpy()
                 for embedding in all_embeddings
             ]
+            if all_query_weights is not None:
+                all_query_weights = [weight.numpy() for weight in all_query_weights]
+
+        if all_query_weights is not None:
+            if input_was_string:
+                return all_embeddings[0], all_query_weights[0]
+            return all_embeddings, all_query_weights
 
         return all_embeddings[0] if input_was_string else all_embeddings
 
@@ -1342,6 +1455,7 @@ class ColBERT(SentenceTransformer):
             for module in modules.values()
             if isinstance(module, Transformer)
             or isinstance(module, DenseSentenceTransformer)
+            or isinstance(module, QueryTokenWeightHead)
         ], module_kwargs
 
     def _get_model_type(
