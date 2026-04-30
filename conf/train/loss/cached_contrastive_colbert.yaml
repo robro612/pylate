@@ -1,0 +1,7 @@
+type: cached_contrastive
+score_fn: colbert
+k_train: null
+k_weights: null
+temperature: 0.2
+learnable_temperature: true
+mini_batch_size: 32

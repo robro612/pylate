@@ -1,0 +1,4 @@
+type: scann
+retrieval:
+  - xtr
+  - colbert

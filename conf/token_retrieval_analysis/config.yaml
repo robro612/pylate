@@ -1,0 +1,70 @@
+defaults:
+  - override hydra/job_logging: custom
+  - _self_
+
+dataset: "beir/nfcorpus/test"
+query_length: 32
+
+models:
+  - name: mb_colbert_kd
+    path: "output/modernbert_colbert_kd/final"
+    label: "ColBERT-KD"
+    index_path: "indexes/bench_output_modernbert_colbert_kd_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_kd_k256
+    path: "output/modernbert_xtr_kd_k256/final"
+    label: "XTR-KD k=256"
+    index_path: "indexes/bench_output_modernbert_xtr_kd_k256_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_kd_k512
+    path: "output/modernbert_xtr_kd_k512/final"
+    label: "XTR-KD k=512"
+    index_path: "indexes/bench_output_modernbert_xtr_kd_k512_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_kd_multik
+    path: "output/modernbert_xtr_kd_multik128-256-512/final"
+    label: "XTR-KD multi-k"
+    index_path: "indexes/bench_output_modernbert_xtr_kd_multik128-256-512_final_beir_nfcorpus_test_scann"
+
+  - name: mb_colbert_contrastive
+    path: "output/modernbert_colbert_contrastive/final"
+    label: "ColBERT-C"
+    index_path: "indexes/bench_output_modernbert_colbert_contrastive_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_contrastive_k128
+    path: "output/modernbert_xtr_contrastive_k128/final"
+    label: "XTR-C k=128"
+    index_path: "indexes/bench_output_modernbert_xtr_contrastive_k128_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_contrastive_k256
+    path: "output/modernbert_xtr_contrastive_k256/final"
+    label: "XTR-C k=256"
+    index_path: "indexes/bench_output_modernbert_xtr_contrastive_k256_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_contrastive_k512
+    path: "output/modernbert_xtr_contrastive_k512/final"
+    label: "XTR-C k=512"
+    index_path: "indexes/bench_output_modernbert_xtr_contrastive_k512_final_beir_nfcorpus_test_scann"
+
+  - name: mb_xtr_contrastive_multik
+    path: "output/modernbert_xtr_contrastive_multik128-256-512/final"
+    label: "XTR-C multi-k"
+    index_path: "indexes/bench_output_modernbert_xtr_contrastive_multik128-256-512_final_beir_nfcorpus_test_scann"
+
+k_token: 1000
+batch_size: 32
+
+seed: 42
+device: null
+
+output:
+  dir: "outputs/token_retrieval_analysis"
+  dpi: 300
+
+plot:
+  xscale: linear
+  yscale: linear
+  xlim: null
+  ylim: null
+  # Which models to include in plots (by name). null = all.
+  include: null

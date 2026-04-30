@@ -1,0 +1,6 @@
+type: contrastive
+score_fn: xtr
+k_train: [128]
+k_weights: null         # list of floats (must match k_train length), or null for uniform
+temperature: 0.05
+learnable_temperature: true

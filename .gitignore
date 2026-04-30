@@ -148,6 +148,9 @@ wandb/
 output_models/
 output/
 
+# hydra run dumps
+outputs/
+
 # datasets
 evaluation_datasets/
 ./datasets/

@@ -1,0 +1,14 @@
+defaults:
+  - expansion: plain
+  - lm: disabled
+  - override hydra/job_logging: custom
+  - _self_
+
+dataset: "Tevatron/AgentIR-data"
+split: "train"
+text_column: "query"
+id_column: null
+max_rows: null
+output_dir: "outputs"
+output_file: null
+print_samples: 3
