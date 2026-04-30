@@ -150,6 +150,7 @@ output/
 
 # hydra run dumps
 outputs/
+embeddings_cache
 
 # datasets
 evaluation_datasets/
