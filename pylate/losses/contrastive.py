@@ -155,12 +155,34 @@ class Contrastive(nn.Module):
             The labels for the contrastive loss. Not used in this implementation, but kept for compatibility with Trainer.
 
         """
-        embeddings = [
-            torch.nn.functional.normalize(
-                self.model(sentence_feature)["token_embeddings"], p=2, dim=-1
-            )
-            for sentence_feature in sentence_features
-        ]
+        model_ref = (
+            self.model
+            if hasattr(self.model, "prepare_token_embeddings_for_scoring")
+            else self.model.module
+        )
+        embeddings = []
+        for idx, sentence_feature in enumerate(sentence_features):
+            outputs = self.model(sentence_feature)
+            if idx == 0:
+                query_embeddings, query_token_weights = (
+                    model_ref.prepare_token_embeddings_for_scoring(
+                        outputs=outputs,
+                        is_query=True,
+                        return_query_token_weights=True,
+                    )
+                )
+                if query_token_weights is not None:
+                    query_embeddings = query_embeddings * query_token_weights.unsqueeze(
+                        -1
+                    ).to(dtype=query_embeddings.dtype)
+                embeddings.append(query_embeddings)
+            else:
+                embeddings.append(
+                    model_ref.prepare_token_embeddings_for_scoring(
+                        outputs=outputs,
+                        is_query=False,
+                    )
+                )
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (
             self.model.skiplist
