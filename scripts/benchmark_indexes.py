@@ -530,7 +530,7 @@ def build_index(
 
     random_rotation = index_cfg.get("random_rotation", False) if index_cfg else False
     use_triton = index_cfg.get("use_triton", None) if index_cfg else None
-    num_shards = index_cfg.get("num_shards", None) if index_cfg else None
+    # num_shards = index_cfg.get("num_shards", None) if index_cfg else None  # not supported in mainline xtr-warp-rs
     verbose = index_cfg.get("verbose", False) if index_cfg else False
     plaid_search_batch_size = index_cfg.get("search_batch_size", None) if index_cfg else None
 
@@ -544,7 +544,7 @@ def build_index(
             n_samples_kmeans=n_samples_kmeans,
             random_rotation=random_rotation,
             use_triton=use_triton,
-            num_shards=num_shards,
+            # num_shards=num_shards,  # not supported in mainline xtr-warp-rs
             verbose=verbose,
         )
         build_start = time.perf_counter()
@@ -841,7 +841,7 @@ def load_existing_index(
     nbits = index_cfg.get("nbits", 4) if index_cfg else 4
 
     random_rotation = index_cfg.get("random_rotation", False) if index_cfg else False
-    num_shards = index_cfg.get("num_shards", None) if index_cfg else None
+    # num_shards = index_cfg.get("num_shards", None) if index_cfg else None  # not supported in mainline xtr-warp-rs
     verbose = index_cfg.get("verbose", False) if index_cfg else False
     plaid_search_batch_size = index_cfg.get("search_batch_size", None) if index_cfg else None
 
@@ -853,7 +853,7 @@ def load_existing_index(
             device=device,
             nbits=nbits,
             random_rotation=random_rotation,
-            num_shards=num_shards,
+            # num_shards=num_shards,  # not supported in mainline xtr-warp-rs
             verbose=verbose,
         )
     elif index_type in ("plaid", "fast_plaid"):

@@ -448,7 +448,7 @@ class WARP(Base):
                 n_samples_kmeans=self.n_samples_kmeans,
                 seed=self.seed,
                 use_triton_kmeans=self.use_triton,
-                num_shards=self.num_shards,
+                # num_shards=self.num_shards,  # not supported in mainline xtr-warp-rs
             )
         finally:
             if self.verbose:
