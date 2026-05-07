@@ -143,9 +143,15 @@ from _embeddings_cache import (  # noqa: E402  (local module)
 def _load_dataset_embeddings(
     *, dataset: str, model: str, root: Path, kind: str, dtype: str
 ) -> list[np.ndarray]:
-    """Load per-doc tensors for one cache cell. Raises if not encoded yet."""
+    """Load per-doc tensors for one cache cell. Raises if not encoded yet.
+
+    Embeddings are kept at stored dtype (float16 by default). The Rust layer handles
+    float16 inputs natively: create.rs avoids the half→half copy, and maxivf_cagra.rs
+    converts to float32 per 131K-token batch rather than up-casting the whole corpus.
+    This halves peak host RAM vs. as_float32=True, which matters for NQ-scale corpora.
+    """
     _ids, arrs = load_cache(
-        root=root, dataset=dataset, model=model, dtype=dtype, kind=kind, as_float32=True
+        root=root, dataset=dataset, model=model, dtype=dtype, kind=kind, as_float32=False
     )
     return arrs
 
