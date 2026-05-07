@@ -71,6 +71,13 @@ class FastPlaid(Base):
         index_folder: str = "indexes",
         index_name: str = "fast_plaid",
         override: bool = False,
+        index_anchor_backend: str = "dense",
+        index_anchor_params: dict | None = None,
+        index_centroid_index_params: dict | None = None,
+        anchor_method: str | None = None,
+        anchor_params: dict | None = None,
+        centroid_index: str | None = None,
+        centroid_index_params: dict | None = None,
         nbits: int = 4,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
@@ -84,6 +91,7 @@ class FastPlaid(Base):
     ) -> None:
         self.index_folder = index_folder
         self.index_name = index_name
+        self.index_anchor_backend = index_anchor_backend
         self.nbits = nbits
         self.kmeans_niters = kmeans_niters
         self.max_points_per_centroid = max_points_per_centroid
@@ -116,8 +124,48 @@ class FastPlaid(Base):
         )
 
         # Initialize or load the fast-plaid index
+        #
+        # Prefer explicit knobs (anchor_method + centroid_index). Fall back to the
+        # older combined `index_anchor_backend` for backward compatibility.
+        if anchor_method is None and centroid_index is None:
+            backend = (index_anchor_backend or "dense").lower()
+            if backend == "dense":
+                anchor_method = "kmeans"
+                centroid_index = "dense"
+            elif backend == "cagra":
+                anchor_method = "maxIVF_cagra"
+                centroid_index = "cagra"
+                anchor_params = index_anchor_params
+                centroid_index_params = index_centroid_index_params
+            elif backend in ("kmeans_cagra", "dense_cagra"):
+                anchor_method = "kmeans"
+                centroid_index = "cagra"
+                centroid_index_params = index_centroid_index_params
+            else:
+                raise ValueError(
+                    f"Unknown index_anchor_backend '{index_anchor_backend}'; expected 'dense', 'cagra', or 'kmeans_cagra'"
+                )
+
+        resolved_anchor_method = (anchor_method or "kmeans").lower()
+        resolved_centroid_index = (centroid_index or "dense").lower()
+        resolved_anchor_params = anchor_params or index_anchor_params or {}
+        resolved_centroid_index_params = (
+            centroid_index_params or index_centroid_index_params or {}
+        )
+
+        kwargs_fp: dict = {}
+        if resolved_anchor_method != "kmeans":
+            # fast-plaid expects an explicit anchor_method only when not default.
+            kwargs_fp["anchor_method"] = resolved_anchor_method
+            kwargs_fp["anchor_params"] = resolved_anchor_params
+        if resolved_centroid_index != "dense":
+            kwargs_fp["centroid_index"] = resolved_centroid_index
+            kwargs_fp["centroid_index_params"] = resolved_centroid_index_params
+
         self.fast_plaid = search.FastPlaid(
-            index=self.fast_plaid_index_path, device=device
+            index=self.fast_plaid_index_path,
+            device=device,
+            **kwargs_fp,
         )
         # Check if index already exists
         self.is_indexed = os.path.exists(self.documents_ids_to_plaid_ids_path)
