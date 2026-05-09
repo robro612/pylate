@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -46,6 +48,23 @@ def convert_embeddings_to_torch(
             return [embeddings]
 
     return embeddings
+
+
+def count_disk_embeddings(embeddings_path: str | Path) -> int:
+    """Count documents in an embeddings folder by reading doclens sidecar files.
+
+    Mirrors the ``_doclens_path_for`` convention used by xtr-warp-rs:
+    ``foo.npy`` → sidecar is ``foo.doclens.npy`` (via ``Path.with_suffix``).
+    """
+    p = Path(embeddings_path)
+    if p.is_file():
+        return int(len(np.load(p.with_suffix(".doclens.npy"))))
+    sidecars = sorted(p.glob("*.doclens.npy"))
+    if not sidecars:
+        raise FileNotFoundError(
+            f"No .doclens.npy sidecar files found in {embeddings_path}."
+        )
+    return sum(int(len(np.load(s))) for s in sidecars)
 
 
 def np_dtype_for(

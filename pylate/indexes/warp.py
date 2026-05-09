@@ -4,13 +4,14 @@ import logging
 import os
 import pickle
 import shutil
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from ..rank import RerankResult
 from .base import Base
-from .utils import convert_embeddings_to_torch
+from .utils import convert_embeddings_to_torch, count_disk_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -77,15 +78,26 @@ class WARP(Base):
         If set to True, a progress bar is displayed during indexing and search
         operations.
     device
-        Device for computation (e.g. "cpu", "cuda", "cuda:0"). If None,
-        defaults to "cuda" when available, else "cpu".
+        Device(s) for computation.  Accepts:
+
+        - ``str`` — single device, e.g. ``"cpu"``, ``"cuda"``, ``"cuda:0"``
+          (default: ``"cuda"`` when available, else ``"cpu"``).
+        - ``list[str]`` — shard the loaded index across these devices
+          (e.g. ``["cuda:0", "cuda:1", "cuda:2"]``).  WARP auto-computes
+          per-device ratios that fill accelerator VRAM first.
+        - ``dict[str, float]`` — explicit per-device ratios
+          (e.g. ``{"cuda:0": 0.6, "cpu": 0.4}``).
+
+        When a list or dict is given, the first listed device is used for
+        index *creation* and incremental *add* operations; all devices are
+        used for sharded *search*.
     dtype
         Precision used for centroids and bucket weights when the index is
         loaded for search (e.g. ``torch.float32``, ``torch.float16``). Affects
         memory footprint and search speed.
     mmap
         Memory-map large index tensors (codes and residuals) to reduce memory
-        usage. Only supported on CPU.
+        usage. Only supported on CPU (or the CPU portion of a sharded index).
 
     """
 
@@ -112,7 +124,7 @@ class WARP(Base):
         batch_size: int = 8192,
         num_threads: int | None = 1,
         show_progress: bool = True,
-        device: str | None = None,
+        device: str | list[str] | dict[str, float] | None = None,
         dtype: torch.dtype = torch.float32,
         mmap: bool = True,
     ) -> None:
@@ -150,11 +162,23 @@ class WARP(Base):
         self.show_progress = show_progress
         self.dtype = dtype
         self.mmap = mmap
-        self.device = (
-            device
-            if device is not None
-            else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+
+        # Resolve device configuration.
+        # _device_config: full spec passed to warp.load() (str | list | dict).
+        # device:         primary single-device string used for create/add ops.
+        default_device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device is None:
+            self._device_config: str | list[str] | dict[str, float] = default_device
+            self.device: str = default_device
+        elif isinstance(device, str):
+            self._device_config = device
+            self.device = device
+        elif isinstance(device, list):
+            self._device_config = device
+            self.device = device[0]
+        else:  # dict
+            self._device_config = device
+            self.device = next(iter(device))
 
         # Create the index directory structure
         self.index_path = os.path.join(index_folder, index_name)
@@ -184,7 +208,7 @@ class WARP(Base):
     def _ensure_loaded(self) -> None:
         """Load the WARP index into memory if not already loaded."""
         if not self._loaded:
-            self.warp.load(device=self.device, dtype=self.dtype, mmap=self.mmap)
+            self.warp.load(device=self._device_config, dtype=self.dtype, mmap=self.mmap)
             self._loaded = True
 
     def _load_documents_ids_to_warp_ids(self) -> dict:
@@ -215,7 +239,7 @@ class WARP(Base):
     def add_documents(
         self,
         documents_ids: str | list[str],
-        documents_embeddings: list[np.ndarray | torch.Tensor],
+        documents_embeddings: list[np.ndarray | torch.Tensor] | str | Path,
         **kwargs,
     ) -> "WARP":
         """Add documents to the index.
@@ -229,7 +253,16 @@ class WARP(Base):
         documents_ids
             Document IDs to associate with the embeddings.
         documents_embeddings
-            The document embeddings to index.
+            The document embeddings to index.  Can be:
+
+            - A list of per-document tensors / arrays (in-memory, existing
+              behavior).
+            - A ``str`` or ``Path`` pointing to a folder of ``*.npy`` /
+              ``*.doclens.npy`` shard pairs.  In this case embeddings are
+              read directly from disk by the WARP backend without loading them
+              into Python memory, which is useful for large corpora.  The
+              folder must contain at least one ``*.npy`` file together with a
+              matching ``*.doclens.npy`` sidecar for each shard.
         **kwargs
             Accepted for compatibility with the base ``Index`` interface
             (e.g. ``batch_size``). Ignored by WARP, which manages batching
@@ -238,14 +271,26 @@ class WARP(Base):
         if isinstance(documents_ids, str):
             documents_ids = [documents_ids]
 
-        documents_embeddings_torch = convert_embeddings_to_torch(documents_embeddings)
+        from_disk = isinstance(documents_embeddings, (str, Path))
+
+        if from_disk:
+            embeddings_source = documents_embeddings
+            n_docs = count_disk_embeddings(embeddings_source)
+            if len(documents_ids) != n_docs:
+                raise ValueError(
+                    f"documents_ids has {len(documents_ids)} entries but the "
+                    f"embeddings folder contains {n_docs} documents."
+                )
+        else:
+            embeddings_source = convert_embeddings_to_torch(documents_embeddings)
+            n_docs = len(embeddings_source)
 
         documents_ids_to_warp_ids = self._load_documents_ids_to_warp_ids()
         warp_ids_to_documents_ids = self._load_warp_ids_to_documents_ids()
 
         if not self.is_indexed:
             self.warp.create(
-                embeddings_source=documents_embeddings_torch,
+                embeddings_source=embeddings_source,
                 device=self.device,
                 kmeans_niters=self.kmeans_niters,
                 max_points_per_centroid=self.max_points_per_centroid,
@@ -255,11 +300,11 @@ class WARP(Base):
                 use_triton_kmeans=self.use_triton,
                 show_progress=self.show_progress,
             )
-            warp_ids = list(range(len(documents_embeddings_torch)))
+            warp_ids = list(range(n_docs))
             self.is_indexed = True
         else:
             warp_ids = self.warp.add(
-                embeddings_source=documents_embeddings_torch,
+                embeddings_source=embeddings_source,
                 reload=True,
                 min_outliers=self.min_outliers,
                 max_growth_rate=self.max_growth_rate,

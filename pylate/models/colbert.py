@@ -1081,7 +1081,7 @@ class ColBERT(SentenceTransformer):
         results_list = sorted(
             [output_queue.get() for _ in range(last_chunk_id)], key=lambda x: x[0]
         )
-        return [np.concatenate(result[1]) for result in results_list]
+        return [emb for result in results_list for emb in result[1]]
 
     def tokenize(
         self,
