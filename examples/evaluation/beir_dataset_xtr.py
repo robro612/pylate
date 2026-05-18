@@ -5,6 +5,9 @@ All three are end-to-end indexes, so the `retrieve.XTR` wrapper short-circuits
 to the index's own scoring rather than running a separate XTR scoring pass on
 top of token-level hits.
 
+Document embeddings are cached to disk under --cache_dir so subsequent runs
+skip encoding entirely. Pass --no_cache to force re-encoding.
+
 For the ColBERT + PLAID pipeline with a standard ColBERT model, see
 `beir_dataset.py`.
 """
@@ -14,6 +17,7 @@ from __future__ import annotations
 import argparse
 
 from pylate import evaluation, indexes, models, retrieve
+from pylate.utils import cache_exists, encode_and_cache, get_cache_dir, load_cached
 
 if __name__ == "__main__":
     query_len = {
@@ -61,6 +65,23 @@ if __name__ == "__main__":
         choices=["plaid", "warp", "tachiom"],
         help="Index backend to use (default: warp)",
     )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default="emb_cache",
+        help="Root directory for embedding shards (default: emb_cache)",
+    )
+    parser.add_argument(
+        "--no_cache",
+        action="store_true",
+        help="Re-encode documents even if a cache exists",
+    )
+    parser.add_argument(
+        "--shard_size",
+        type=int,
+        default=500_000,
+        help="Max documents per embedding shard (default: 500000)",
+    )
     args = parser.parse_args()
 
     dataset_name = args.dataset_name
@@ -72,10 +93,9 @@ if __name__ == "__main__":
     )
 
     if "cqadupstack" in dataset_name:
-        # Download dataset if not already downloaded
         from beir import util
 
-        data_path = util.download_and_unzip(
+        util.download_and_unzip(
             url="https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/cqadupstack.zip",
             out_dir="./evaluation_datasets/",
         )
@@ -100,25 +120,48 @@ if __name__ == "__main__":
 
     retriever = retrieve.XTR(index=index)
 
-    encode_kwargs = dict(
-        sentences=[document["text"] for document in documents],
-        batch_size=2000,
-        is_query=False,
-        show_progress_bar=True,
-    )
-    if args.index == "tachiom":
-        documents_embeddings, documents_token_ids = model.encode(
-            **encode_kwargs, return_token_ids=True
-        )
+    # ── Document embeddings (cached) ─────────────────────────────────────────
+    want_token_ids = args.index == "tachiom"
+    doc_cache_dir = get_cache_dir(args.cache_dir, dataset_name, model_name)
+
+    if not args.no_cache and cache_exists(doc_cache_dir):
+        print(f"Loading document embeddings from cache: {doc_cache_dir}")
+        cached_doc_ids, documents_embeddings, documents_token_ids = load_cached(doc_cache_dir)
+        # If tachiom needs token IDs but the cache predates token-ID support, re-encode.
+        if want_token_ids and documents_token_ids is None:
+            print("Cache has no token IDs; re-encoding with return_token_ids=True")
+            documents_embeddings, documents_token_ids = encode_and_cache(
+                model=model,
+                sentences=[d["text"] for d in documents],
+                doc_ids=[d["id"] for d in documents],
+                cache_dir=doc_cache_dir,
+                shard_size=args.shard_size,
+                return_token_ids=True,
+                batch_size=2000,
+                is_query=False,
+                show_progress_bar=True,
+            )
     else:
-        documents_embeddings = model.encode(**encode_kwargs)
-        documents_token_ids = None
+        print(f"Encoding documents and writing cache to: {doc_cache_dir}")
+        documents_embeddings, documents_token_ids = encode_and_cache(
+            model=model,
+            sentences=[d["text"] for d in documents],
+            doc_ids=[d["id"] for d in documents],
+            cache_dir=doc_cache_dir,
+            shard_size=args.shard_size,
+            return_token_ids=want_token_ids,
+            batch_size=2000,
+            is_query=False,
+            show_progress_bar=True,
+        )
 
     index.add_documents(
         documents_ids=[document["id"] for document in documents],
         documents_embeddings=documents_embeddings,
         **({"documents_token_ids": documents_token_ids} if documents_token_ids is not None else {}),
     )
+
+    # ── Query embeddings (not cached — queries are fast) ──────────────────────
     queries_embeddings = model.encode(
         sentences=list(queries.values()),
         is_query=True,
@@ -132,7 +175,6 @@ if __name__ == "__main__":
     for (query_id, query), query_scores in zip(queries.items(), scores):
         for score in query_scores:
             if score["id"] == query_id:
-                # Remove the query_id from the score
                 query_scores.remove(score)
 
     evaluation_scores = evaluation.evaluate(
