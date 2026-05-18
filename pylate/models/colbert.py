@@ -814,7 +814,10 @@ class ColBERT(SentenceTransformer):
             ]
 
         if return_token_ids:
-            token_ids_out = [t.numpy().astype("int64") for t in all_token_ids]
+            token_ids_out = [
+                t.astype("int64") if isinstance(t, np.ndarray) else t.numpy().astype("int64")
+                for t in all_token_ids
+            ]
             emb_out = all_embeddings[0] if input_was_string else all_embeddings
             return emb_out, (token_ids_out[0] if input_was_string else token_ids_out)
         return all_embeddings[0] if input_was_string else all_embeddings
