@@ -768,10 +768,13 @@ class ColBERT(SentenceTransformer):
                 all_embeddings.extend(embeddings)
 
                 if return_token_ids:
-                    all_token_ids.extend(
-                        features["input_ids"][i][masks[i]].cpu()
-                        for i in range(len(embeddings))
-                    )
+                    # Detach and move to CPU in one shot to avoid GPU boolean
+                    # indexing inside the compiled model's scope, which can
+                    # corrupt TorchInductor's symbolic-shape tracking.
+                    input_ids_np = features["input_ids"].detach().cpu().numpy()
+                    masks_np = masks.detach().cpu().numpy()
+                    for i in range(len(embeddings)):
+                        all_token_ids.append(input_ids_np[i][masks_np[i]])
 
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
