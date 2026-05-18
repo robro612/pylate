@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .plaid import PLAID
 from .scann import ScaNN
+from .tachiom import Tachiom
 from .voyager import Voyager
 from .warp import WARP
 
@@ -10,4 +11,5 @@ __all__ = [
     "PLAID",
     "ScaNN",
     "WARP",
+    "Tachiom",
 ]
