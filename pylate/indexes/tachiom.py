@@ -253,17 +253,28 @@ class Tachiom(Base):
         self._doc_ids.extend(documents_ids)
         self._save_doc_ids()
 
+        # total_centroids must not exceed the number of tokens (k-means constraint)
+        n_tokens = len(all_token_ids)
+        total_centroids = min(self.total_centroids, n_tokens)
+        if total_centroids < self.total_centroids:
+            logger.warning(
+                "total_centroids reduced from %d to %d to match token count",
+                self.total_centroids,
+                total_centroids,
+            )
+
         # Build from the saved files (tachiom reads them with mmap internally)
         logger.info(
-            "Building Tachiom index: %d docs, %d tokens",
+            "Building Tachiom index: %d docs, %d tokens, %d centroids",
             len(self._doc_ids),
-            len(all_token_ids),
+            n_tokens,
+            total_centroids,
         )
         self._index = _tachiom.Tachiom.build(
             self._vectors_npy,
             self._token_ids_npy,
             self._doclens_npy,
-            total_centroids=self.total_centroids,
+            total_centroids=total_centroids,
             tac_n_iter=self.tac_n_iter,
             pq_sample_size=self.pq_sample_size,
             pq_n_iter=self.pq_n_iter,
