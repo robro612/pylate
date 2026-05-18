@@ -121,26 +121,13 @@ if __name__ == "__main__":
     retriever = retrieve.XTR(index=index)
 
     # ── Document embeddings (cached) ─────────────────────────────────────────
-    want_token_ids = args.index == "tachiom"
+    # Always cache token IDs — negligible extra cost, avoids re-encoding when
+    # switching between index types.
     doc_cache_dir = get_cache_dir(args.cache_dir, dataset_name, model_name)
 
     if not args.no_cache and cache_exists(doc_cache_dir):
         print(f"Loading document embeddings from cache: {doc_cache_dir}")
-        cached_doc_ids, documents_embeddings, documents_token_ids = load_cached(doc_cache_dir)
-        # If tachiom needs token IDs but the cache predates token-ID support, re-encode.
-        if want_token_ids and documents_token_ids is None:
-            print("Cache has no token IDs; re-encoding with return_token_ids=True")
-            documents_embeddings, documents_token_ids = encode_and_cache(
-                model=model,
-                sentences=[d["text"] for d in documents],
-                doc_ids=[d["id"] for d in documents],
-                cache_dir=doc_cache_dir,
-                shard_size=args.shard_size,
-                return_token_ids=True,
-                batch_size=2000,
-                is_query=False,
-                show_progress_bar=True,
-            )
+        _, documents_embeddings, documents_token_ids = load_cached(doc_cache_dir)
     else:
         print(f"Encoding documents and writing cache to: {doc_cache_dir}")
         documents_embeddings, documents_token_ids = encode_and_cache(
@@ -149,7 +136,7 @@ if __name__ == "__main__":
             doc_ids=[d["id"] for d in documents],
             cache_dir=doc_cache_dir,
             shard_size=args.shard_size,
-            return_token_ids=want_token_ids,
+            return_token_ids=True,
             batch_size=2000,
             is_query=False,
             show_progress_bar=True,
