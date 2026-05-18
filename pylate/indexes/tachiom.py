@@ -27,8 +27,8 @@ class Tachiom(Base):
         Whether to override the index if it already exists.
     total_centroids
         Total coarse-centroid budget distributed across token types by TAC.
-        Should be scaled with collection size; a rough guide is ~1 centroid
-        per 30–100 tokens. Defaults to 2_097_152 (2 M).
+        When ``None`` (default), set to 5 % of the total token count at build
+        time. Pass an explicit integer to override.
     tac_n_iter
         Number of k-means iterations inside TAC per token group.
     pq_sample_size
@@ -86,7 +86,7 @@ class Tachiom(Base):
         index_name: str = "tachiom",
         override: bool = False,
         # Build params
-        total_centroids: int = 2_097_152,
+        total_centroids: int | None = None,
         tac_n_iter: int = 10,
         pq_sample_size: int = 10_000_000,
         pq_n_iter: int = 10,
@@ -253,15 +253,18 @@ class Tachiom(Base):
         self._doc_ids.extend(documents_ids)
         self._save_doc_ids()
 
-        # total_centroids must not exceed the number of tokens (k-means constraint)
         n_tokens = len(all_token_ids)
-        total_centroids = min(self.total_centroids, n_tokens)
-        if total_centroids < self.total_centroids:
-            logger.warning(
-                "total_centroids reduced from %d to %d to match token count",
-                self.total_centroids,
-                total_centroids,
-            )
+        if self.total_centroids is None:
+            total_centroids = max(1, int(0.05 * n_tokens))
+            logger.info("total_centroids set to 5%% of tokens: %d", total_centroids)
+        else:
+            total_centroids = min(self.total_centroids, n_tokens)
+            if total_centroids < self.total_centroids:
+                logger.warning(
+                    "total_centroids reduced from %d to %d to match token count",
+                    self.total_centroids,
+                    total_centroids,
+                )
 
         # Build from the saved files (tachiom reads them with mmap internally)
         logger.info(
