@@ -100,16 +100,24 @@ if __name__ == "__main__":
 
     retriever = retrieve.XTR(index=index)
 
-    documents_embeddings = model.encode(
+    encode_kwargs = dict(
         sentences=[document["text"] for document in documents],
         batch_size=2000,
         is_query=False,
         show_progress_bar=True,
     )
+    if args.index == "tachiom":
+        documents_embeddings, documents_token_ids = model.encode(
+            **encode_kwargs, return_token_ids=True
+        )
+    else:
+        documents_embeddings = model.encode(**encode_kwargs)
+        documents_token_ids = None
 
     index.add_documents(
         documents_ids=[document["id"] for document in documents],
         documents_embeddings=documents_embeddings,
+        **({"documents_token_ids": documents_token_ids} if documents_token_ids is not None else {}),
     )
     queries_embeddings = model.encode(
         sentences=list(queries.values()),

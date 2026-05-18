@@ -507,6 +507,7 @@ class ColBERT(SentenceTransformer):
         is_query: bool = True,
         pool_factor: int = 1,
         protected_tokens: int = 1,
+        return_token_ids: bool = False,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
         Computes sentence embeddings.
@@ -652,6 +653,7 @@ class ColBERT(SentenceTransformer):
         self.to(device)
 
         all_embeddings = []
+        all_token_ids: list[torch.Tensor] = []
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[int(idx)] for idx in length_sorted_idx]
 
@@ -765,6 +767,12 @@ class ColBERT(SentenceTransformer):
 
                 all_embeddings.extend(embeddings)
 
+                if return_token_ids:
+                    all_token_ids.extend(
+                        features["input_ids"][i][masks[i]].cpu()
+                        for i in range(len(embeddings))
+                    )
+
         # Pad the embeddings to the same length. Documents can have different lengths while queries are already padded (when using query expansion, else requires padding as well).
         if padding:
             all_embeddings = torch.nn.utils.rnn.pad_sequence(
@@ -777,6 +785,8 @@ class ColBERT(SentenceTransformer):
             )
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+        if return_token_ids:
+            all_token_ids = [all_token_ids[idx] for idx in np.argsort(length_sorted_idx)]
 
         if precision and precision != "float32":
             all_embeddings = quantize_embeddings(
@@ -800,6 +810,10 @@ class ColBERT(SentenceTransformer):
                 for embedding in all_embeddings
             ]
 
+        if return_token_ids:
+            token_ids_out = [t.numpy().astype("int64") for t in all_token_ids]
+            emb_out = all_embeddings[0] if input_was_string else all_embeddings
+            return emb_out, (token_ids_out[0] if input_was_string else token_ids_out)
         return all_embeddings[0] if input_was_string else all_embeddings
 
     def pool_embeddings_hierarchical(
