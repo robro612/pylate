@@ -1,11 +1,12 @@
-"""Evaluation script for BEIR datasets using a WARP index, paired with an
-XTR-trained model.
+"""Evaluation script for BEIR datasets using PLAID, WARP, or Tachiom index,
+paired with an XTR-trained model.
 
-WARP is an end-to-end multi-vector retrieval engine (like PLAID), so the
-`retrieve.XTR` wrapper short-circuits to the index's own scoring rather than
-running a separate XTR scoring pass on top of token-level hits.
+All three are end-to-end indexes, so the `retrieve.XTR` wrapper short-circuits
+to the index's own scoring rather than running a separate XTR scoring pass on
+top of token-level hits.
 
-For the ColBERT + PLAID pipeline, see `beir_dataset.py`.
+For the ColBERT + PLAID pipeline with a standard ColBERT model, see
+`beir_dataset.py`.
 """
 
 from __future__ import annotations
@@ -44,13 +45,21 @@ if __name__ == "__main__":
         "cqadupstack/wordpress": 32,
     }
 
-    # Parse dataset_name from command line arguments
-    parser = argparse.ArgumentParser(description="Dataset name")
+    parser = argparse.ArgumentParser(
+        description="BEIR evaluation with XTR model and a choice of index"
+    )
     parser.add_argument(
         "--dataset_name",
         type=str,
         default="nfcorpus",
-        help="Name of the dataset to evaluate on (default: 'fiqa')",
+        help="BEIR dataset to evaluate on (default: nfcorpus)",
+    )
+    parser.add_argument(
+        "--index",
+        type=str,
+        default="warp",
+        choices=["plaid", "warp", "tachiom"],
+        help="Index backend to use (default: warp)",
     )
     args = parser.parse_args()
 
@@ -81,10 +90,13 @@ if __name__ == "__main__":
             split="dev" if "msmarco" in dataset_name else "test",
         )
 
-    index = indexes.WARP(
-        override=True,
-        index_name=f"{dataset_name}_{model_name.split('/')[-1]}",
-    )
+    index_name = f"{dataset_name}_{model_name.split('/')[-1]}"
+    if args.index == "plaid":
+        index = indexes.PLAID(override=True, index_name=index_name)
+    elif args.index == "warp":
+        index = indexes.WARP(override=True, index_name=index_name)
+    else:
+        index = indexes.Tachiom(override=True, index_name=index_name)
 
     retriever = retrieve.XTR(index=index)
 
