@@ -68,8 +68,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default="emb_cache",
-        help="Root directory for embedding shards (default: emb_cache)",
+        default="embeddings_cache",
+        help="Root directory for embedding shards (default: embeddings_cache)",
     )
     parser.add_argument(
         "--no_cache",
