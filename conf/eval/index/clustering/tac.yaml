@@ -1,0 +1,10 @@
+type: tac
+
+# Number of k-means iterations per token-type group.
+n_iter: 10
+
+# TAC thresholds passed to auto_build_params (null = auto-derive).
+# micro_threshold: token types with fewer vectors get 1 centroid.
+# small_threshold: token types in [micro, small) get 2 centroids.
+micro_threshold: null
+small_threshold: null

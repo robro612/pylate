@@ -1,0 +1,59 @@
+defaults:
+  - override hydra/job_logging: custom
+  - _self_
+
+hydra:
+  run:
+    dir: .
+
+models:
+  # - "robro612/google-xtr-base-en-pylate"
+  # - "robro612/ModernBERT-XTR"
+  # - "robro612/modernbert_colbert_kd"
+  # - "lightonai/GTE-ModernColBERT-v1"
+  # - "mixedbread-ai/mxbai-edge-colbert-v0-32m"
+  # - "mixedbread-ai/mxbai-edge-colbert-v0-17m"
+  # - "lightonai/colbertv2.0"
+  # - "LiquidAI/LFM2-ColBERT-350M"
+  # - "jinaai/jina-colbert-v2"
+  # - "perplexity-ai/pplx-embed-v1-late-0.6b"
+  # - "lightonai/answerai-colbert-small-v1"
+  # - "lightonai/LateOn"
+  # - "lightonai/ColBERT-Zero"
+  # - "lightonai/ColBERT-Zero-unsupervised"
+  # - "lightonai/ColBERT-Zero-supervised"
+  # - "topk-io/Iso-ModernColBERT"
+  - "lightonai/lateon-fix-s"
+  - "lightonai/lateon-fix-m"
+
+dataset: "beir/msmarco/dev"
+doc_length: 180
+
+# Shared model-loading kwargs applied to every model in the list
+model:
+  trust_remote_code: true
+  model_kwargs:
+    torch_dtype: "float32"
+
+encode:
+  batch_size: 1000
+  shard_size: 100000   # >= sample.n_docs → single shard per model
+  pool_factor: 1
+  pool_method: none
+  protected_tokens: 1
+  dtype: fp32
+  save_token_ids: true
+
+sample:
+  n_docs: 5000
+  seed: 42
+
+n_pairs: 10000
+
+cache:
+  dir: "embeddings_cache/anisotropy"
+
+output:
+  results_file: "results/anisotropy.jsonl"
+
+compile: false

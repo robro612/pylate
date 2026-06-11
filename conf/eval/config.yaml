@@ -1,0 +1,90 @@
+defaults:
+  - model: google_xtr
+  - index: plaid
+  - override hydra/job_logging: custom
+  - _self_
+
+datasets:
+  - "beir/nfcorpus/test"
+
+doc_length: 300
+
+query_length:
+  "beir/nfcorpus/test": 32
+  "beir/fiqa/test": 32
+  "beir/scidocs": 48
+  "beir/scifact/test": 48
+  "beir/trec-covid": 48
+  "beir/quora/test": 32
+  "beir/nq": 32
+  "beir/webis-touche2020/v2": 32
+  "beir/arguana": 64
+  "beir/climate-fever": 64
+  "beir/dbpedia-entity/test": 32
+  "beir/fever/test": 32
+  "beir/hotpotqa/test": 32
+  "beir/msmarco/dev": 32
+  "lotte/lifestyle/dev/search": 32
+  "lotte/pooled/dev/search": 32
+  "lotte/recreation/dev/search": 32
+  "lotte/science/dev/search": 32
+  "lotte/technology/dev/search": 32
+  "lotte/writing/dev/search": 32
+  "lotte/lifestyle/test/search": 32
+  "lotte/pooled/test/search": 32
+  "lotte/recreation/test/search": 32
+  "lotte/science/test/search": 32
+  "lotte/technology/test/search": 32
+  "lotte/writing/test/search": 32
+  "disks45/nocr/trec-robust-2004": 32
+
+encode:
+  batch_size: 3000
+  query_batch_size: 32
+  shard_size: 100000
+  pool_factor: 1
+  pool_method: none
+  protected_tokens: 1
+  dtype: fp16
+  shards: null
+  save_token_ids: true   # always on; token IDs are needed by Tachiom and cheap to store
+
+cache:
+  dir: "embeddings_cache"
+  enabled: true
+
+search:
+  k: 100
+  k_token: 10000
+  repeats: 1
+  metrics:
+    - map
+    - ndcg@10
+    - ndcg@100
+    - recall@10
+    - recall@100
+    - mrr@10
+    - mrr@100
+    - hit_rate@5
+    - hit_rate@10
+    - hit_rate@100
+
+output:
+  results_file: "results.jsonl"
+  index_folder: "indexes"
+  runs_dir: "results/runfiles"
+
+compile: false
+
+device: null
+
+# Stages to run. Options: encode_docs, encode_queries, build_index, retrieve
+# Later stages depend on earlier ones (retrieve needs an index, etc.)
+# If a dependency's output already exists on disk (cached shards, built index),
+# it will be loaded rather than recomputed.
+stages:
+  - encode_docs
+  - encode_queries
+  - build_index
+  - retrieve
+  - delete_index

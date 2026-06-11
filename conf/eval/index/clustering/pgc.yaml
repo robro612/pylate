@@ -1,0 +1,8 @@
+type: pgc
+n_iter: 5
+sample_multiplier: -1
+empty_strategy: split
+iter_hnsw_m: 16
+iter_ef_construction: 200
+iter_ef_search: 50
+seed: 42

@@ -1,0 +1,15 @@
+type: warp
+retrieval:
+  - xtr
+nbits: 2
+use_triton: null
+verbose: false
+override: true
+# Search params
+n_ivf_probe: 32
+bound: null
+t_prime: 100000
+max_candidates: null
+centroid_score_threshold: null
+batch_size: 512
+warp_search_batch_size: null

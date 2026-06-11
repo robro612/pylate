@@ -1,0 +1,27 @@
+defaults:
+  - clustering: tac
+  - _self_
+
+type: tachiom
+retrieval:
+  - xtr
+# Build params (official TachiomIndex interface)
+center_dataset: true
+total_centroids: null  # null = auto via auto_build_params
+tac_n_iter: 10
+tac_micro_threshold: null  # null = auto
+tac_small_threshold: null  # null = auto
+pq_sample_size: 10000000
+pq_n_iter: 10
+pq_seed: 42
+normalize: true
+hnsw_m: 32
+ef_construction: 1500
+# Search params
+k_centroids: 20
+k_docs_to_score: 500
+ef_search: null  # null = auto (1.5 * k_centroids)
+alpha: 0.45
+beta: null
+lambda_: null
+num_threads: 0
