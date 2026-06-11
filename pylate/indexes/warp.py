@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pickle
@@ -186,6 +187,16 @@ class WARP(Base):
         if not self._loaded:
             self.warp.load(device=self.device, dtype=self.dtype, mmap=self.mmap)
             self._loaded = True
+
+    @property
+    def actual_total_centroids(self) -> int | None:
+        """Number of centroids in the built WARP index, read from its metadata.json."""
+        meta_path = os.path.join(self.warp_index_path, "metadata.json")
+        try:
+            with open(meta_path) as f:
+                return json.load(f).get("num_centroids")
+        except Exception:
+            return None
 
     def _load_documents_ids_to_warp_ids(self) -> dict:
         """Load the pickle file that maps document IDs to WARP passage IDs."""
