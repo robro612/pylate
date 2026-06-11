@@ -135,7 +135,7 @@ class TachiomIndex(Base):
         index_folder: str = "indexes",
         index_name: str = "tachiom",
         override: bool = False,
-        # Build hyperparams
+        # Build hyperparams (official interface)
         center_dataset: bool = True,
         total_centroids: int | None = None,
         tac_n_iter: int = 10,
@@ -147,7 +147,7 @@ class TachiomIndex(Base):
         pq_seed: int = 42,
         hnsw_m: int = 32,
         ef_construction: int = 1500,
-        # Search hyperparams
+        # Search hyperparams (official interface)
         k_centroids: int = 20,
         k_docs_to_score: int = 500,
         ef_search: int | None = None,
@@ -155,6 +155,15 @@ class TachiomIndex(Base):
         beta: int | None = None,
         lambda_: float | None = None,
         num_threads: int = 0,
+        # Local extension: PGC clustering (requires local tachiom build)
+        clustering: str = "tac",
+        pgc_n_iter: int = 10,
+        pgc_sample_multiplier: int = 5,
+        pgc_empty_strategy: str = "resample",
+        pgc_iter_hnsw_m: int = 16,
+        pgc_iter_ef_construction: int = 200,
+        pgc_iter_ef_search: int = 50,
+        pgc_seed: int = 42,
     ) -> None:
         try:
             from tachiom import Tachiom as _Tachiom
@@ -165,6 +174,9 @@ class TachiomIndex(Base):
             )
         self._Tachiom = _Tachiom
         self._auto_build_params = _auto_build_params
+
+        if clustering not in ("tac", "pgc"):
+            raise ValueError(f"clustering must be 'tac' or 'pgc', got {clustering!r}")
 
         self.index_folder = index_folder
         self.index_name = index_name
@@ -188,6 +200,15 @@ class TachiomIndex(Base):
         self.beta = beta
         self.lambda_ = lambda_
         self.num_threads = num_threads
+
+        self.clustering = clustering
+        self.pgc_n_iter = pgc_n_iter
+        self.pgc_sample_multiplier = pgc_sample_multiplier
+        self.pgc_empty_strategy = pgc_empty_strategy
+        self.pgc_iter_hnsw_m = pgc_iter_hnsw_m
+        self.pgc_iter_ef_construction = pgc_iter_ef_construction
+        self.pgc_iter_ef_search = pgc_iter_ef_search
+        self.pgc_seed = pgc_seed
 
         self.index_path = os.path.join(index_folder, index_name)
         if override and os.path.exists(self.index_path):
@@ -350,40 +371,192 @@ class TachiomIndex(Base):
         total_centroids = params["total_centroids"]
         micro_threshold = params["tac_micro_threshold"]
         small_threshold = params["tac_small_threshold"]
-        # Store resolved values so __repr__ can show the actual config used.
         self.total_centroids = total_centroids
         self.tac_micro_threshold = micro_threshold
         self.tac_small_threshold = small_threshold
         logger.debug(
             "TachiomIndex: %d docs, %d tokens, dim=%d — "
-            "total_centroids=%d, micro_threshold=%d, small_threshold=%d",
+            "clustering=%s, total_centroids=%d, micro_threshold=%d, small_threshold=%d",
             len(new_doclens),
             len(new_token_ids),
             embeddings_f32[0].shape[1],
+            self.clustering,
             total_centroids,
             micro_threshold,
             small_threshold,
         )
-        self._index = self._Tachiom.build_from_arrays(
-            vectors=new_vectors_u16,
-            token_ids=token_ids_cont,
-            doclens=new_doclens,
-            center_dataset=self.center_dataset,
-            total_centroids=total_centroids,
-            tac_n_iter=self.tac_n_iter,
-            tac_micro_threshold=micro_threshold,
-            tac_small_threshold=small_threshold,
-            pq_sample_size=self.pq_sample_size,
-            pq_n_iter=self.pq_n_iter,
-            normalize=self.normalize,
-            pq_seed=self.pq_seed,
-            hnsw_m=self.hnsw_m,
-            ef_construction=self.ef_construction,
-        )
+
+        if self.clustering == "pgc":
+            self._index = self._Tachiom.build_with_pgc(
+                vectors=new_vectors_u16,
+                token_ids=token_ids_cont,
+                doclens=new_doclens,
+                center_dataset=self.center_dataset,
+                total_centroids=total_centroids,
+                pgc_n_iter=self.pgc_n_iter,
+                pgc_sample_multiplier=self.pgc_sample_multiplier,
+                pgc_empty_strategy=self.pgc_empty_strategy,
+                pgc_iter_hnsw_m=self.pgc_iter_hnsw_m,
+                pgc_iter_ef_construction=self.pgc_iter_ef_construction,
+                pgc_iter_ef_search=self.pgc_iter_ef_search,
+                pgc_seed=self.pgc_seed,
+                pq_sample_size=self.pq_sample_size,
+                pq_n_iter=self.pq_n_iter,
+                normalize=self.normalize,
+                pq_seed=self.pq_seed,
+                hnsw_m=self.hnsw_m,
+                ef_construction=self.ef_construction,
+            )
+        else:
+            self._index = self._Tachiom.build_from_arrays(
+                vectors=new_vectors_u16,
+                token_ids=token_ids_cont,
+                doclens=new_doclens,
+                center_dataset=self.center_dataset,
+                total_centroids=total_centroids,
+                tac_n_iter=self.tac_n_iter,
+                tac_micro_threshold=micro_threshold,
+                tac_small_threshold=small_threshold,
+                pq_sample_size=self.pq_sample_size,
+                pq_n_iter=self.pq_n_iter,
+                normalize=self.normalize,
+                pq_seed=self.pq_seed,
+                hnsw_m=self.hnsw_m,
+                ef_construction=self.ef_construction,
+            )
         self._index.save(self._tachiom_path)
         self._save_mappings(doc_id_to_int, int_to_doc_id)
         self.is_indexed = True
 
+        return self
+
+    def add_documents_from_shards(
+        self,
+        documents_ids: list[str],
+        shard_dir: str,
+    ) -> "TachiomIndex":
+        """Build the index by reading embedding shards directly in Rust.
+
+        Avoids the Python-side flat buffer that ``add_documents`` requires,
+        cutting peak RAM roughly in half for large corpora.  Shards must be
+        files written by ``pylate.utils.encode_and_cache`` (or the same
+        naming convention: ``embeddings_N.npy``, ``embeddings_N.doclens.npy``,
+        ``embeddings_N.token_ids.npy``).
+
+        Parameters
+        ----------
+        documents_ids
+            String IDs aligned with the shard files (same order as encoding).
+        shard_dir
+            Directory containing the embedding shards.
+        """
+        import math
+        from pathlib import Path as _Path
+
+        if self.is_indexed:
+            warnings.warn(
+                "TachiomIndex has already been built and does not currently support "
+                "incremental updates. This call has no effect.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return self
+
+        shard_dir = _Path(shard_dir)
+        vec_paths = sorted(shard_dir.glob("embeddings_*.npy"))
+        vec_paths = [
+            p
+            for p in vec_paths
+            if not any(
+                p.name.endswith(s)
+                for s in (".doclens.npy", ".doc_ids.npy", ".token_ids.npy")
+            )
+        ]
+        if not vec_paths:
+            raise FileNotFoundError(f"No embedding shards found in {shard_dir}")
+
+        vectors_paths = [str(p) for p in vec_paths]
+        doclens_paths = [str(p.parent / p.name.replace(".npy", ".doclens.npy")) for p in vec_paths]
+        token_ids_paths = [str(p.parent / p.name.replace(".npy", ".token_ids.npy")) for p in vec_paths]
+
+        # Count tokens from doclens only (lightweight) to call auto_build_params.
+        # Load token IDs as well for auto_build_params — these are 4 bytes/token,
+        # much cheaper than loading full embeddings.
+        all_tids = np.concatenate([
+            np.load(p, mmap_mode="r") if _Path(p).exists()
+            else np.zeros(int(np.load(d).sum()), dtype=np.uint32)
+            for p, d in zip(token_ids_paths, doclens_paths)
+        ]).astype(np.uint32)
+
+        token_ids_cont = np.ascontiguousarray(all_tids)
+        params = self._auto_build_params(
+            token_ids_cont,
+            total_centroids=self.total_centroids,
+            tac_micro_threshold=self.tac_micro_threshold,
+            tac_small_threshold=self.tac_small_threshold,
+        )
+        total_centroids = params["total_centroids"]
+        micro_threshold = params["tac_micro_threshold"]
+        small_threshold = params["tac_small_threshold"]
+        self.total_centroids = total_centroids
+        self.tac_micro_threshold = micro_threshold
+        self.tac_small_threshold = small_threshold
+
+        n_tokens = len(all_tids)
+        del all_tids  # free before the Rust build allocates
+
+        doc_id_to_int = {doc_id: i for i, doc_id in enumerate(documents_ids)}
+        int_to_doc_id = {i: doc_id for i, doc_id in enumerate(documents_ids)}
+
+        logger.info(
+            "TachiomIndex.add_documents_from_shards: %d docs, %d tokens, %d shards — "
+            "clustering=%s, total_centroids=%d",
+            len(documents_ids), n_tokens, len(vec_paths),
+            self.clustering, total_centroids,
+        )
+
+        if self.clustering == "pgc":
+            self._index = self._Tachiom.build_with_pgc_from_shards(
+                vectors_paths=vectors_paths,
+                token_ids_paths=token_ids_paths,
+                doclens_paths=doclens_paths,
+                center_dataset=self.center_dataset,
+                total_centroids=total_centroids,
+                pgc_n_iter=self.pgc_n_iter,
+                pgc_sample_multiplier=self.pgc_sample_multiplier,
+                pgc_empty_strategy=self.pgc_empty_strategy,
+                pgc_iter_hnsw_m=self.pgc_iter_hnsw_m,
+                pgc_iter_ef_construction=self.pgc_iter_ef_construction,
+                pgc_iter_ef_search=self.pgc_iter_ef_search,
+                pgc_seed=self.pgc_seed,
+                pq_sample_size=self.pq_sample_size,
+                pq_n_iter=self.pq_n_iter,
+                normalize=self.normalize,
+                pq_seed=self.pq_seed,
+                hnsw_m=self.hnsw_m,
+                ef_construction=self.ef_construction,
+            )
+        else:
+            self._index = self._Tachiom.build_from_shards(
+                vectors_paths=vectors_paths,
+                token_ids_paths=token_ids_paths,
+                doclens_paths=doclens_paths,
+                center_dataset=self.center_dataset,
+                total_centroids=total_centroids,
+                tac_n_iter=self.tac_n_iter,
+                tac_micro_threshold=micro_threshold,
+                tac_small_threshold=small_threshold,
+                pq_sample_size=self.pq_sample_size,
+                pq_n_iter=self.pq_n_iter,
+                normalize=self.normalize,
+                pq_seed=self.pq_seed,
+                hnsw_m=self.hnsw_m,
+                ef_construction=self.ef_construction,
+            )
+
+        self._index.save(self._tachiom_path)
+        self._save_mappings(doc_id_to_int, int_to_doc_id)
+        self.is_indexed = True
         return self
 
     def __call__(
@@ -523,7 +696,8 @@ class TachiomIndex(Base):
             f"  path={self.index_path!r},\n"
             f"  docs={self._index.len}, tokens={self._index.n_tokens}, dim={self._index.dim},\n"
             f"  — build —\n"
-            f"  center_dataset={self.center_dataset}, "
+            f"  clustering={self.clustering}, "
+            f"center_dataset={self.center_dataset}, "
             f"total_centroids={self.total_centroids}, "
             f"tac_n_iter={self.tac_n_iter}, "
             f"tac_micro_threshold={self.tac_micro_threshold}, "
