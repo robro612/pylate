@@ -8,9 +8,7 @@ retrieval:
 # Build params (official TachiomIndex interface)
 center_dataset: true
 total_centroids: null  # null = auto via auto_build_params
-tac_n_iter: 10
-tac_micro_threshold: null  # null = auto
-tac_small_threshold: null  # null = auto
+# clustering-specific params (n_iter, thresholds, etc.) live in conf/eval/index/clustering/
 pq_sample_size: 10000000
 pq_n_iter: 10
 pq_seed: 42
