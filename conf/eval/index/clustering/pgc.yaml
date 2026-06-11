@@ -1,6 +1,6 @@
 type: pgc
 n_iter: 5
-sample_multiplier: -1
+sample_multiplier: null  # null = use all vectors (no sampling); integer = sample n*total_centroids per iteration
 empty_strategy: split
 iter_hnsw_m: 16
 iter_ef_construction: 200
