@@ -938,7 +938,11 @@ def build_index(
         # Tachiom reads shards directly in Rust — no Python flat buffer needed.
         logger.info("Building Tachiom index from shards (Rust native path)...")
         build_start = time.perf_counter()
-        index.add_documents_from_shards(documents_ids=doc_ids, shard_dir=shard_dir)
+        index.add_documents_from_shards(
+            documents_ids=doc_ids,
+            shard_dir=shard_dir,
+            glob_pattern="doc_shard_*.npy",
+        )
         build_time = time.perf_counter() - build_start
         gc.collect()
 

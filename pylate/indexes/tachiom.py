@@ -434,14 +434,14 @@ class TachiomIndex(Base):
         self,
         documents_ids: list[str],
         shard_dir: str,
+        glob_pattern: str = "embeddings_*.npy",
     ) -> "TachiomIndex":
         """Build the index by reading embedding shards directly in Rust.
 
         Avoids the Python-side flat buffer that ``add_documents`` requires,
-        cutting peak RAM roughly in half for large corpora.  Shards must be
-        files written by ``pylate.utils.encode_and_cache`` (or the same
-        naming convention: ``embeddings_N.npy``, ``embeddings_N.doclens.npy``,
-        ``embeddings_N.token_ids.npy``).
+        cutting peak RAM roughly in half for large corpora.  Shards must follow
+        the naming convention ``<stem>.npy`` / ``<stem>.doclens.npy`` /
+        ``<stem>.token_ids.npy``.
 
         Parameters
         ----------
@@ -449,6 +449,11 @@ class TachiomIndex(Base):
             String IDs aligned with the shard files (same order as encoding).
         shard_dir
             Directory containing the embedding shards.
+        glob_pattern
+            Glob pattern for the embedding shard files.  Defaults to
+            ``"embeddings_*.npy"`` (written by
+            ``pylate.utils.encode_and_cache``).  Pass ``"doc_shard_*.npy"``
+            when shards were written by ``scripts/benchmark_indexes.py``.
         """
         import math
         from pathlib import Path as _Path
@@ -463,7 +468,7 @@ class TachiomIndex(Base):
             return self
 
         shard_dir = _Path(shard_dir)
-        vec_paths = sorted(shard_dir.glob("embeddings_*.npy"))
+        vec_paths = sorted(shard_dir.glob(glob_pattern))
         vec_paths = [
             p
             for p in vec_paths
