@@ -1,0 +1,28 @@
+# Fast quantization-aware training run: int8 queries, binary documents.
+# The StraightThroughEstimator is the single source of truth for quantization
+# (permanent, active at inference) -- do not pass precision= to encode().
+run_name: qat-int8-query-binary-doc
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/qat-int8-binary
+dataset: lightonai/lighton-ms-marco-mini
+dataset_config: triplet
+max_train_samples: 512
+eval_fraction: 0.1
+
+quantization:
+  enabled: true
+  pre_normalize: true
+  query:
+    type: ScalarQuantizer
+    n_bits: 8
+  document:
+    type: BinaryQuantizer
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 16
+  learning_rate: 3.0e-6
+  fp16: false
+  bf16: false
+  eval_steps: 10
+  logging_steps: 5

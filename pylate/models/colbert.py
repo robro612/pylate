@@ -28,6 +28,7 @@ from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from ._chat_templates import COLPALI_CHAT_TEMPLATES, COLPALI_TEMPLATE_NAME
 from .Dense import Dense
+from .quantization import StraightThroughEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -541,12 +542,20 @@ class ColBERT(SentenceTransformer):
                     )
                 )
                 logger.info("Created a PyLate model from base encoder.")
-        # Convert ST dense layers to PyLate dense layers
+        # Convert ST dense layers to PyLate dense layers. Only coerce genuine
+        # sentence-transformers Dense modules; leave other appended modules (e.g.
+        # a StraightThroughEstimator for quantization-aware training) untouched.
         for i in range(1, len(self)):
-            if not isinstance(self[i], Dense):
+            if isinstance(self[i], DenseSentenceTransformer) and not isinstance(
+                self[i], Dense
+            ):
                 self[i] = Dense.from_sentence_transformers(dense=self[i])
         # If the user defined an output dimension and the last linear dimension is not the same, add a dense layer
-        if embedding_size is not None and self[-1].out_features != embedding_size:
+        if (
+            embedding_size is not None
+            and hasattr(self[-1], "out_features")
+            and self[-1].out_features != embedding_size
+        ):
             logger.warning(
                 f"The checkpoint contains a final projection layer with output dimension ({self[-1].in_features}, {self[-1].out_features}). Adding a dense layer with output dimensions ({self[-1].out_features}, {embedding_size})."
             )
@@ -1494,6 +1503,13 @@ class ColBERT(SentenceTransformer):
         ):
             tokenized_outputs["attention_mask"].fill_(1)
 
+        # Carry the query/document flag through the pipeline so downstream modules
+        # (e.g. StraightThroughEstimator with asymmetric quantization) can route
+        # queries and documents to different transforms. The collator preserves
+        # this as `<column>_is_query` and the trainer regroups it into each
+        # feature dict; non-tensor entries pass through batch_to_device untouched.
+        tokenized_outputs["is_query"] = is_query
+
         return tokenized_outputs
 
     def _append_expansion_tokens(
@@ -2070,18 +2086,15 @@ class ColBERT(SentenceTransformer):
     def _filter_non_colbert_modules(
         modules: list[nn.Module] | OrderedDict[str, nn.Module],
     ) -> list[nn.Module] | OrderedDict[str, nn.Module]:
-        """Filter modules to only keep Transformer and Dense modules (remove Pooling, etc.)."""
+        """Filter modules to only keep Transformer, Dense, and StraightThroughEstimator modules (remove Pooling, etc.)."""
+        keep_types = (Transformer, DenseSentenceTransformer, StraightThroughEstimator)
         if isinstance(modules, OrderedDict):
             return OrderedDict(
                 (name, module)
                 for name, module in modules.items()
-                if isinstance(module, (Transformer, DenseSentenceTransformer))
+                if isinstance(module, keep_types)
             )
-        return [
-            module
-            for module in modules
-            if isinstance(module, (Transformer, DenseSentenceTransformer))
-        ]
+        return [module for module in modules if isinstance(module, keep_types)]
 
     def _load_config_modules(
         self,
