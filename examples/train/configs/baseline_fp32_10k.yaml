@@ -1,0 +1,29 @@
+# Iso baseline for qat_int8_binary_10k.yaml: identical setup, full precision (no STE).
+# Use this to measure the quality gap introduced by quantization-aware training.
+run_name: baseline-fp32-10k
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/baseline-fp32-10k
+dataset: sentence-transformers/msmarco-bm25
+dataset_config: triplet
+max_train_samples: 400000
+max_eval_samples: 1000
+seed: 42
+
+quantization:
+  enabled: false
+
+wandb:
+  enabled: true
+  project: pylate-ste
+
+training:
+  max_steps: 10000
+  per_device_train_batch_size: 32
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.05
+  fp16: false
+  bf16: true
+  eval_steps: 500
+  logging_steps: 50
+  save_steps: 2000
+  save_total_limit: 1

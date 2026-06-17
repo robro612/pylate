@@ -1,0 +1,36 @@
+# Real QAT run: ~10k steps, int8 queries / binary documents, MS MARCO triplets.
+# The StraightThroughEstimator is the single source of truth for quantization
+# (permanent, active at inference) -- do not pass precision= to encode().
+run_name: qat-int8-query-binary-doc-10k
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/qat-int8-binary-10k
+dataset: sentence-transformers/msmarco-bm25
+dataset_config: triplet
+max_train_samples: 400000   # >= 10k steps * batch 32; bounds RAM/download
+max_eval_samples: 1000      # fast triplet evaluation
+seed: 42
+
+quantization:
+  enabled: true
+  pre_normalize: true
+  query:
+    type: ScalarQuantizer
+    n_bits: 8
+  document:
+    type: BinaryQuantizer
+
+wandb:
+  enabled: true
+  project: pylate-ste
+
+training:
+  max_steps: 10000
+  per_device_train_batch_size: 32
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.05
+  fp16: false
+  bf16: true
+  eval_steps: 500
+  logging_steps: 50
+  save_steps: 2000
+  save_total_limit: 1

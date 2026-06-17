@@ -1,0 +1,21 @@
+# Iso baseline: identical to qat_int8_binary.yaml but full-precision (no STE).
+# Use this to measure the quality gap introduced by quantization-aware training.
+run_name: baseline-fp32
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/baseline-fp32
+dataset: lightonai/lighton-ms-marco-mini
+dataset_config: triplet
+max_train_samples: 512
+eval_fraction: 0.1
+
+quantization:
+  enabled: false
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 16
+  learning_rate: 3.0e-6
+  fp16: false
+  bf16: false
+  eval_steps: 10
+  logging_steps: 5
