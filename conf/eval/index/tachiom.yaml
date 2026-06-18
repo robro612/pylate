@@ -9,17 +9,24 @@ retrieval:
 center_dataset: true
 total_centroids: null  # null = auto via auto_build_params
 # clustering-specific params (n_iter, thresholds, etc.) live in conf/eval/index/clustering/
-pq_sample_size: 10000000
+pq_sample_size: 4000000  # PQ codebook capacity is fixed (M*KSUB), so a constant sample suffices; 4M matches 10M quality at ~2.5x faster. Rust caps at min(this, n_tokens).
 pq_n_iter: 10
 pq_seed: 42
+pq_subspaces: 32  # PQ subspaces (M). bits/dim = M/16; bytes/token = M. Must divide token_dim & be %4. Compiled: {4,8,16,32,64,128}. 32=2bit/dim (default), 64≈PLAID 4bit, 128=8bit (exceeds PLAID, 2x size).
 normalize: true
 hnsw_m: 32
 ef_construction: 1500
 # Search params
+# Quality levers (see study below): k_docs_to_score is the dominant recall/coverage knob —
+# it sets how many candidates reach full-MaxSim rerank (default 500 starved it). 2000 is a
+# safe default; raise to 5000-10000 + alpha=null for recall-bound (deep-pool) datasets.
+# alpha caps the candidate pool *after* k_docs (so alpha<1 and deep k_docs are in tension):
+# alpha=0.45 is fine/faster at moderate k_docs; use alpha=null for max recall at deep k_docs.
+# For ranking-precision-bound (shallow-pool) datasets the lever is pq_subspaces (M), not search.
 k_centroids: 20
-k_docs_to_score: 500
+k_docs_to_score: 2000  # was 500 (reranker-starved). 2000 recovers most recall; 5000-10000+alpha=null for deep-pool sets.
 ef_search: null  # null = auto (1.5 * k_centroids)
-alpha: 0.45
+alpha: 0.45      # candidate-pool prune width; set null for max recall with deep k_docs_to_score
 beta: null
 lambda_: null
 num_threads: 0

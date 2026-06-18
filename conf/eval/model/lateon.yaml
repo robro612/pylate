@@ -1,0 +1,3 @@
+name_or_path: "lightonai/LateOn"
+model_kwargs:
+  torch_dtype: "float16"

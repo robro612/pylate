@@ -68,11 +68,10 @@ class BaseRetriever(ABC):
         # End-to-end indexes (e.g. PLAID) handle scoring internally and return
         # RerankResult directly.
         if self.index.is_end_to_end_index:
-            return self.index(
-                queries_embeddings=queries_embeddings,
-                k=k,
-                subset=subset,
-            )
+            kwargs = dict(queries_embeddings=queries_embeddings, k=k)
+            if subset is not None:
+                kwargs["subset"] = subset
+            return self.index(**kwargs)
 
         self._validate_subset_token_path(subset)
 

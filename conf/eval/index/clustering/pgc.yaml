@@ -1,8 +1,11 @@
 type: pgc
 n_iter: 5
-sample_multiplier: null  # null = use all vectors (no sampling); integer = sample n*total_centroids per iteration
+sample_multiplier: 40  # ~samples per centroid per iteration; 40 matches full-sampling quality at ~2x faster (scale-invariant: rides on total_centroids). null = use all vectors.
 empty_strategy: split
 iter_hnsw_m: 16
 iter_ef_construction: 200
 iter_ef_search: 50
+iter_lambda: null  # null/0 = no early termination; typical useful range [0.01, 0.2], tune with iter_ef_search
+assign_topm: 1     # top-m soft centroid update (1 = hard top-1). Training-only; final/index assignment stays hard top-1.
+assign_temp: 0.1   # softmax temperature for top-m weights wᵢ∝exp(sᵢ/τ); smaller→peaked, larger→uniform. Ignored when assign_topm=1.
 seed: 42

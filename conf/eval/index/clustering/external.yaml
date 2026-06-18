@@ -1,0 +1,6 @@
+type: external
+# Paths to externally-computed coarse clustering (e.g. scripts/gpu_kmeans_cluster.py).
+# centroids.npy: [K, dim] f32 ; assignments.npy: [n_tokens] u32, token i -> centroid.
+# Token order must match TachiomIndex.add_documents_from_shards (sorted glob of the shard dir).
+centroids_path: ???
+assignments_path: ???

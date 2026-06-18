@@ -915,6 +915,7 @@ def build_index(
             pq_n_iter=index_cfg.get("pq_n_iter", 10) if index_cfg else 10,
             normalize=index_cfg.get("normalize", True) if index_cfg else True,
             pq_seed=index_cfg.get("pq_seed", 42) if index_cfg else 42,
+            pq_subspaces=index_cfg.get("pq_subspaces", 32) if index_cfg else 32,
             hnsw_m=index_cfg.get("hnsw_m", 32) if index_cfg else 32,
             ef_construction=index_cfg.get("ef_construction", 1500) if index_cfg else 1500,
             # Official search params
@@ -933,7 +934,12 @@ def build_index(
             pgc_iter_hnsw_m=cl.get("iter_hnsw_m", 16) if cl else 16,
             pgc_iter_ef_construction=cl.get("iter_ef_construction", 200) if cl else 200,
             pgc_iter_ef_search=cl.get("iter_ef_search", 50) if cl else 50,
+            pgc_iter_lambda=cl.get("iter_lambda", None) if cl else None,
+            pgc_assign_topm=cl.get("assign_topm", 1) if cl else 1,
+            pgc_assign_temp=cl.get("assign_temp", 0.1) if cl else 0.1,
             pgc_seed=cl.get("seed", 42) if cl else 42,
+            external_centroids_path=cl.get("centroids_path", None) if cl else None,
+            external_assignments_path=cl.get("assignments_path", None) if cl else None,
         )
         # Tachiom reads shards directly in Rust — no Python flat buffer needed.
         logger.info("Building Tachiom index from shards (Rust native path)...")
@@ -1164,6 +1170,8 @@ def load_existing_index(
             index_folder=index_folder,
             index_name=index_name,
             override=False,
+            # Must match the M the index was built with (on-disk PQ is M-specific).
+            pq_subspaces=index_cfg.get("pq_subspaces", 32) if index_cfg else 32,
             k_centroids=index_cfg.get("k_centroids", 20) if index_cfg else 20,
             k_docs_to_score=index_cfg.get("k_docs_to_score", 500) if index_cfg else 500,
             ef_search=index_cfg.get("ef_search", None) if index_cfg else None,

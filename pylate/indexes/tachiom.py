@@ -145,6 +145,7 @@ class TachiomIndex(Base):
         pq_n_iter: int = 10,
         normalize: bool = True,
         pq_seed: int = 42,
+        pq_subspaces: int = 32,
         hnsw_m: int = 32,
         ef_construction: int = 1500,
         # Search hyperparams (official interface)
@@ -163,7 +164,13 @@ class TachiomIndex(Base):
         pgc_iter_hnsw_m: int = 16,
         pgc_iter_ef_construction: int = 200,
         pgc_iter_ef_search: int = 50,
+        pgc_iter_lambda: float | None = None,
+        pgc_assign_topm: int = 1,
+        pgc_assign_temp: float = 0.1,
         pgc_seed: int = 42,
+        # Local extension: externally-computed coarse centroids (e.g. GPU k-means)
+        external_centroids_path: str | None = None,
+        external_assignments_path: str | None = None,
     ) -> None:
         try:
             from tachiom import Tachiom as _Tachiom
@@ -175,8 +182,12 @@ class TachiomIndex(Base):
         self._Tachiom = _Tachiom
         self._auto_build_params = _auto_build_params
 
-        if clustering not in ("tac", "pgc"):
-            raise ValueError(f"clustering must be 'tac' or 'pgc', got {clustering!r}")
+        if clustering not in ("tac", "pgc", "external"):
+            raise ValueError(f"clustering must be 'tac', 'pgc', or 'external', got {clustering!r}")
+        if clustering == "external" and not (external_centroids_path and external_assignments_path):
+            raise ValueError(
+                "clustering='external' requires external_centroids_path and external_assignments_path"
+            )
 
         self.index_folder = index_folder
         self.index_name = index_name
@@ -190,6 +201,7 @@ class TachiomIndex(Base):
         self.pq_n_iter = pq_n_iter
         self.normalize = normalize
         self.pq_seed = pq_seed
+        self.pq_subspaces = pq_subspaces
         self.hnsw_m = hnsw_m
         self.ef_construction = ef_construction
 
@@ -209,7 +221,12 @@ class TachiomIndex(Base):
         self.pgc_iter_hnsw_m = pgc_iter_hnsw_m
         self.pgc_iter_ef_construction = pgc_iter_ef_construction
         self.pgc_iter_ef_search = pgc_iter_ef_search
+        self.pgc_iter_lambda = pgc_iter_lambda
+        self.pgc_assign_topm = pgc_assign_topm
+        self.pgc_assign_temp = pgc_assign_temp
         self.pgc_seed = pgc_seed
+        self.external_centroids_path = external_centroids_path
+        self.external_assignments_path = external_assignments_path
 
         self.index_path = os.path.join(index_folder, index_name)
         if override and os.path.exists(self.index_path):
@@ -230,7 +247,11 @@ class TachiomIndex(Base):
 
     def _ensure_loaded(self) -> None:
         if self._index is None:
-            self._index = self._Tachiom.load(self._tachiom_path)
+            # pq_subspaces must match the M the index was built with (on-disk PQ
+            # format is M-specific); the caller is responsible for passing it.
+            self._index = self._Tachiom.load(
+                self._tachiom_path, pq_subspaces=self.pq_subspaces
+            )
 
     def _ensure_mappings(self) -> None:
         if self._doc_id_to_int is None:
@@ -399,9 +420,13 @@ class TachiomIndex(Base):
                 pgc_iter_hnsw_m=self.pgc_iter_hnsw_m,
                 pgc_iter_ef_construction=self.pgc_iter_ef_construction,
                 pgc_iter_ef_search=self.pgc_iter_ef_search,
+                pgc_iter_lambda=self.pgc_iter_lambda,
+                pgc_assign_topm=self.pgc_assign_topm,
+                pgc_assign_temp=self.pgc_assign_temp,
                 pgc_seed=self.pgc_seed,
                 pq_sample_size=self.pq_sample_size,
                 pq_n_iter=self.pq_n_iter,
+                pq_subspaces=self.pq_subspaces,
                 normalize=self.normalize,
                 pq_seed=self.pq_seed,
                 hnsw_m=self.hnsw_m,
@@ -419,6 +444,7 @@ class TachiomIndex(Base):
                 tac_small_threshold=small_threshold,
                 pq_sample_size=self.pq_sample_size,
                 pq_n_iter=self.pq_n_iter,
+                pq_subspaces=self.pq_subspaces,
                 normalize=self.normalize,
                 pq_seed=self.pq_seed,
                 hnsw_m=self.hnsw_m,
@@ -532,7 +558,32 @@ class TachiomIndex(Base):
             self.clustering, total_centroids,
         )
 
-        if self.clustering == "pgc":
+        if self.clustering == "external":
+            centroids = np.ascontiguousarray(
+                np.load(self.external_centroids_path), dtype=np.float32
+            )
+            assignments = np.ascontiguousarray(
+                np.load(self.external_assignments_path), dtype=np.uint32
+            )
+            logger.info(
+                "TachiomIndex: external clustering — %d centroids, %d assignments",
+                centroids.shape[0], assignments.shape[0],
+            )
+            self._index = self._Tachiom.build_from_arrays_with_centroids(
+                vectors=vectors_u16,
+                token_ids=token_ids_cont,
+                doclens=flat_doclens,
+                centroids=centroids,
+                assignments=assignments,
+                pq_sample_size=self.pq_sample_size,
+                pq_n_iter=self.pq_n_iter,
+                pq_subspaces=self.pq_subspaces,
+                normalize=self.normalize,
+                pq_seed=self.pq_seed,
+                hnsw_m=self.hnsw_m,
+                ef_construction=self.ef_construction,
+            )
+        elif self.clustering == "pgc":
             self._index = self._Tachiom.build_with_pgc(
                 vectors=vectors_u16,
                 token_ids=token_ids_cont,
@@ -544,9 +595,13 @@ class TachiomIndex(Base):
                 pgc_iter_hnsw_m=self.pgc_iter_hnsw_m,
                 pgc_iter_ef_construction=self.pgc_iter_ef_construction,
                 pgc_iter_ef_search=self.pgc_iter_ef_search,
+                pgc_iter_lambda=self.pgc_iter_lambda,
+                pgc_assign_topm=self.pgc_assign_topm,
+                pgc_assign_temp=self.pgc_assign_temp,
                 pgc_seed=self.pgc_seed,
                 pq_sample_size=self.pq_sample_size,
                 pq_n_iter=self.pq_n_iter,
+                pq_subspaces=self.pq_subspaces,
                 normalize=self.normalize,
                 pq_seed=self.pq_seed,
                 hnsw_m=self.hnsw_m,
@@ -564,6 +619,7 @@ class TachiomIndex(Base):
                 tac_small_threshold=small_threshold,
                 pq_sample_size=self.pq_sample_size,
                 pq_n_iter=self.pq_n_iter,
+                pq_subspaces=self.pq_subspaces,
                 normalize=self.normalize,
                 pq_seed=self.pq_seed,
                 hnsw_m=self.hnsw_m,
