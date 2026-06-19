@@ -864,9 +864,24 @@ def build_index(
             del batch_embeddings, batch_ids
             gc.collect()
 
-        # if use_fast:
-        #     logger.info("Freezing PLAID index (removes redundant uncombined shards used for index adds)...")
-        #     index.freeze()
+        # FastPlaid keeps both per-shard ({i}.codes/residuals.npy, used for index
+        # adds) and merged_* (used at search) files — ~2x on-disk residuals. For a
+        # read-only benchmark index the per-shard files are redundant; freeze() drops
+        # them so disk_mb below reflects the true searchable footprint (~halved).
+        # Requires fast-plaid >= 1.4.7 (freeze() added in 1.4.7); guarded for the
+        # Stanford backend, which has no freeze().
+        if use_fast:
+            try:
+                logger.info("Freezing PLAID index (drops redundant per-shard files)...")
+                index.freeze()
+            except (AttributeError, RuntimeError) as exc:
+                # fast-plaid < 1.4.7 has no freeze(); leave the index un-frozen
+                # (usable, just ~2x disk) rather than failing a completed build.
+                logger.warning(
+                    "freeze() unavailable (need fast-plaid >= 1.4.7); "
+                    "index left un-frozen, disk_mb will include redundant shards: %s",
+                    exc,
+                )
 
         build_time = time.perf_counter() - build_start
 
@@ -1245,7 +1260,21 @@ def main(cfg: DictConfig) -> None:
         if index_type == "tachiom":
             cl_cfg = cfg.index.get("clustering", {})
             clustering_type = cl_cfg.get("type", "tac") if cl_cfg else "tac"
-            clustering_slug = f"_{clustering_type}"
+            # pq_subspaces (M) is baked into the on-disk PQ, so it's part of the index
+            # identity: different M (or clustering) must not share a name, else builds
+            # collide and retrieve loads the wrong codebook. m{M} keeps them distinct.
+            m = cfg.index.get("pq_subspaces", 32)
+            # For external clustering, "external" alone doesn't say which method produced
+            # the centroids — PGC and TAC would both land at _external_m{M} and collide,
+            # silently overwriting each other's build. Tag with the provenance dir name
+            # (parent of centroids_path, e.g. lotte_pgc_m4t05 / lotte_tac) to keep them
+            # distinct and self-documenting.
+            if clustering_type == "external":
+                cpath = cl_cfg.get("centroids_path") if cl_cfg else None
+                src = Path(cpath).parent.name if cpath else "unknown"
+                clustering_slug = f"_external_{src}_m{m}"
+            else:
+                clustering_slug = f"_{clustering_type}_m{m}"
         index_name = f"bench_{model_slug}_{dataset_slug}_{index_type}{clustering_slug}"
 
         # Track timing for results

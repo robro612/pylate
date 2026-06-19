@@ -311,6 +311,20 @@ class FastPlaid(Base):
             documents_embeddings=documents_embeddings,
         )
 
+    def freeze(self) -> "FastPlaid":
+        """Drop the redundant per-shard files to halve on-disk storage.
+
+        After building, fast-plaid keeps both the per-shard ``{i}.codes/residuals.npy``
+        (used by ``update``/``delete``) and the ``merged_*`` files (used at search
+        time). For a read-only index the shards are redundant. ``freeze()`` refreshes
+        the merged files, deletes the per-shard files, and marks the index frozen;
+        search is unaffected and subsequent ``update``/``delete`` calls raise.
+
+        Requires fast-plaid >= 1.4.7.
+        """
+        self.fast_plaid.freeze()
+        return self
+
     def __call__(
         self,
         queries_embeddings: np.ndarray

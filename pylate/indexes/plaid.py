@@ -278,6 +278,21 @@ class PLAID(Base):
         )
         return self
 
+    def freeze(self) -> "PLAID":
+        """Drop redundant per-shard files to halve on-disk storage.
+
+        Only supported with the FastPlaid backend (``use_fast=True``, fast-plaid
+        >= 1.4.7). After freezing the index is read-only: search is unaffected but
+        ``add_documents``/``update_documents``/``remove_documents`` will raise.
+        """
+        if not self.use_fast:
+            raise NotImplementedError(
+                "freeze is only supported with the FastPlaid backend. "
+                "Set use_fast=True to use it."
+            )
+        self._index.freeze()
+        return self
+
     def __call__(
         self,
         queries_embeddings: np.ndarray | torch.Tensor,
