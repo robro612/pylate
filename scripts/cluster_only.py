@@ -78,10 +78,12 @@ def main():
             total_centroids=a.total_centroids, pgc_n_iter=a.n_iter,
             pgc_sample_multiplier=a.pgc_sample_multiplier, pgc_empty_strategy=a.pgc_empty_strategy,
             pgc_assign_topm=a.pgc_assign_topm, pgc_assign_temp=a.pgc_assign_temp,
+            verbose=True,
         )
     else:
         centroids, assignments = tachiom.cluster_tac(
             vectors_u16, tids, dl, total_centroids=a.total_centroids, tac_n_iter=a.n_iter,
+            verbose=True,
         )
     print(f"  {a.method} clustering done in {time.time()-tc:.1f}s -> {centroids.shape[0]} centroids")
     np.save(a.out_dir / "centroids.npy", np.ascontiguousarray(centroids, dtype=np.float32))
