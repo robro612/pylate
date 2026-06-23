@@ -54,29 +54,31 @@ _COLPALI_PROJ_KEY: dict[str, str] = {
 _DEFAULT_PROJ_KEY = "custom_text_proj"
 
 
-def _load_colpali_proj_tensors(
+def _read_merged_proj_tensors(
     model_name_or_path: str,
     weight_key: str,
     bias_key: str,
-    **hub_kwargs,
+    hub_kwargs: dict,
 ) -> dict[str, torch.Tensor]:
-    """Read projection layer tensors from a safetensors checkpoint.
+    """Read projection weight/bias from a *merged* safetensors checkpoint.
 
     Matches keys by suffix (e.g. any key ending in ``custom_text_proj.weight``)
     so it handles plain, ``model.``-prefixed, and ``base_model.model.``-prefixed
-    checkpoints without maintaining an explicit prefix list.
+    checkpoints without maintaining an explicit prefix list. Returns an empty
+    dict if no merged checkpoint (``model.safetensors`` or sharded index) holds
+    the projection.
     """
     from safetensors import safe_open
 
     def _find_in_file(sf_path: str) -> dict[str, torch.Tensor]:
-        result = {}
+        found = {}
         with safe_open(sf_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 if key == weight_key or key.endswith("." + weight_key):
-                    result[weight_key] = f.get_tensor(key)
+                    found[weight_key] = f.get_tensor(key)
                 elif key == bias_key or key.endswith("." + bias_key):
-                    result[bias_key] = f.get_tensor(key)
-        return result
+                    found[bias_key] = f.get_tensor(key)
+        return found
 
     # Try single safetensors file.
     try:
@@ -109,10 +111,114 @@ def _load_colpali_proj_tensors(
     except EnvironmentError:
         pass
 
+    return {}
+
+
+def _merge_lora_proj_tensors(
+    model_name_or_path: str,
+    weight_key: str,
+    bias_key: str,
+    hub_kwargs: dict,
+) -> dict[str, torch.Tensor]:
+    """Reconstruct the projection from a LoRA *adapter* checkpoint.
+
+    Official ViDoRe checkpoints (``colqwen2*-v*``, ``tsystems/*``, ``colSmol``)
+    ship as LoRA adapters, not merged weights. When such a repo is loaded as
+    the bare base VLM (e.g. ``Qwen2_5_VLModel``), the ``custom_text_proj`` layer
+    is not part of that architecture, so peft never instantiates it and the
+    merged weight is never materialized on the live model. The adapter stores
+    the projection as a LoRA pair on top of the base repo's frozen projection,
+    so we merge it by hand: ``W = W_base + (alpha / r) * (B @ A)``.
+
+    Returns an empty dict if *model_name_or_path* is not a LoRA adapter repo or
+    the adapter does not carry the projection.
+    """
+    from safetensors import safe_open
+
+    try:
+        adapter_config_path = cached_file(
+            model_name_or_path, "adapter_config.json", **hub_kwargs
+        )
+    except EnvironmentError:
+        return {}
+
+    with open(adapter_config_path) as f:
+        adapter_config = json.load(f)
+
+    base_model = adapter_config.get("base_model_name_or_path")
+    rank = adapter_config.get("r")
+    alpha = adapter_config.get("lora_alpha")
+    if not base_model or not rank or alpha is None:
+        return {}
+
+    # The frozen base projection lives in the base repo (it is ignored when the
+    # adapter repo itself is loaded as the bare VLM, hence never on the model).
+    base_tensors = _read_merged_proj_tensors(
+        base_model, weight_key, bias_key, hub_kwargs
+    )
+    if weight_key not in base_tensors:
+        return {}
+
+    proj_key = weight_key[: -len(".weight")]
+    lora_a_key = f"{proj_key}.lora_A.weight"
+    lora_b_key = f"{proj_key}.lora_B.weight"
+
+    try:
+        adapter_path = cached_file(
+            model_name_or_path, "adapter_model.safetensors", **hub_kwargs
+        )
+    except EnvironmentError:
+        return {}
+
+    lora_a = lora_b = None
+    with safe_open(adapter_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key == lora_a_key or key.endswith("." + lora_a_key):
+                lora_a = f.get_tensor(key)
+            elif key == lora_b_key or key.endswith("." + lora_b_key):
+                lora_b = f.get_tensor(key)
+
+    # No LoRA on the projection itself → the base weight is already final.
+    if lora_a is None or lora_b is None:
+        return base_tensors
+
+    scaling = alpha / (math.sqrt(rank) if adapter_config.get("use_rslora") else rank)
+    base_weight = base_tensors[weight_key]
+    delta = (lora_b.float() @ lora_a.float()) * scaling
+    merged_weight = (base_weight.float() + delta).to(base_weight.dtype)
+
+    merged = {weight_key: merged_weight}
+    if bias_key in base_tensors:  # LoRA never modifies the bias
+        merged[bias_key] = base_tensors[bias_key]
+    return merged
+
+
+def _load_colpali_proj_tensors(
+    model_name_or_path: str,
+    weight_key: str,
+    bias_key: str,
+    **hub_kwargs,
+) -> dict[str, torch.Tensor]:
+    """Load ColPali projection tensors from a merged or LoRA-adapter checkpoint."""
+    # Merged checkpoint: the projection weight is materialized on disk.
+    result = _read_merged_proj_tensors(
+        model_name_or_path, weight_key, bias_key, hub_kwargs
+    )
+    if weight_key in result:
+        return result
+
+    # LoRA adapter checkpoint: merge the base projection with the LoRA pair.
+    result = _merge_lora_proj_tensors(
+        model_name_or_path, weight_key, bias_key, hub_kwargs
+    )
+    if weight_key in result:
+        return result
+
     raise ValueError(
         f"Could not find projection weights ending in '{weight_key}' "
-        f"in {model_name_or_path}. "
-        "Looked for model.safetensors and model.safetensors.index.json."
+        f"in {model_name_or_path}. Looked for a merged checkpoint "
+        "(model.safetensors / model.safetensors.index.json) and a LoRA adapter "
+        "(adapter_config.json + adapter_model.safetensors)."
     )
 
 
@@ -1914,7 +2020,8 @@ class ColBERT(SentenceTransformer):
         Checks whether the loaded ``auto_model`` already carries the projection
         (happens when ``colpali_engine`` is installed and ``trust_remote_code``
         was used). Otherwise falls back to reading the safetensors files
-        directly.
+        directly — either a merged checkpoint or a LoRA adapter, which is merged
+        against its base repo's projection on the fly.
         """
         weight_key = f"{proj_key}.weight"
         bias_key = f"{proj_key}.bias"

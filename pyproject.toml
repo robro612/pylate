@@ -62,7 +62,7 @@ flash-maxsim = ["flash-maxsim >= 0.2.1"]
 lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
 ]
-image = ["sentence-transformers[image]"]
+image = ["sentence-transformers[image]", "peft >= 0.13.0"]
 
 
 [dependency-groups]
