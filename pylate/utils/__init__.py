@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from .collator import ColBERTCollator
-from .distributed import all_gather, all_gather_with_gradients, get_rank, get_world_size
+from .distributed import (
+    all_gather,
+    all_gather_with_gradients,
+    all_reduce_max,
+    get_rank,
+    get_world_size,
+)
 from .embedding_cache import (
     cache_exists,
     encode_and_cache,
@@ -28,6 +34,7 @@ __all__ = [
     "_start_multi_process_pool",
     "all_gather",
     "all_gather_with_gradients",
+    "all_reduce_max",
     "get_rank",
     "get_world_size",
     "cache_exists",
