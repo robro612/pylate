@@ -1,4 +1,4 @@
-"""Benchmark indexes on ir_datasets collections.
+"""Benchmark indexes on ir_datasets text collections or ViDoRe image collections.
 
 Collects evaluation metrics (NDCG, recall, MAP), queries per second (QPS),
 index build time, index disk usage, and encode time.
@@ -13,6 +13,15 @@ Usage:
     python scripts/benchmark_indexes.py index=tachiom 'index/clustering=pgc'
     python scripts/benchmark_indexes.py datasets=[beir/fiqa/test,beir/scifact/test]
     python scripts/benchmark_indexes.py --multirun index=warp,plaid,tachiom
+
+Multimodal (ViDoRe visual document retrieval): documents are page images
+encoded by a ColPali-family VLM. Same pipeline (encode -> cache -> index ->
+retrieve), one constraint -- TAC clustering is rejected (image patches have no
+vocabulary token types); use PGC or a PLAID/WARP index.
+    python scripts/benchmark_indexes.py model=colqwen index=plaid \\
+        datasets=[vidore/finance]
+    python scripts/benchmark_indexes.py model=colqwen index=tachiom \\
+        'index/clustering=pgc' datasets=[vidore/finance]
 """
 
 from __future__ import annotations
@@ -183,10 +192,30 @@ def append_stage_marker(
 # ---------------------------------------------------------------------------
 
 
+def _doc_payload(doc: dict):
+    """Return the model input for a document: a PIL image for multimodal corpora
+    (ViDoRe), otherwise the document text."""
+    return doc["image"] if "image" in doc else doc["text"]
+
+
+def is_multimodal_corpus(documents: list[dict]) -> bool:
+    """True when documents are images (ViDoRe) rather than text."""
+    return bool(documents) and "image" in documents[0]
+
+
 def load_dataset(
     dataset_id: str,
 ) -> tuple[list[dict], dict[str, str], dict[str, dict[str, int]]]:
-    """Load documents, queries, and qrels from an ir_datasets collection."""
+    """Load documents, queries, and qrels.
+
+    ``vidore/<name>`` ids (e.g. ``vidore/finance``) load a ViDoRe visual-document
+    dataset whose documents are page images; everything else loads from an
+    ir_datasets collection of text documents.
+    """
+    if dataset_id.startswith("vidore/"):
+        logger.info("Loading ViDoRe dataset: %s", dataset_id)
+        return evaluation.load_vidore(dataset_id.split("/", 1)[1])
+
     logger.info("Loading dataset: %s", dataset_id)
     dataset = ir_datasets.load(dataset_id)
 
@@ -258,6 +287,17 @@ def encode_documents_sharded(
 
     save_token_ids = cfg.encode.get("save_token_ids", True)
 
+    # Image corpora (ViDoRe) have no vocabulary token IDs -- only visual-patch
+    # placeholders -- so caching them is pointless and TAC clustering (which keys
+    # on token types) is meaningless. Force them off; build_index rejects TAC.
+    multimodal = is_multimodal_corpus(documents)
+    if multimodal and save_token_ids:
+        logger.warning(
+            "Multimodal (image) corpus: forcing save_token_ids=False "
+            "(no vocabulary token IDs; TAC clustering is not applicable)."
+        )
+        save_token_ids = False
+
     # Check which selected shards are already cached
     cached = set()
     for idx in shard_selection:
@@ -319,7 +359,7 @@ def encode_documents_sharded(
         shard_token_ids = None
         if use_multi_gpu:
             shard_embeddings = model.encode_multi_process(
-                sentences=[doc["text"] for doc in documents[start:end]],
+                sentences=[_doc_payload(doc) for doc in documents[start:end]],
                 pool=pool,
                 batch_size=cfg.encode.batch_size,
                 is_query=False,
@@ -331,7 +371,7 @@ def encode_documents_sharded(
                 # output_value=None returns unfiltered embeddings + mask + input_ids.
                 # Apply the mask here so shards store only valid (non-padding) tokens.
                 encode_result = model.encode(
-                    sentences=[doc["text"] for doc in documents[start:end]],
+                    sentences=[_doc_payload(doc) for doc in documents[start:end]],
                     batch_size=cfg.encode.batch_size,
                     is_query=False,
                     show_progress_bar=True,
@@ -356,7 +396,7 @@ def encode_documents_sharded(
                     shard_token_ids.append(np.asarray(filtered_ids, dtype=np.int64))
             else:
                 shard_embeddings = model.encode(
-                    sentences=[doc["text"] for doc in documents[start:end]],
+                    sentences=[_doc_payload(doc) for doc in documents[start:end]],
                     batch_size=cfg.encode.batch_size,
                     is_query=False,
                     show_progress_bar=True,
@@ -1243,6 +1283,21 @@ def main(cfg: DictConfig) -> None:
         # Always load dataset metadata (needed for doc IDs, qrels, etc.)
         documents, queries, qrels = load_dataset(dataset_id)
         query_ids = list(queries.keys())
+
+        # Multimodal (image) corpora are modality-agnostic from the index down,
+        # with one hard incompatibility: TAC clustering keys on vocabulary token
+        # types, which image patches do not have. Reject it loudly rather than
+        # silently producing a degenerate clustering. Use clustering=pgc (or a
+        # PLAID/WARP index) for multimodal datasets.
+        if is_multimodal_corpus(documents) and index_type == "tachiom":
+            cl_type = (cfg.index.get("clustering", {}) or {}).get("type", "tac")
+            if cl_type == "tac":
+                raise ValueError(
+                    f"Dataset '{dataset_id}' is a multimodal (image) corpus, but "
+                    "index=tachiom uses TAC clustering, which requires vocabulary "
+                    "token IDs that image documents do not have. Re-run with "
+                    "'index/clustering=pgc' (or index=plaid / index=warp)."
+                )
 
         # Cache directory: dataset / model / encoding params
         pool_factor = cfg.encode.get("pool_factor", 1)

@@ -1,0 +1,6 @@
+# ColQwen2.5 (ColPali-family) multi-vector VLM for visual document retrieval.
+# LoRA-only adapter repo — loadable since the projection-merge fix. Pair with a
+# ViDoRe dataset (datasets='[vidore/finance]') and PGC/PLAID (not TAC).
+name_or_path: "vidore/colqwen2.5-v0.2"
+model_kwargs:
+  torch_dtype: "bfloat16"

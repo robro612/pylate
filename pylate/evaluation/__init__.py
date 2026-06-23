@@ -8,6 +8,7 @@ from .nano_beir_evaluator import NanoBEIREvaluator
 from .pylate_information_retrieval_evaluator import PyLateInformationRetrievalEvaluator
 
 try:
+    from .vidore_beir import load_vidore
     from .vidore_evaluator import ViDoREvaluator
 except ImportError:
     pass
@@ -17,6 +18,7 @@ __all__ = [
     "ColBERTDistillationEvaluator",
     "NanoBEIREvaluator",
     "ViDoREvaluator",
+    "load_vidore",
     "get_beir_triples",
     "load_beir",
     "load_custom_dataset",

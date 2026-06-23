@@ -516,7 +516,11 @@ class TachiomIndex(Base):
         dim = np.load(str(vec_paths[0]), mmap_mode="r").shape[1]
 
         flat_vecs = np.empty((total_tokens, dim), dtype=np.float16)
-        flat_tids = np.empty(total_tokens, dtype=np.uint32)
+        # zeros (not empty): shards without a .token_ids.npy file (e.g. image
+        # corpora) then default to token ID 0, matching the documented
+        # "omitted token IDs -> single global k-means" fallback rather than
+        # feeding uninitialized garbage into _auto_build_params.
+        flat_tids = np.zeros(total_tokens, dtype=np.uint32)
         flat_doclens = np.empty(total_docs, dtype=np.int32)
 
         # Pass 2: fill flat buffers shard by shard.
