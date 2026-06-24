@@ -171,11 +171,22 @@ if __name__ == "__main__":
             print(f"Model: {model_name} ({model_type})")
             print("=" * 80)
             model_class = normalize_model_type(model_type)
-            model = model_class(
-                model_name_or_path=model_name,
-                document_length=300,
-                query_length=query_len.get(dataset_name),
-            )
+            if model_type == "proxy_attention":
+                # ProxyAttentionColBERT's __init__ ignores the saved proxy config
+                # (num_select_tokens, etc.) and re-initializes the proxy embeddings
+                # randomly. Only .load() restores the trained vector budget and proxy
+                # weights from the checkpoint, so use it for this model type.
+                model = models.ProxyAttentionColBERT.load(
+                    model_name,
+                    document_length=300,
+                    query_length=query_len.get(dataset_name),
+                )
+            else:
+                model = model_class(
+                    model_name_or_path=model_name,
+                    document_length=300,
+                    query_length=query_len.get(dataset_name),
+                )
             print(f"Compiling model and casting to bfloat16 on GPU...")
             print(f"Model before compilation: {model.dtype=} {model.device=}")
             model = model.to("cuda", dtype=torch.bfloat16)
