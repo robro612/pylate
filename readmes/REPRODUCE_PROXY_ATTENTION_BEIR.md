@@ -7,11 +7,10 @@ model: learnable proxy query tokens compute attention saliency over document tok
 top-`m` most salient tokens are selected, and (optionally) nearby tokens are pooled into those
 centroids — i.e. *attention-guided clustering*.
 
-> **TL;DR** — Everything needed (model, loss, training script, BEIR eval harness, configs,
-> tests) is committed. The trained checkpoints are *not* shipped, so each vector budget
-> requires training one model. A different budget (8 vs 16) = a separately trained model.
-> Read the **Gotchas** section before evaluating — the eval entrypoint needs `.load()`, not
-> the bare constructor, or it silently uses random proxy weights.
+> **TL;DR** — Everything needed (model, loss, training entrypoint, configs, BEIR eval harness,
+> tests) is committed. The trained checkpoints are *not* shipped, so each vector budget requires
+> training one model. A different budget (8 vs 16) = a separately trained model. The existing
+> released checkpoints were trained with the **Hydra** trainer (Section 4) on a **single H100**.
 
 ---
 
@@ -42,14 +41,21 @@ pruning & pooling) applied on top of a stock `lightonai/GTE-ModernColBERT-v1`.
 - `pylate/losses/proxy_attention_distillation.py` — `ProxyAttentionDistillation` (KL-divergence
   knowledge-distillation loss).
 
-**Training**
-- `examples/train/proxy_attention_colbert.py` — CLI training entrypoint (KD on MS MARCO).
-- `examples/train/PROXY_ATTENTION_COLBERT.md` — full math + code walkthrough of the method.
-- `conf/model/proxy_attention.yaml` — config template for the model variant.
+**Training (the path that produced the released checkpoints)**
+- `examples/train/gte_modern_colbert_hydra.py` — Hydra/OmegaConf training entrypoint.
+- `scripts/train_variants.sh` — SLURM-array launcher; the proxy-attention models are array
+  indices 1 / 4 / 7 (P32-S32 / P24-S24 / P16-S16).
+- `conf/gte_modern_colbert.yaml` — base training config (batch size, steps, lr, dataset, …).
+- `conf/model/proxy_attention.yaml` — the proxy-attention model variant config.
+- `examples/train/PROXY_ATTENTION_COLBERT.md` — math + code walkthrough of the method.
+- `examples/train/proxy_attention_colbert.py` — an *alternative* standalone argparse trainer.
+  **It was not used for the released checkpoints** (it schedules by `--epochs` rather than
+  `max_steps` and defaults to a different batch size). Prefer the Hydra path for faithful repro.
 
 **Evaluation**
 - `examples/evaluation/beir_dataset.py` — **full BEIR test eval** with a PLAID index
-  (`--model_type proxy_attention`). This is the path that produces per-dataset BEIR numbers.
+  (`--model_type proxy_attention`). Already loads proxy models correctly via `.load()`
+  (committed fix, see Section 5).
 - `pylate/evaluation/beir.py` — BEIR dataset loader used by the above.
 - `evaluation.NanoBEIREvaluator` — small-subset eval used *during training* for monitoring;
   **not** a substitute for full BEIR test numbers.
@@ -66,156 +72,149 @@ weights, not source; reproduction re-creates them.
 ```bash
 # from the repo root
 uv pip install -e .          # or: pip install -e .
-# Optional extras used by some training modes:
-#   peft        -> required only for --training_mode lora
 ```
 
 The base model and KD dataset are pulled from the HuggingFace Hub automatically:
-- Base encoder: `Alibaba-NLP/gte-modernbert-base` (paper default) — or `lightonai/GTE-ModernColBERT-v1`
-  to start from an already-ColBERT-tuned checkpoint.
+- Base encoder: `Alibaba-NLP/gte-modernbert-base` (what the released checkpoints used).
 - KD training data: `lightonai/ms-marco-en-bge-gemma` (MS MARCO with BGE-Gemma teacher scores).
 
-GPU notes for this cluster: train on L40S/A100/H100 (`srunl40s` / a100 / h100). V100 cannot run
-the cu13 torch build. Encoding/eval can run on GPU; PLAID indexing defaults to CPU.
+Hardware: the released checkpoints were trained on a **single H100** (`--gres=gpu:h100:1`,
+torch `2.9.0+cu128`). A100 / L40S work too. **V100 is incompatible with the current cu13 torch
+build** (Volta sm_70 is dropped), so use it only for CPU-side work.
 
 ---
 
 ## 4. Train the models (one per vector budget)
 
-The output vector count **m** is the `--num_select_tokens` flag and is fixed at *training* time.
-To get an 8-vector and a 16-vector model, train two models:
+The output vector count **m** is `num_select_tokens` and is fixed at *training* time. To get an
+8-vector and a 16-vector model, train two models. **Exact command used for the released
+16-vector model** (`scripts/train_variants.sh`, array index 7):
 
 ```bash
-# 8 vectors/doc
-torchrun --nproc_per_node=4 examples/train/proxy_attention_colbert.py \
-    --model_name Alibaba-NLP/gte-modernbert-base \
-    --num_select_tokens 8  --num_proxy_tokens 8 \
-    --use_cluster_pooling \
-    --batch_size 24 --n_ways 16 --lr 3e-5 --epochs 3 --bf16 \
-    --output_dir output/proxy_attention-S8
-
-# 16 vectors/doc
-torchrun --nproc_per_node=4 examples/train/proxy_attention_colbert.py \
-    --model_name Alibaba-NLP/gte-modernbert-base \
-    --num_select_tokens 16 --num_proxy_tokens 16 \
-    --use_cluster_pooling \
-    --batch_size 24 --n_ways 16 --lr 3e-5 --epochs 3 --bf16 \
-    --output_dir output/proxy_attention-S16
+python examples/train/gte_modern_colbert_hydra.py \
+  --config-name gte_modern_colbert \
+  model=proxy_attention \
+  model.variant_args.num_proxy_tokens=16 \
+  model.variant_args.num_select_tokens=16 \
+  compile=false
 ```
 
+For **8 vectors**, change both overrides to `8`:
+
+```bash
+python examples/train/gte_modern_colbert_hydra.py \
+  --config-name gte_modern_colbert \
+  model=proxy_attention \
+  model.variant_args.num_proxy_tokens=8 \
+  model.variant_args.num_select_tokens=8 \
+  compile=false
+```
+
+What the configs supply (resolved values, verified against a released checkpoint's saved
+`config.yaml`):
+
+| Source | Setting | Value |
+|---|---|---|
+| `conf/gte_modern_colbert.yaml` | `batch_size` | **20** |
+| | `n_ways` | 16 |
+| | `lr` | 3e-5 |
+| | `max_steps` | **10000** |
+| | `warmup_ratio` | 0.0 |
+| | `eval_steps` / `save_steps` / `logging_steps` | 250 / 5000 / 10 |
+| | `dtype` | bf16 |
+| | `model.document_length` / `query_length` | 300 / 32 |
+| | `dataset_path` | `lightonai/ms-marco-en-bge-gemma` |
+| `conf/model/proxy_attention.yaml` | `use_cluster_pooling` | true |
+| | `proxy_tau` | 1.0 |
+| | `num_proxy_tokens` / `num_select_tokens` | 32 / 32 (override per run) |
+
 Notes:
-- Single GPU: drop `torchrun --nproc_per_node=N` and just run `python ...`.
-- The final model is written to `<output_dir>/final` (via the model's custom `save()`, which
-  writes `proxy_embeddings/` and records the proxy params in `config_sentence_transformers.json`).
-- `--num_proxy_tokens` need not equal `--num_select_tokens`, but matching them is the convention
-  used here. `num_proxy_tokens` = how many learnable probes compute saliency; `num_select_tokens`
-  = how many output vectors are kept.
-- Training modes (`--training_mode`): `full` (default), `proxy_only` (freeze everything but the
-  proxy tokens — cheapest), `freeze_word_embeddings`, `lora` (needs `peft`). The paper used full
-  fine-tuning; `proxy_only` is a fast sanity check.
+- `compile=false` is set explicitly for proxy-attention runs (the base config has `compile=true`,
+  but `torch.compile` doesn't play well with the eager-attention capture this model needs).
+- The released checkpoints also used `use_attn_weight_cluster_pooling=true` (the model default):
+  saliency scores weight the pooling. It isn't set in the config, so leave the default in place.
+- To launch all variants as the original SLURM array (single H100 each):
+  `sbatch scripts/train_variants.sh` (proxy indices are 1/4/7; add an `8`-token entry to the
+  `configs` array if you want that budget in the sweep).
+- Single-GPU interactive run: drop the SLURM wrapper and run the `python ...` command directly
+  on an H100/A100/L40S node.
 - Mid-training NanoBEIR scores are logged but are *not* the reported BEIR test numbers.
+- The trained model is written under the run's output dir as `.../final` (custom `save()` writes
+  `proxy_embeddings/` and records the proxy params in `config_sentence_transformers.json`).
 
 ---
 
 ## 5. Evaluate on BEIR
 
-### ⚠️ Required fix before evaluating (read this)
+The loading is already correct in the committed code. `examples/evaluation/beir_dataset.py`
+loads `proxy_attention` models via `ProxyAttentionColBERT.load(...)`, which restores the trained
+`num_select_tokens` and the learned proxy embeddings from the checkpoint.
 
-`examples/evaluation/beir_dataset.py` instantiates models with the **plain constructor**:
-
-```python
-model = model_class(model_name_or_path=model_name, document_length=300, query_length=...)
-```
-
-For `ProxyAttentionColBERT` the constructor **does not** read the saved proxy config and **does
-not** load the trained proxy-token weights. It will silently fall back to the defaults
-(`num_select_tokens=32`) with **randomly initialized** proxy embeddings — i.e. it will *not*
-evaluate your trained 8/16-vector model. Only the `ProxyAttentionColBERT.load(path)` classmethod
-restores `num_select_tokens` and the learned proxy embeddings from disk.
-
-Apply this one-line change in `beir_dataset.py` where the model is built (around line 173):
-
-```python
-# before
-model = model_class(
-    model_name_or_path=model_name,
-    document_length=300,
-    query_length=query_len.get(dataset_name),
-)
-
-# after
-if model_type == "proxy_attention":
-    model = models.ProxyAttentionColBERT.load(
-        model_name,
-        document_length=300,
-        query_length=query_len.get(dataset_name),
-    )
-else:
-    model = model_class(
-        model_name_or_path=model_name,
-        document_length=300,
-        query_length=query_len.get(dataset_name),
-    )
-```
-
-(You can verify the fix took effect: the encoded docs should average ≈ `num_select_tokens`
-vectors/doc in the `print_token_stats` output — 8 or 16, not ~300.)
-
-### Run it
+> **Background (why `.load()` matters):** the plain `ProxyAttentionColBERT(...)` constructor does
+> **not** read the saved proxy config — it would default to `num_select_tokens=32` and randomly
+> re-initialize the proxy embeddings, silently evaluating the wrong model. This was fixed in the
+> eval script (commit `342a9a7`) so the constructor is no longer used for this model type. If you
+> write your own eval, load with `ProxyAttentionColBERT.load(path)`, not the bare constructor.
 
 ```bash
 python examples/evaluation/beir_dataset.py \
     --model_type proxy_attention \
-    --model_name_or_path output/proxy_attention-S8/final \
+    --model_name_or_path output/<your-16tok-run>/final \
     --index_type plaid \
-    --output_dir evaluation_results/proxy_attention-S8 \
+    --output_dir evaluation_results/proxy_attention-S16 \
     --save_runfile \
     --dataset_name nfcorpus scifact fiqa trec-covid scidocs arguana \
                    webis-touche2020 quora nq hotpotqa fever \
                    climate-fever dbpedia-entity
 ```
 
-This loads each BEIR dataset, encodes docs (→ 8 vectors/doc) and queries, builds a PLAID index,
-retrieves, and writes `evaluation_results/.../overall_results.jsonl` plus per-dataset
-`evaluation_results.json` (and `run.json` runfiles with `--save_runfile`). Reported metrics:
-`map, ndcg@10, ndcg@100, recall@10, recall@100`. Repeat with `output/proxy_attention-S16/final`.
+This loads each BEIR dataset, encodes docs and queries, builds a PLAID index, retrieves, and
+writes `evaluation_results/.../overall_results.jsonl` plus per-dataset `evaluation_results.json`
+(and `run.json` runfiles with `--save_runfile`). Reported metrics: `map, ndcg@10, ndcg@100,
+recall@10, recall@100`. Repeat with the 8-vector checkpoint.
 
-Per-dataset query lengths are already encoded in the `query_len` dict at the top of the script.
+**Sanity check the budget loaded:** the script prints `avg_tokens_per_document`. For a correctly
+loaded model it should be **≈ `num_select_tokens`** (8 or 16) — not ~300, and not 32. (Verified:
+the P16-S16 checkpoint encodes exactly 16 vectors/doc through this path.)
+
+Per-dataset query lengths are encoded in the `query_len` dict at the top of the script.
 
 ---
 
 ## 6. Extending the method
 
-- **Other vector budgets** — train with any `--num_select_tokens` (4, 8, 16, 24, 32, …). One
-  model per budget.
-- **Pooling variants** — `--no_cluster_pooling` (pure top-k selection, no clustering),
-  `cluster_centroid_weight`, `use_attn_weight_cluster_pooling` (saliency-weighted pooling). These
-  are constructor args; expose them as CLI flags in `proxy_attention_colbert.py` if you want to
-  sweep them (only the four already-wired flags are CLI-exposed today).
-- **Saliency temperature** — `--proxy_tau` sharpens/softens the proxy→token attention softmax.
-- **Different base encoder** — `--model_name <any ColBERT-compatible encoder>`. Architecture
-  support for the attention capture lives in `_get_last_layer` (ModernBERT / BERT / RoBERTa
-  styles handled; add a branch for others).
-- **New datasets** — add the dataset to `--dataset_name`; set its query length in the `query_len`
-  dict in `beir_dataset.py`. `cqadupstack/*` subsets are handled specially (auto-downloaded).
+- **Other vector budgets** — set `model.variant_args.num_select_tokens` (and `num_proxy_tokens`)
+  to any value (4, 8, 16, 24, 32, …). One model per budget.
+- **Pooling variants** — `model.variant_args.use_cluster_pooling=false` (pure top-k selection),
+  plus `cluster_centroid_weight` and `use_attn_weight_cluster_pooling` (constructor args; add
+  them to `conf/model/proxy_attention.yaml` to sweep).
+- **Saliency temperature** — `model.variant_args.proxy_tau` sharpens/softens the proxy→token
+  attention softmax.
+- **Different base encoder** — `model.name=<any ColBERT-compatible encoder>`. Attention-capture
+  support lives in `_get_last_layer` (ModernBERT / BERT / RoBERTa styles handled; add a branch
+  for others).
+- **New datasets** — add the dataset to `--dataset_name` in `beir_dataset.py`; set its query
+  length in the `query_len` dict. `cqadupstack/*` subsets are handled specially (auto-downloaded).
 
 ---
 
 ## 7. Gotchas & caveats checklist
 
-- [ ] **Use `.load()`, not the constructor**, when evaluating a trained proxy model (Section 5).
-      Otherwise you measure a random model at the wrong vector count.
+- [ ] **Use the Hydra trainer for faithful repro** (Section 4), not `proxy_attention_colbert.py`
+      — the released checkpoints used `max_steps=10000` and `batch_size=20`, not epochs/bs=24.
 - [ ] **Checkpoints are not in git.** Train first; nothing is reproducible from committed weights.
 - [ ] **8 ≠ 16 is two training runs**, not an eval-time flag. The budget is baked in at train time.
 - [ ] **NanoBEIR ≠ BEIR.** The in-training evaluator uses small subsets; report numbers from
       `beir_dataset.py`.
-- [ ] **Working-tree drift.** As of this writing, several eval-side files have *uncommitted local
-      modifications* (`experiments/compression/compression_eval*.py`,
-      `experiments/compression/conf/compression_eval.yaml`, `pylate/evaluation/beir.py`, and
-      `pylate/models/compression/*.py`). The `ProxyAttentionColBERT` training/eval path
-      (`examples/...`) is unaffected, but if you hand this off, commit or stash those diffs so the
-      recipient isn't chasing behavior that only exists on a local tree.
-- [ ] **GPU/CUDA:** V100 is incompatible with the cu13 torch build; train/encode on L40S/A100/H100.
+- [ ] **`.load()`, not the constructor**, if you write a custom eval. The committed eval script
+      already does this; the constructor silently yields a random 32-vector model otherwise.
+- [ ] **`compile=false` for proxy runs** — `torch.compile` breaks the eager-attention capture.
+- [ ] **GPU:** trained on a single H100; A100/L40S fine; V100 is incompatible with the cu13 torch
+      build (use CPU there).
+- [ ] **Working-tree drift.** As of this writing several eval-side files have *uncommitted local
+      modifications* (`experiments/compression/compression_eval*.py`, its `conf/`, and
+      `pylate/models/compression/*.py`). The proxy training/eval path is unaffected, but if you
+      hand this off, commit or stash those so the recipient isn't chasing local-only behavior.
 
 ---
 
@@ -225,19 +224,17 @@ Per-dataset query lengths are already encoded in the `query_len` dict at the top
 # 0. install
 uv pip install -e .
 
-# 1. train (two budgets)
-torchrun --nproc_per_node=4 examples/train/proxy_attention_colbert.py \
-    --num_select_tokens 8  --num_proxy_tokens 8  --use_cluster_pooling \
-    --output_dir output/proxy_attention-S8
-torchrun --nproc_per_node=4 examples/train/proxy_attention_colbert.py \
-    --num_select_tokens 16 --num_proxy_tokens 16 --use_cluster_pooling \
-    --output_dir output/proxy_attention-S16
+# 1. train (two budgets, single H100/A100/L40S each)
+python examples/train/gte_modern_colbert_hydra.py --config-name gte_modern_colbert \
+    model=proxy_attention model.variant_args.num_proxy_tokens=8  \
+    model.variant_args.num_select_tokens=8  compile=false
+python examples/train/gte_modern_colbert_hydra.py --config-name gte_modern_colbert \
+    model=proxy_attention model.variant_args.num_proxy_tokens=16 \
+    model.variant_args.num_select_tokens=16 compile=false
 
-# 2. apply the .load() fix in examples/evaluation/beir_dataset.py (Section 5)
-
-# 3. eval on BEIR
+# 2. eval on BEIR (loading fix already committed)
 python examples/evaluation/beir_dataset.py --model_type proxy_attention \
-    --model_name_or_path output/proxy_attention-S8/final \
+    --model_name_or_path output/<your-8tok-run>/final \
     --index_type plaid --save_runfile --output_dir evaluation_results/S8 \
     --dataset_name nfcorpus scifact fiqa trec-covid scidocs arguana
 ```
