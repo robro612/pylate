@@ -1,10 +1,15 @@
 type: gpu
-# GPU coarse clustering (scripts/gpu_cluster.py). Produces centroids/assignments that
-# the CPU tachiom build ingests like `external` (clustering=gpu alias). Needs cuvs-cu13
-# for backend=cagra (see pyproject `gpu` extra). Run on L40S/A100, not V100.
+# GPU coarse clustering. Produces centroids/assignments that the tachiom build ingests
+# like `external`. Two ways to run, same code (gpu_cluster.cluster_tokens):
+#   1. As a benchmark_indexes.py STAGE:  stages=[...,cluster,build_index,...]
+#      index/clustering=gpu  — writes to clusterings/<dataset>_<model>/<backend>[_k..][_s..]/
+#      and the build ingests it automatically (no manual path-passing).
+#   2. Standalone:  scripts/gpu_cluster.py shard_dir=<docs> out_dir=<o> clustering.backend=cagra
+# Needs a cuvs-capable GPU env in-process: cu13 on L40S/A100, cu12 on V100.
 
 backend: cagra        # brute (pytorch exact) | cagra (CAGRA-guided Lloyd = GPU-PGC) | flash
-k: null               # total_centroids; null -> tachiom auto_build_params (matches CPU TAC/PGC)
+k: null               # total_centroids; null -> auto: tachiom auto_build_params (in-memory)
+                      # or round(1% of tokens) (streaming, matches LateOn lotte_cagra)
 iters: 10
 seed: 42
 train_sample: null    # null = cluster on all tokens (in-memory, GPU-resident; ok up to ~10s of GB).

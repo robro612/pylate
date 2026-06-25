@@ -156,12 +156,13 @@ def _argmax_brute(xb, Ch, kblock):
     return arg
 
 
-def _assign_brute(X, Ch, chunk, kblock, log_tqdm=None):
+def _assign_brute(X, Ch, chunk, kblock, desc=None):
     N = X.shape[0]
     labels = torch.empty(N, dtype=torch.long, device=X.device)
     rng = range(0, N, chunk)
-    if log_tqdm is not None:
-        rng = log_tqdm(rng)
+    if desc is not None:
+        from tqdm import tqdm
+        rng = tqdm(rng, desc=desc, unit="batch", leave=False, mininterval=2.0)
     for s in rng:
         labels[s:s + chunk] = _argmax_brute(X[s:s + chunk], Ch, kblock)
     return labels
@@ -189,11 +190,15 @@ def _cagra_search(index, xb, cfg_cagra):
     return nb[:, 0].long()
 
 
-def _assign_cagra(X, Ch, cfg_cagra, chunk):
+def _assign_cagra(X, Ch, cfg_cagra, chunk, desc=None):
     index = _build_cagra(Ch, cfg_cagra)
     N = X.shape[0]
     labels = torch.empty(N, dtype=torch.long, device=X.device)
-    for s in range(0, N, chunk):
+    rng = range(0, N, chunk)
+    if desc is not None:
+        from tqdm import tqdm
+        rng = tqdm(rng, desc=desc, unit="batch", leave=False, mininterval=2.0)
+    for s in rng:
         labels[s:s + chunk] = _cagra_search(index, X[s:s + chunk], cfg_cagra)
     return labels
 
@@ -209,7 +214,7 @@ def lloyd(X, K, iters, assign_fn, seed=42, chunk=65536, log=print, final_assign=
     C = torch.nn.functional.normalize(C, dim=1)
     for it in range(iters):
         t = time.time()
-        labels = assign_fn(X, C.half())
+        labels = assign_fn(X, C.half(), f"iter {it + 1}/{iters} assign")
         sums = torch.zeros(K, D, device=X.device, dtype=torch.float32)
         cnt = torch.zeros(K, device=X.device, dtype=torch.float32)
         for s in range(0, N, chunk):
@@ -222,7 +227,7 @@ def lloyd(X, K, iters, assign_fn, seed=42, chunk=65536, log=print, final_assign=
             ridx = torch.randint(0, N, ((~nz).sum().item(),), generator=g, device=X.device)
             C[~nz] = X[ridx].float()
         log(f"  iter {it + 1}/{iters}: {int((~nz).sum())} empty, {time.time() - t:.1f}s")
-    labels = assign_fn(X, C.half()) if final_assign else None
+    labels = assign_fn(X, C.half(), "final assign") if final_assign else None
     return C, labels
 
 
@@ -233,11 +238,15 @@ def _stream_assign(sv: ShardedVectors, C_half, backend, cfg, chunk, log=print):
     (brute), and walks the corpus chunk-by-chunk so the full corpus never lands in
     host RAM or GPU memory at once.
     """
+    from tqdm import tqdm
+
     dev = C_half.device
     labels = np.empty(sv.N, dtype=np.uint32)
+    log(f"  building {backend} index over {C_half.shape[0]} centroids for final assignment ...")
     index = _build_cagra(C_half, cfg.cagra) if backend == "cagra" else None
     t = time.time()
     done = 0
+    pbar = tqdm(total=sv.N, desc="stream-assign", unit="tok", unit_scale=True, mininterval=2.0)
     for start, arr in sv.iter_chunks(chunk):
         xb = torch.nn.functional.normalize(
             torch.from_numpy(arr).to(dev, non_blocking=True).float(), dim=1).half()
@@ -247,6 +256,8 @@ def _stream_assign(sv: ShardedVectors, C_half, backend, cfg, chunk, log=print):
             lab = _argmax_brute(xb, C_half, cfg.kblock)
         labels[start:start + arr.shape[0]] = lab.to(torch.int32).cpu().numpy().astype(np.uint32)
         done += arr.shape[0]
+        pbar.update(arr.shape[0])
+    pbar.close()
     log(f"  streamed final assignment: {done} tokens in {time.time() - t:.1f}s")
     return labels
 
@@ -262,17 +273,21 @@ def kmeans_flash(X, K, iters, seed=42, log=print):
 
 
 # ---------------------------------------------------------------------------
-@hydra.main(config_path="../conf/eval", config_name="cluster", version_base=None)
-def main(cfg: DictConfig) -> None:
-    cl = cfg.clustering
+def cluster_tokens(shard_dir: Path, out_dir: Path, cl: DictConfig):
+    """Run GPU coarse clustering over the token shards in `shard_dir`.
+
+    Writes centroids.npy / assignments.npy / meta.json into `out_dir` and returns
+    (centroids_path, assignments_path). This is the importable core shared by the
+    standalone CLI (`main`, below) and the `cluster` stage of benchmark_indexes.py, so
+    both run identical code. K resolution: `clustering.k` if set, else
+    tachiom.auto_build_params on the token_ids (in-memory) or 1% of tokens (streaming).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
     backend = cl.backend
     if cl.get("search_topm", 1) and cl.get("search_topm", 1) > 1:
         raise NotImplementedError(
             "soft top-m update (search_topm>1) not implemented; index assignment is hard top-1."
         )
-    shard_dir = Path(hydra.utils.to_absolute_path(cfg.shard_dir))
-    out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
-    out_dir.mkdir(parents=True, exist_ok=True)
     train_sample = cl.get("train_sample", None)
     streaming = train_sample is not None
 
@@ -298,12 +313,15 @@ def main(cfg: DictConfig) -> None:
     K = cl.get("k", None)
     if K is None:
         if streaming:
-            raise ValueError("clustering.k must be set explicitly in streaming mode "
-                             "(sidecar has no tachiom auto-resolver).")
-        import tachiom
-        K = int(tachiom.auto_build_params(
-            np.ascontiguousarray(tids, dtype=np.uint32), total_centroids=None)["total_centroids"])
-        print(f"  resolved K (auto_build_params) = {K}")
+            # Streaming never loads token_ids; use the established 1%-of-tokens rule
+            # (the LateOn lotte_cagra K convention) as the auto default.
+            K = round(0.01 * n_tok)
+            print(f"  resolved K = round(1% of {n_tok} tokens) = {K}")
+        else:
+            import tachiom
+            K = int(tachiom.auto_build_params(
+                np.ascontiguousarray(tids, dtype=np.uint32), total_centroids=None)["total_centroids"])
+            print(f"  resolved K (auto_build_params) = {K}")
     K = int(K)
 
     print("torch", torch.__version__, "device", torch.cuda.get_device_name(0))
@@ -314,15 +332,17 @@ def main(cfg: DictConfig) -> None:
 
     if streaming:
         # Train on a GPU-resident subsample; final assignment streamed over all tokens.
+        print(f"  gathering {int(train_sample)}-token training subsample from mmap'd shards ...")
         Xs = torch.from_numpy(sv.sample(int(train_sample), seed=cl.seed)).to(dev)
         _normalize_inplace(Xs)
-        print(f"  training subsample on GPU: {Xs.shape[0]} tokens")
+        print(f"  training subsample on GPU: {Xs.shape[0]} tokens "
+              f"({time.time() - tk:.0f}s to gather)")
         if backend == "cagra":
             if K <= cl.cagra.intermediate_graph_degree:
                 raise ValueError(f"K={K} too small for CAGRA; use backend=brute.")
-            assign = lambda Xx, Ch: _assign_cagra(Xx, Ch, cl.cagra, cl.chunk)  # noqa: E731
+            assign = lambda Xx, Ch, desc: _assign_cagra(Xx, Ch, cl.cagra, cl.chunk, desc=desc)  # noqa: E731
         else:
-            assign = lambda Xx, Ch: _assign_brute(Xx, Ch, cl.chunk, cl.kblock)  # noqa: E731
+            assign = lambda Xx, Ch, desc: _assign_brute(Xx, Ch, cl.chunk, cl.kblock, desc=desc)  # noqa: E731
         C, _ = lloyd(Xs, K, cl.iters, assign, seed=cl.seed, chunk=cl.chunk, final_assign=False)
         del Xs
         torch.cuda.empty_cache()
@@ -332,14 +352,12 @@ def main(cfg: DictConfig) -> None:
         X = torch.from_numpy(vecs).to(dev)
         _normalize_inplace(X)
         if backend == "brute":
-            from tqdm import tqdm
-            assign = lambda Xx, Ch: _assign_brute(  # noqa: E731
-                Xx, Ch, cl.chunk, cl.kblock, log_tqdm=lambda r: tqdm(r, desc="assign", leave=False))
+            assign = lambda Xx, Ch, desc: _assign_brute(Xx, Ch, cl.chunk, cl.kblock, desc=desc)  # noqa: E731
             C, lab = lloyd(X, K, cl.iters, assign, seed=cl.seed, chunk=cl.chunk)
         elif backend == "cagra":
             if K <= cl.cagra.intermediate_graph_degree:
                 raise ValueError(f"K={K} too small for CAGRA; use backend=brute.")
-            assign = lambda Xx, Ch: _assign_cagra(Xx, Ch, cl.cagra, cl.chunk)  # noqa: E731
+            assign = lambda Xx, Ch, desc: _assign_cagra(Xx, Ch, cl.cagra, cl.chunk, desc=desc)  # noqa: E731
             C, lab = lloyd(X, K, cl.iters, assign, seed=cl.seed, chunk=cl.chunk)
         elif backend == "flash":
             centroids, labels = kmeans_flash(X, K, cl.iters, seed=cl.seed)
@@ -367,6 +385,21 @@ def main(cfg: DictConfig) -> None:
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"wrote {out_dir}  (total {time.time() - t0:.0f}s)")
+    return out_dir / "centroids.npy", out_dir / "assignments.npy"
+
+
+@hydra.main(config_path="../conf/eval", config_name="cluster", version_base=None)
+def main(cfg: DictConfig) -> None:
+    # Line-buffer stdout so progress shows up live under slurm (-o redirects stdout to a
+    # file, where the default block buffering hides every print until the buffer fills).
+    try:
+        import sys
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    shard_dir = Path(hydra.utils.to_absolute_path(cfg.shard_dir))
+    out_dir = Path(hydra.utils.to_absolute_path(cfg.out_dir))
+    cluster_tokens(shard_dir, out_dir, cfg.clustering)
 
 
 if __name__ == "__main__":

@@ -980,6 +980,8 @@ def build_index(
             alpha=index_cfg.get("alpha", 0.45) if index_cfg else 0.45,
             beta=index_cfg.get("beta", None) if index_cfg else None,
             lambda_=index_cfg.get("lambda_", None) if index_cfg else None,
+            impute_missing=index_cfg.get("impute_missing", False) if index_cfg else False,
+            gap_relative=index_cfg.get("gap_relative", False) if index_cfg else False,
             num_threads=index_cfg.get("num_threads", 0) if index_cfg else 0,
             # Local PGC extension
             clustering=clustering_type,
@@ -1233,6 +1235,8 @@ def load_existing_index(
             alpha=index_cfg.get("alpha", 0.45) if index_cfg else 0.45,
             beta=index_cfg.get("beta", None) if index_cfg else None,
             lambda_=index_cfg.get("lambda_", None) if index_cfg else None,
+            impute_missing=index_cfg.get("impute_missing", False) if index_cfg else False,
+            gap_relative=index_cfg.get("gap_relative", False) if index_cfg else False,
             num_threads=index_cfg.get("num_threads", 0) if index_cfg else 0,
         )
     else:
@@ -1253,6 +1257,7 @@ def main(cfg: DictConfig) -> None:
     canonical_stage_order = [
         "encode_docs",
         "encode_queries",
+        "cluster",
         "build_index",
         "retrieve",
         "delete_index",
@@ -1319,22 +1324,42 @@ def main(cfg: DictConfig) -> None:
             # identity: different M (or clustering) must not share a name, else builds
             # collide and retrieve loads the wrong codebook. m{M} keeps them distinct.
             m = cfg.index.get("pq_subspaces", 32)
+            # If the `cluster` stage will GENERATE the clustering (type=gpu, no explicit
+            # centroids_path), pick a canonical out_dir up front — nested under a per-corpus
+            # dir, named by backend+params — so the index name is stable and the build +
+            # retrieve steps ingest the same files this run produces. The parent dir name
+            # (used as the slug `src` below) needs only to disambiguate clustering *method*
+            # within a corpus, since model+dataset are already in the index name.
+            if clustering_type == "gpu" and "cluster" in stage_set and not cl_cfg.get("centroids_path"):
+                bk = cl_cfg.get("backend", "cagra")
+                name = bk
+                if cl_cfg.get("k"):
+                    name += f"_k{int(cl_cfg.get('k'))}"
+                if cl_cfg.get("train_sample"):
+                    name += f"_s{int(cl_cfg.get('train_sample'))}"
+                gen_dir = (Path(cfg.output.get("clusterings_dir", "clusterings"))
+                           / f"{dataset_slug}_{model_slug}" / name)
+                cl_cfg.centroids_path = str(gen_dir / "centroids.npy")
+                cl_cfg.assignments_path = str(gen_dir / "assignments.npy")
             # For external clustering, "external" alone doesn't say which method produced
             # the centroids — PGC and TAC would both land at _external_m{M} and collide,
             # silently overwriting each other's build. Tag with the provenance dir name
             # (parent of centroids_path, e.g. lotte_pgc_m4t05 / lotte_tac) to keep them
             # distinct and self-documenting.
-            if clustering_type == "external":
+            if clustering_type in ("external", "gpu"):
                 cpath = cl_cfg.get("centroids_path") if cl_cfg else None
                 src = Path(cpath).parent.name if cpath else "unknown"
-                clustering_slug = f"_external_{src}_m{m}"
+                clustering_slug = f"_{clustering_type}_{src}_m{m}"
             else:
                 clustering_slug = f"_{clustering_type}_m{m}"
         index_name = f"bench_{model_slug}_{dataset_slug}_{index_type}{clustering_slug}"
+        # Re-snapshot the (possibly path-injected) index config for the result rows.
+        index_config = OmegaConf.to_container(cfg.index, resolve=True)
 
         # Track timing for results
         doc_encode_time = 0.0
         query_encode_time = 0.0
+        cluster_time = 0.0
         build_time = 0.0
         disk_mb = 0.0
         n_doc_tokens = 0
@@ -1370,6 +1395,35 @@ def main(cfg: DictConfig) -> None:
             )
             print(f"  Query encode time: {query_encode_time:.2f}s")
             append_stage_marker("encode_queries", "end", dataset_id, index_type)
+
+        # --- Stage: cluster (precompute GPU coarse clustering -> centroids/assignments) ---
+        # Runs scripts/gpu_cluster.py's core in-process and writes the centroids/assignments
+        # that build_index then ingests via clustering=gpu. Checkpoint-skips if they already
+        # exist, so re-running the pipeline is cheap. Needs a cuvs-capable GPU env in THIS
+        # process (cu13 on L40S/A100, cu12 on V100 — both supported).
+        if "cluster" in stage_set:
+            append_stage_marker("cluster", "start", dataset_id, index_type)
+            if index_type != "tachiom":
+                raise ValueError("the 'cluster' stage applies only to index=tachiom.")
+            cl_cfg = cfg.index.clustering
+            if cl_cfg.get("type") != "gpu":
+                raise ValueError(
+                    "stages=[...,cluster,...] requires index/clustering=gpu (it generates the "
+                    "centroids); use clustering=external to ingest a precomputed clustering.")
+            if not shard_dir.exists():
+                raise FileNotFoundError(
+                    f"No doc shards at {shard_dir}; run the encode_docs stage first.")
+            cpath, apath = Path(cl_cfg.centroids_path), Path(cl_cfg.assignments_path)
+            if cpath.exists() and apath.exists():
+                print(f"\n  Clustering already present at {cpath.parent} — skipping (checkpoint).")
+            else:
+                from gpu_cluster import cluster_tokens
+                print(f"\n  Clustering {shard_dir} -> {cpath.parent} ...")
+                t_cl = time.perf_counter()
+                cluster_tokens(shard_dir, cpath.parent, cl_cfg)
+                cluster_time = time.perf_counter() - t_cl
+                print(f"  Cluster time: {cluster_time:.2f}s")
+            append_stage_marker("cluster", "end", dataset_id, index_type)
 
         # --- Stage: build_index ---
         if "build_index" in stage_set:
@@ -1462,6 +1516,7 @@ def main(cfg: DictConfig) -> None:
                         "n_doc_tokens": n_doc_tokens,
                         "doc_encode_time_s": round(doc_encode_time, 2),
                         "query_encode_time_s": round(query_encode_time, 2),
+                        "cluster_time_s": round(cluster_time, 2),
                         "build_time_s": round(build_time, 2),
                         "disk_mb": round(disk_mb, 2),
                         "index_config": index_config,
@@ -1494,6 +1549,7 @@ def main(cfg: DictConfig) -> None:
                 "n_doc_tokens": n_doc_tokens,
                 "doc_encode_time_s": round(doc_encode_time, 2),
                 "query_encode_time_s": round(query_encode_time, 2),
+                "cluster_time_s": round(cluster_time, 2),
                 "build_time_s": round(build_time, 2),
                 "disk_mb": round(disk_mb, 2),
                 "index_config": index_config,
