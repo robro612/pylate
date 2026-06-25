@@ -1,0 +1,33 @@
+type: gpu
+# GPU coarse clustering (scripts/gpu_cluster.py). Produces centroids/assignments that
+# the CPU tachiom build ingests like `external` (clustering=gpu alias). Needs cuvs-cu13
+# for backend=cagra (see pyproject `gpu` extra). Run on L40S/A100, not V100.
+
+backend: cagra        # brute (pytorch exact) | cagra (CAGRA-guided Lloyd = GPU-PGC) | flash
+k: null               # total_centroids; null -> tachiom auto_build_params (matches CPU TAC/PGC)
+iters: 10
+seed: 42
+train_sample: null    # null = cluster on all tokens (in-memory, GPU-resident; ok up to ~10s of GB).
+                      # int = subsample this many tokens for the Lloyd iterations (mmap'd) + stream a
+                      # final full assignment. Needed when the corpus exceeds GPU memory (e.g. LoTTE
+                      # 279M tokens = 71.5GB). Set = (PGC sample_multiplier × K) for apples-to-apples.
+
+# pytorch 'brute' backend tiling (VRAM control)
+chunk: 65536          # N-tile size (also CAGRA search batch)
+kblock: 16384         # K-tile size
+
+# CAGRA backend levers (cuVS). metric sqeuclidean on unit vectors == cosine.
+cagra:
+  graph_degree: 64
+  intermediate_graph_degree: 128
+  build_algo: nn_descent      # nn_descent | ivf_pq | ace | iterative_cagra_search
+  itopk_size: 64              # search exploration width (accuracy<->speed)
+  search_width: 1
+  metric: sqeuclidean
+search_topm: 1                # >1 soft top-m update — NOT yet implemented (index assign is hard top-1)
+search_temp: 0.1
+
+# Ingest paths for the CPU index build (clustering=gpu). Written by gpu_cluster.py to
+# out_dir; set these to <out_dir>/centroids.npy and <out_dir>/assignments.npy at build time.
+centroids_path: null
+assignments_path: null

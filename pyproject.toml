@@ -63,11 +63,24 @@ lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
 ]
 image = ["sentence-transformers[image]", "peft >= 0.13.0"]
+# GPU clustering (scripts/gpu_cluster.py backend=cagra/brute). cu13 build — matches the
+# current torch 2.11+cu130 venv; runs on L40S/A100 (NOT V100; cu13 dropped Volta sm_70).
+# A cu12 variant for V100 can be added later as a conflicting extra.
+# NOTE: pypi.nvidia.com wheels report no upload date, so `uv sync` filters them via
+# exclude-newer. Install with uv pip (ignores the lock cutoff):
+#   uv pip install "cuvs-cu13>=25.10" --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match
+gpu = ["cuvs-cu13 >= 25.10; sys_platform == 'linux' and python_version < '3.14'"]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
 
 [tool.uv.sources]
 # To use a local tachiom build instead of PyPI, point this at your checkout.
 # Comment out to fall back to the version constraint above.
 tachiom = { path = "../tachiom", editable = true }
+cuvs-cu13 = { index = "nvidia" }
 
 
 [dependency-groups]

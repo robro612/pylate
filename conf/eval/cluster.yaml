@@ -1,0 +1,20 @@
+# Hydra app root for standalone GPU clustering (scripts/gpu_cluster.py).
+# Composes the SAME clustering config group used by benchmark_indexes (index/clustering),
+# placed at package `clustering`, so backend + CAGRA params have one schema across the
+# clustering run and the downstream index ingest (clustering=gpu).
+#
+#   srunl40s uv run --no-sync python scripts/gpu_cluster.py \
+#     shard_dir=<docs> out_dir=clusterings/<name> \
+#     clustering.backend=cagra clustering.k=262144
+defaults:
+  - index/clustering@clustering: gpu
+  - _self_
+
+shard_dir: ???
+out_dir: ???
+
+hydra:
+  run:
+    dir: ${out_dir}/.hydra
+  job:
+    chdir: false
