@@ -155,6 +155,8 @@ class TachiomIndex(Base):
         alpha: float | None = 0.45,
         beta: int | None = None,
         lambda_: float | None = None,
+        impute_missing: bool = False,
+        gap_relative: bool = False,
         num_threads: int = 0,
         # Local extension: PGC clustering (requires local tachiom build)
         clustering: str = "tac",
@@ -182,11 +184,15 @@ class TachiomIndex(Base):
         self._Tachiom = _Tachiom
         self._auto_build_params = _auto_build_params
 
-        if clustering not in ("tac", "pgc", "external"):
-            raise ValueError(f"clustering must be 'tac', 'pgc', or 'external', got {clustering!r}")
-        if clustering == "external" and not (external_centroids_path and external_assignments_path):
+        if clustering not in ("tac", "pgc", "external", "gpu"):
             raise ValueError(
-                "clustering='external' requires external_centroids_path and external_assignments_path"
+                f"clustering must be 'tac', 'pgc', 'external', or 'gpu', got {clustering!r}"
+            )
+        # 'gpu' (scripts/gpu_cluster.py output) ingests through the same precomputed-centroids
+        # path as 'external'; it only differs in provenance/labeling.
+        if clustering in ("external", "gpu") and not (external_centroids_path and external_assignments_path):
+            raise ValueError(
+                f"clustering={clustering!r} requires external_centroids_path and external_assignments_path"
             )
 
         self.index_folder = index_folder
@@ -211,7 +217,20 @@ class TachiomIndex(Base):
         self.alpha = alpha
         self.beta = beta
         self.lambda_ = lambda_
+        self.impute_missing = impute_missing
+        self.gap_relative = gap_relative
         self.num_threads = num_threads
+
+        # XTR imputation adds a per-query additive constant to every score, which the
+        # default magnitude-band alpha threshold (s_k - |s_k|·alpha) is NOT invariant to,
+        # so it prunes unpredictably. Gap-relative pruning (s_k - alpha·(s_best - s_k)) is
+        # shift-invariant and must be paired with imputation whenever alpha is active.
+        if impute_missing and alpha is not None and not gap_relative:
+            raise ValueError(
+                "impute_missing=True with alpha-pruning requires gap_relative=True "
+                "(the magnitude-band threshold is not shift-invariant, so imputation "
+                "breaks it). Set gap_relative=True, or alpha=None to disable pruning."
+            )
 
         self.clustering = clustering
         self.pgc_n_iter = pgc_n_iter
@@ -562,7 +581,7 @@ class TachiomIndex(Base):
             self.clustering, total_centroids,
         )
 
-        if self.clustering == "external":
+        if self.clustering in ("external", "gpu"):
             centroids = np.ascontiguousarray(
                 np.load(self.external_centroids_path), dtype=np.float32
             )
@@ -699,6 +718,8 @@ class TachiomIndex(Base):
             alpha=self.alpha,
             beta=self.beta,
             lambda_=self.lambda_,
+            impute_missing=self.impute_missing,
+            gap_relative=self.gap_relative,
         )
 
         results = []
@@ -791,6 +812,8 @@ class TachiomIndex(Base):
             f"  alpha={self.alpha}, "
             f"beta={self.beta}, "
             f"lambda_={self.lambda_}, "
+            f"impute_missing={self.impute_missing}, "
+            f"gap_relative={self.gap_relative}, "
             f"num_threads={self.num_threads}\n"
             f")"
         )

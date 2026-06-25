@@ -29,4 +29,17 @@ ef_search: null  # null = auto (1.5 * k_centroids)
 alpha: 0.45      # candidate-pool prune width; set null for max recall with deep k_docs_to_score
 beta: null
 lambda_: null
+# XTR-style imputation of missing per-token coarse scores. When false (default),
+# a doc absent from all probed centroids for a query token scores 0 on that token.
+# When true, each hit is credited best_sim - m_i (m_i = min retrieved centroid sim),
+# which is rank-equivalent to imputing missing contributions with m_i (an upper bound).
+# NOTE: impute_missing=true with alpha-pruning REQUIRES gap_relative=true (below) —
+# imputation adds a per-query constant the magnitude band isn't invariant to. Empirically
+# a clean win for non-XTR-trained models (LateOn: +0.022 NDCG / +0.050 R@100 on lotte);
+# a no-op for XTR-trained models (ModernBERT-XTR), which already internalize it.
+impute_missing: false
+# Gap-relative (shift-invariant) alpha pruning: threshold = s_k - alpha*(s_best - s_k)
+# instead of the magnitude band s_k - |s_k|*alpha. Mandatory when impute_missing=true and
+# alpha is set (TachiomIndex raises otherwise); harmless/usable on its own.
+gap_relative: false
 num_threads: 0
