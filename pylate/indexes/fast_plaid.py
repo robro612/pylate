@@ -8,8 +8,9 @@ from bisect import bisect_left
 
 import numpy as np
 import torch
-from fast_plaid import search
+from fast_plaid import fast_plaid_rust, search
 
+from ..profiling import Span, active
 from ..rank import RerankResult
 from .base import Base
 from .utils import convert_embeddings_to_torch
@@ -389,17 +390,40 @@ class FastPlaid(Base):
                     if doc_id in documents_ids_to_plaid_ids
                 ]
 
-        # Perform search using fast-plaid
-        search_results = self.fast_plaid.search(
-            queries_embeddings=queries_embeddings,
-            top_k=k,
-            batch_size=self.batch_size,
-            n_ivf_probe=self.n_ivf_probe,
-            n_full_scores=self.n_full_scores,
-            show_progress=self.show_progress,
-            subset=plaid_subset,
-            n_processes=self.num_threads,
+        self.last_profile = None
+        prof = active()
+        collect_rust_profile = (
+            prof.enabled
+            and hasattr(fast_plaid_rust, "begin_profile")
+            and hasattr(fast_plaid_rust, "take_profile")
         )
+
+        try:
+            if collect_rust_profile:
+                fast_plaid_rust.begin_profile()
+            # Perform search using fast-plaid
+            search_results = self.fast_plaid.search(
+                queries_embeddings=queries_embeddings,
+                top_k=k,
+                batch_size=self.batch_size,
+                n_ivf_probe=self.n_ivf_probe,
+                n_full_scores=self.n_full_scores,
+                show_progress=self.show_progress,
+                subset=plaid_subset,
+                n_processes=self.num_threads,
+            )
+            if collect_rust_profile:
+                rust_roots = [
+                    Span.from_dict(dict(root)) for root in fast_plaid_rust.take_profile()
+                ]
+                if len(rust_roots) == 1 and rust_roots[0].name == "search":
+                    self.last_profile = rust_roots[0].children
+                else:
+                    self.last_profile = rust_roots
+        except Exception:
+            if collect_rust_profile:
+                fast_plaid_rust.take_profile()
+            raise
 
         # Convert results to expected format
         results = []

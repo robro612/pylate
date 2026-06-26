@@ -164,6 +164,11 @@ evaluation_datasets/
 colbert-training/
 uv.lock
 
+# Local third-party Rust checkouts used by this profiling branch. Keep the
+# checkout contents out of PyLate git; see third_party/README.md.
+third_party/*
+!third_party/README.md
+
 indexes/*
 pylate-index/*
 /docs/api/

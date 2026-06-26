@@ -95,14 +95,23 @@ class BaseRetriever(ABC):
             prof = self.profiler or NULL_PROFILER
             first_root = len(prof.roots)
             n = len(queries_embeddings) if hasattr(queries_embeddings, "__len__") else 1
-            with prof.span("search", count=n, index=type(self.index).__name__) as sp:
-                results = self.index(**kwargs)
-                idx_prof = getattr(self.index, "last_profile", None)
-                if sp is not None and idx_prof:
-                    sp.children.extend(
-                        idx_prof if isinstance(idx_prof, list) else [idx_prof]
-                    )
-            self.last_profile = prof.roots[first_root:]
+            rust_roots_profile = None
+            with use(prof):
+                with prof.span("search", count=n, index=type(self.index).__name__) as sp:
+                    results = self.index(**kwargs)
+                    idx_prof = getattr(self.index, "last_profile", None)
+                    if sp is not None and idx_prof:
+                        rust_spans = idx_prof if isinstance(idx_prof, list) else [idx_prof]
+                        if len(rust_spans) > 1 and all(
+                            rust_span.name == "search" for rust_span in rust_spans
+                        ):
+                            rust_roots_profile = rust_spans
+                        for rust_span in rust_spans:
+                            if rust_span.name == "search" and rust_span.children:
+                                sp.children.extend(rust_span.children)
+                            else:
+                                sp.children.append(rust_span)
+            self.last_profile = rust_roots_profile or prof.roots[first_root:]
             return results
 
         self._validate_subset_token_path(subset)

@@ -57,7 +57,7 @@ api = ["fastapi >= 0.114.1", "uvicorn >= 0.30.6", "batched >= 0.1.2"]
 voyager = ["voyager >= 2.0.9; python_version < '3.14'"]
 scann = ["scann >= 1.4.2; python_version < '3.14'"]
 warp = ["xtr-warp-rs == 2.0.3.*"]
-tachiom = ["tachiom >=0.3.1,<0.4.0"]
+tachiom = ["tachiom >=0.3.0,<0.4.0"]
 flash-maxsim = ["flash-maxsim >= 0.2.1"]
 lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
@@ -77,9 +77,11 @@ url = "https://pypi.nvidia.com"
 explicit = true
 
 [tool.uv.sources]
-# To use a local tachiom build instead of PyPI, point this at your checkout.
-# Comment out to fall back to the version constraint above.
-tachiom = { path = "../tachiom", editable = true }
+# Local Rust-backed dependency forks used by the profiling branch. The checkout
+# contents live under third_party/ locally but are intentionally not vendored.
+fast-plaid = { path = "third_party/fast-plaid", editable = true }
+tachiom = { path = "third_party/tachiom", editable = true }
+xtr-warp-rs = { path = "third_party/xtr-warp-rs", editable = true }
 cuvs-cu13 = { index = "nvidia" }
 
 

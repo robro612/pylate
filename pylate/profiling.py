@@ -81,6 +81,18 @@ class Span:
             "children": [c.to_dict() for c in self.children],
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Span":
+        """Reconstruct a span tree from the JSON-able dict representation."""
+        return cls(
+            name=str(data["name"]),
+            device=str(data.get("device", "cpu")),
+            count=int(data.get("count", 1)),
+            dur_ns=int(data.get("dur_ns", 0)),
+            meta=dict(data.get("meta") or {}),
+            children=[cls.from_dict(c) for c in data.get("children", [])],
+        )
+
     def walk(self, _prefix: str = "") -> Iterator[tuple[str, "Span"]]:
         """Yield ``(stage_path, span)`` for this span and all descendants.
 

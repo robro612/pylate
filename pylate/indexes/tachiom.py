@@ -9,6 +9,7 @@ import warnings
 import numpy as np
 import torch
 
+from ..profiling import Span, active
 from ..rank import RerankResult
 from .base import Base
 
@@ -696,6 +697,9 @@ class TachiomIndex(Base):
             q.squeeze(0) if q.ndim == 3 and q.shape[0] == 1 else q for q in queries_list
         ]
 
+        self.last_profile = None
+        prof = active()
+
         n_queries = len(queries_list)
         lens = [q.shape[0] for q in queries_list]
         tokens = np.ascontiguousarray(np.vstack(queries_list), dtype=np.float32)
@@ -721,16 +725,47 @@ class TachiomIndex(Base):
             impute_missing=self.impute_missing,
             gap_relative=self.gap_relative,
         )
+        collect_rust_profile = (
+            prof.enabled
+            and hasattr(self._index, "begin_profile")
+            and hasattr(self._index, "take_profile")
+        )
         try:
+            if collect_rust_profile:
+                self._index.begin_profile()
             scores, doc_ids = self._index.batch_search(**search_kwargs)
+            if collect_rust_profile:
+                rust_roots = [
+                    Span.from_dict(dict(root)) for root in self._index.take_profile()
+                ]
+                # The retriever already owns the parent "search" span. In the
+                # latency-grade bs=1 path, graft the Rust search internals as
+                # direct children so the existing reducer sees stage names
+                # (`coarse_score`, `candidate_select`, `rerank`) directly.
+                if len(rust_roots) == 1 and rust_roots[0].name == "search":
+                    self.last_profile = rust_roots[0].children
+                else:
+                    self.last_profile = rust_roots
         except TypeError as exc:
+            if collect_rust_profile:
+                self._index.take_profile()
             msg = str(exc)
             optional_kwargs = ("impute_missing", "gap_relative")
             if not any(f"'{name}'" in msg or f'"{name}"' in msg for name in optional_kwargs):
                 raise
             for name in optional_kwargs:
                 search_kwargs.pop(name, None)
+            if collect_rust_profile:
+                self._index.begin_profile()
             scores, doc_ids = self._index.batch_search(**search_kwargs)
+            if collect_rust_profile:
+                rust_roots = [
+                    Span.from_dict(dict(root)) for root in self._index.take_profile()
+                ]
+                if len(rust_roots) == 1 and rust_roots[0].name == "search":
+                    self.last_profile = rust_roots[0].children
+                else:
+                    self.last_profile = rust_roots
 
         results = []
         for query_scores, query_doc_ids in zip(scores, doc_ids):

@@ -1,6 +1,7 @@
 # Unified retrieval profiling
 
-Status: **Python/token-path implemented; rust internals pending**.
+Status: **Python/token-path implemented; Tachiom/FastPlaid rust internals
+implemented; WARP rust internals pending**.
 Goal: high-quality, stage-level timing across every retrieval path so we can
 build stacked-bar comparisons across methods and find real bottlenecks.
 
@@ -12,6 +13,14 @@ edges**.
 ---
 
 ## Current status (2026-06-26)
+
+**Design constraint / memory:** Rust profiling must not add separate
+`*_with_profile` / `*_with_timings` search APIs, profile arguments, or profile
+return payloads. Instrument the normal Rust search path with `tracing`; enable
+collection through a Rust/Python bridge controlled by PyLate's existing
+profiler context; drain the collected tree via `last_profile`. If an
+implementation starts adding alternate timed search functions, stop and refactor
+back to this design before extending it to another backend.
 
 Implemented:
 
@@ -29,8 +38,17 @@ Implemented:
   latency-grade per-query stats. Cached query loading is also attributed
   (`load_cache_arrays`, `reconstruct_query_tensors`) when retrieve reuses cache.
 - Coarse end-to-end index profiling via `search.e2e_profile_batch_size`. Setting
-  it to `1` records one outer search span per query for Tachiom/WARP/PLAID-like
-  paths, but rust-internal stages are not broken out yet.
+  it to `1` records one outer search span per query for WARP/PLAID-like paths.
+- Tachiom rust-internal retrieval profiling via normal `batch_search`: the Rust
+  code emits `tracing` spans on `coarse_hnsw_lookup`, `coarse_accumulate`,
+  `candidate_topk`, `candidate_sort`, `alpha_prune`, `rerank_prepare`,
+  `rerank_score`, `rerank_select`, and `rerank_sort`; the PyO3 bridge toggles
+  collection with `begin_profile()` and drains trees with `take_profile()`.
+  There are no `*_with_profile` search methods and no profile return payloads.
+- FastPlaid rust-internal retrieval profiling via normal `search`: the Rust code
+  emits `tracing` spans on query preparation, IVF lookup/selection, approximate
+  scoring, decompression, exact scoring, final top-k, and materialization. The
+  PyO3 module uses the same `begin_profile()` / `take_profile()` bridge shape.
 - Terminal visualization in `scripts/profview.py` with separate high-contrast
   palettes for query-time, encode, and build sections.
 - Tachiom benchmark config now uses the ColBERT retriever label
@@ -42,18 +60,17 @@ Verified early profiling runs:
 
 - Short nfcorpus ScaNN -> torch MaxSim runs with varied `k_token` completed and
   show increasing query-time latency as the candidate pool grows.
-- Tachiom comparison rows exist both as the older amortized full-batch profile
-  and as a newer `search.e2e_profile_batch_size=1` latency-style profile.
+- Tachiom comparison rows exist both as older coarse `search` profiles and newer
+  bridge-collected retrieval-internal profiles. The latest split run on
+  nfcorpus records separate centroid HNSW lookup, coarse accumulation,
+  candidate top-k/sort/alpha prune, and rerank prepare/score/select/sort stages.
 - Local combined artifact used for inspection:
   `results_profiling_scann_k_sweep_plus_both_tachiom.jsonl`. This is a run
   artifact and should stay out of git.
 
 Still to do:
 
-- Rust/Tachiom internal stages (`coarse_score`, `candidate_select`, `rerank`)
-  need real binding/crate instrumentation. Current Tachiom profiles are coarse
-  outer search spans only.
-- WARP/FastPlaid rust-internal spans are still pending.
+- WARP rust-internal spans are still pending.
 - Deeper build/index-construction profiling inside rust code is still pending;
   the harness currently records coarse build pipeline timing and Python encode
   spans.
@@ -68,12 +85,14 @@ Use the CLI visualizer with `uv run`:
 uv run python scripts/profview.py results_profiling_scann_k_sweep_plus_both_tachiom.jsonl
 ```
 
-Useful filters:
+Useful filters and display controls:
 
 ```bash
 uv run python scripts/profview.py results.jsonl --dataset nfcorpus
 uv run python scripts/profview.py results.jsonl --index scann --backend torch
 uv run python scripts/profview.py results.jsonl --last 10
+uv run python scripts/profview.py results.jsonl --section query,index
+uv run python scripts/profview.py results.jsonl --section query --detail stage
 ```
 
 The visualizer reads normal benchmark JSONL rows. It renders:
@@ -83,7 +102,12 @@ The visualizer reads normal benchmark JSONL rows. It renders:
 - query-time stacked bars from the row's `profile`;
 - query/document encode stacked bars from `query_encode_profile` and
   `doc_encode_profile` when those stages were run with profiling enabled;
-- build pipeline bars from the coarse `*_time_s` fields.
+- index pipeline bars from the coarse `*_time_s` fields.
+
+By default, bars are grouped into semantic buckets so the legend stays small.
+Use `--detail stage` to expand to the raw low-level span names. Use `--section`
+with `query`, `query_encode`, `doc_encode`, `index`, or comma-separated
+combinations to choose which profile surfaces to render.
 
 Do not commit generated result JSONL files, cluster directories, notebooks, or
 Slurm logs. They are inspection artifacts, not source.
@@ -107,9 +131,9 @@ the back half splits into two fundamentally different shapes.
 | ScaNN | token-path | `pylate/indexes/scann.py` | per-token ANN lookup | none |
 | Voyager | token-path | `pylate/indexes/voyager.py` | per-token ANN lookup | none |
 | PLAID (native) | E2E | `pylate/indexes/plaid.py` | torch | none |
-| FastPlaid | E2E (rust) | `fast_plaid.py:393` → `fast-plaid/rust/search/search.rs:471` | IVF score → gather+dedup → approx score → prune → decompress+exact → topk (**5**) | **none** |
+| FastPlaid | E2E (rust) | `fast_plaid.py:393` → `fast-plaid/rust/search/search.rs` | query prepare → centroid score → IVF select/lookup → candidate dedup → approx lookup/score/top-k → decompress → exact lookup/decompress/score → final top-k/materialize | `tracing` spans collected by PyO3 bridge; normal `search`, no timed search variant |
 | WARP / xtr-warp-rs | E2E (rust) | `warp.py:415` → `sharded_scorer.rs:1420` | centroid score → centroid select → residual decompress → merge/rerank (**4**) | `profile.rs` spans exist, **not wired** into `rank()`, env-gated `XTR_WARP_PROFILE` |
-| Tachiom | E2E (rust, local fork) | `tachiom.py:709` → `tachiom/src/tachiom.rs` | coarse-score accumulate (`:564`) → candidate select (`:628`) → rerank (`:659`) (**3**) | `SearchTimings{stage1_ns,stage2_ns,stage3_ns}` + `search_with_timings()` at `:852` **exist but the pyo3 binding doesn't call it** |
+| Tachiom | E2E (rust, local fork) | `tachiom.py:709` → `tachiom/src/tachiom.rs` | centroid HNSW lookup → coarse accumulation → candidate top-k → candidate sort → alpha prune → rerank prepare → rerank score → rerank select → rerank sort (**9**) | `tracing` spans collected by PyO3 bridge; normal `batch_search`, no timed search variant |
 
 Tachiom also has a **build-time clustering sub-stage** (TAC / PGC / GPU-CAGRA /
 external), already represented as the `"cluster"` stage in the harness.
@@ -273,10 +297,9 @@ the no-op path means zero overhead and zero behavior change for existing callers
 The decision: **standardize on `tracing`**, the Rust ecosystem's de-facto
 instrumentation crate, rather than a bespoke per-crate timing module. The whole
 point is that timing is **a tag on top of the logic, never intermingled with
-it**. The current state proves why this matters — tachiom's
-`search_with_timings()` (`tachiom.rs:852`) is a *forked copy* of `search` with
-`Instant::now()` sprinkled through it. That duplicate drifts every time `search`
-changes. `tracing` eliminates the fork.
+it**. Tachiom previously had a forked timing path with `Instant::now()`
+sprinkled through a search duplicate; that duplicate would drift every time
+normal `search` changed. `tracing` eliminates that fork.
 
 ### Instrumentation lives in the crate (one line per stage)
 
@@ -292,13 +315,13 @@ algorithm, so they **survive refactors and rebase cleanly** as a small patch.
 ### Collection lives in our pyo3 wrapper (out of crate tree)
 
 The crate only *emits* spans and has no idea anything is listening. The timing
-tree is built by a custom **`tracing-subscriber` Layer (~60 lines) in the pyo3
-binding**, not in the crate. On span enter/close it records an `Instant`, builds
-the `Span` tree, and on the per-query root span's close ships it out via a
-thread-local the binding drains. **No public API change; no return-payload
-threading.** This is the "one schema, one seam" boundary realized on the rust
-side: the Layer emits the same `Span {name, dur_ns, device, count, meta,
-children}` regardless of crate.
+tree is built by a custom **`tracing-subscriber` Layer in the pyo3 binding**,
+not by the search API. On span enter/close it records an `Instant`, builds the
+`Span` tree, and the binding drains it through a bridge method after the normal
+search call. **No profiled search variant; no return-payload threading.** This
+is the "one schema, one seam" boundary realized on the rust side: the Layer
+emits the same `Span {name, dur_ns, device, count, meta, children}` regardless
+of crate.
 
 - **Per-query association under a parallel batch:** tag the per-query root span
   with a `query_id` field; `tracing`'s span nesting gives the tree for free, and
@@ -311,13 +334,14 @@ children}` regardless of crate.
   `release_max_level_*` filter), spans collapse to a cheap level check, so
   instrumentation stays in hot paths permanently.
 
-### Transport: return sidecar (Tier 1), env JSONL (Tier 2)
+### Transport: bridge drain (Tier 1), env JSONL (Tier 2)
 
-The Layer-built tree is returned **alongside results, gated by a `with_timings`
-flag** (Tier 1 — the benchmarking default): exact per-query attribution,
-thread-safe, grafts straight into the Python tree as a subtree. A `tracing`
-file/flamegraph subscriber (`tracing-chrome`, `tracing-flame`) is the Tier-2
-deep-debug option, replacing xtr-warp's env-gated JSON-lines mode.
+The Layer-built tree is stored out-of-band and drained after the normal search
+call (Tier 1 — the benchmarking default): exact per-query attribution,
+thread-safe, grafts straight into the Python tree as a subtree, and does not
+change search signatures or return values. A `tracing` file/flamegraph
+subscriber (`tracing-chrome`, `tracing-flame`) is the Tier-2 deep-debug option,
+replacing xtr-warp's env-gated JSON-lines mode.
 
 ### Upstream story
 
@@ -331,19 +355,19 @@ advances."
 
 ### Per-crate wiring
 
-- **Tachiom** — replace the forked `search_with_timings()` (`tachiom.rs:852`)
-  with `info_span!` tags on the three stages of `search` itself
-  (`coarse_accumulate` `:564` / `candidate_select` `:628` / `rerank` `:659`), so
-  the timed and untimed paths are the same code. Binding (`python.rs:1138`/`:1214`)
-  attaches the Layer when `with_timings=True`.
+- **Tachiom** — `info_span!` tags live on the three stages of `search` itself
+  (`coarse_accumulate` / `candidate_select` / `rerank`), so the timed and
+  untimed paths are the same code. The binding toggles collection with
+  `begin_profile()`, calls normal `batch_search`, then drains with
+  `take_profile()`.
 - **WARP** — retire `profile.rs` in favor of `tracing` tags on the phases in
   `rank()` (`sharded_scorer.rs:1420`): `centroid_score` (`:617`, `count=B`,
   amortized), `centroid_select` / `residual_decompress` / `merge_rerank`
   (per-query).
-- **FastPlaid** — fresh `tracing` tags at the 5 stage boundaries in
-  `search.rs` (≈ `:491` IVF score, `:534` gather+dedup, `:553` approx score,
-  `:625` decompress+exact, `:658` topk), inside the per-query `search()` so
-  `count=1`.
+- **FastPlaid** — `tracing` tags around query preparation, IVF
+  selection/lookup, candidate deduplication, approximate scoring, decompression,
+  exact scoring, final top-k, and materialization. The bridge drains spans after
+  the normal `search()` call; no profiled search variant.
 
 Each crate needs a `maturin develop` rebuild after instrumentation (uv sync
 fails on cpu nodes for the local fork — rebuild maturin-direct, per project
@@ -451,13 +475,18 @@ Example:
 uv run python scripts/profview.py results_profiling_scann_k_sweep_plus_both_tachiom.jsonl
 ```
 
-Filters:
+Filters and display controls:
 
 ```bash
 uv run python scripts/profview.py results.jsonl --dataset nfcorpus
 uv run python scripts/profview.py results.jsonl --index scann --backend torch
 uv run python scripts/profview.py results.jsonl --last 10
+uv run python scripts/profview.py results.jsonl --section query,index
+uv run python scripts/profview.py results.jsonl --section query --detail stage
 ```
+
+The default `--detail group` mode collapses raw spans into semantic buckets.
+Use `--detail stage` when investigating a specific backend's internals.
 
 A future saved-figure script can reuse the same reduced profile schema, but the
 current committed visualization surface is the terminal CLI.
@@ -472,29 +501,31 @@ current committed visualization surface is the terminal CLI.
    gather / tensor preparation / maxsim / topk / result materialization) +
    `last_profile` seam + `BaseRetriever` opt-in. This also lands the
    GPU-MaxSim backend lever and result metadata.
-3. **Done, coarse only:** end-to-end index profiling can force outer bs=1 spans
-   via `search.e2e_profile_batch_size=1`, enough to compare Tachiom coarse
-   search latency against token-path rows. Internal rust stages are still opaque.
-4. **Pending:** **Tachiom** — `tracing` tags on `search`'s three stages + the collection
-   Layer in the binding; delete the forked `search_with_timings`. Smallest rust
-   change, and it removes existing debt.
+3. **Done, coarse for WARP/PLAID:** end-to-end index profiling can
+   force outer bs=1 spans via `search.e2e_profile_batch_size=1`.
+4. **Done:** **Tachiom** — `tracing` tags on `search`'s retrieval internals plus
+   the collection layer in the binding. The binding toggles/drains the bridge
+   around normal `batch_search`; the forked `search_with_timings` / profiled
+   search API has been removed.
 5. **Pending:** **WARP** — `tracing` tags on `rank()`'s phases; retire
    `profile.rs`.
-6. **Pending:** **FastPlaid** — fresh `tracing` tags at the 5 boundaries.
+6. **Done:** **FastPlaid** — `tracing` tags around the retrieval internals plus
+   the same bridge collection pattern as Tachiom.
 7. **Pending:** saved plot/export script if terminal visualization is not enough.
 
-Phases 1–3 deliver the current comparison without touching any rust crate; 4–6
-progressively light up the E2E internals. The collection Layer (≈60 lines) is
-written once in phase 4 and reused by 5–6 — factor it into a shared internal
-helper rather than copying.
+Phases 1–4 and 6 deliver the current comparison across token-path, Tachiom, and
+FastPlaid retrieval. WARP remains the next E2E backend to light up. The
+collection layer should eventually be factored into a shared helper rather than
+copied across forks.
 
 ---
 
 ## 9. Open questions / risks
 
 - **`tracing` Layer overhead.** Attaching the subscriber adds per-span tree
-  bookkeeping. Gate behind `with_timings`; with no subscriber, tags are a cheap
-  level check, so production batched search is unaffected.
+  bookkeeping. Gate collection behind the PyLate profiler bridge; with no active
+  bridge collection, tags are a cheap level check, so production batched search
+  is unaffected.
 - **CUDA sync cost in aggregate.** Syncing around every span in a tight per-query
   loop serializes the GPU (both the Python `cuda_sync` and the rust
   `tch::Cuda::synchronize` inside GPU-stage spans). Accepted while profiling; off
