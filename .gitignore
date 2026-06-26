@@ -164,6 +164,9 @@ evaluation_datasets/
 colbert-training/
 uv.lock
 
+# Generated local profile visualizations.
+profile_flamegraph*.html
+
 # Local third-party Rust checkouts used by this profiling branch. Keep the
 # checkout contents out of PyLate git; see third_party/README.md.
 third_party/*

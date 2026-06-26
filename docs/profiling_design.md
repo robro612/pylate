@@ -93,6 +93,7 @@ uv run python scripts/profview.py results.jsonl --index scann --backend torch
 uv run python scripts/profview.py results.jsonl --last 10
 uv run python scripts/profview.py results.jsonl --section query,index
 uv run python scripts/profview.py results.jsonl --section query --detail stage
+uv run python scripts/profflame.py results.jsonl --profile query --out profile_flamegraph.html
 ```
 
 The visualizer reads normal benchmark JSONL rows. It renders:
@@ -108,6 +109,13 @@ By default, bars are grouped into semantic buckets so the legend stays small.
 Use `--detail stage` to expand to the raw low-level span names. Use `--section`
 with `query`, `query_encode`, `doc_encode`, `index`, or comma-separated
 combinations to choose which profile surfaces to render.
+
+For a richer browser view, `scripts/profflame.py` writes a standalone HTML
+flamegraph-style page using the same filters and `--detail` controls as
+`profview.py`. Current benchmark JSONL files persist reduced per-stage summaries
+rather than raw span trees, so this is an aggregate icicle over p50/p90/mean
+stage buckets. A true nested flamegraph requires saving raw span trees or an
+additional folded-stack export at collection time.
 
 Do not commit generated result JSONL files, cluster directories, notebooks, or
 Slurm logs. They are inspection artifacts, not source.
@@ -483,13 +491,18 @@ uv run python scripts/profview.py results.jsonl --index scann --backend torch
 uv run python scripts/profview.py results.jsonl --last 10
 uv run python scripts/profview.py results.jsonl --section query,index
 uv run python scripts/profview.py results.jsonl --section query --detail stage
+uv run python scripts/profflame.py results.jsonl --profile query --out profile_flamegraph.html
 ```
 
 The default `--detail group` mode collapses raw spans into semantic buckets.
 Use `--detail stage` when investigating a specific backend's internals.
+`scripts/profflame.py` produces a standalone HTML aggregate flamegraph using the
+same section/detail filters. Because result rows currently store reduced stage
+summaries rather than raw span trees, this browser view is an icicle over the
+selected p50/p90/mean buckets rather than a true nested call-stack flamegraph.
 
-A future saved-figure script can reuse the same reduced profile schema, but the
-current committed visualization surface is the terminal CLI.
+The terminal CLI remains the fastest comparison surface; the HTML exporter is
+the richer drill-down view for wide legends and visual inspection.
 
 ---
 
