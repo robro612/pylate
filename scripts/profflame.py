@@ -4,7 +4,7 @@
 Benchmark artifacts currently store reduced per-stage timing summaries, not raw
 span trees. This exporter maps those summaries to synthetic Speedscope evented
 profiles: each selected run/profile section becomes one profile whose frames are
-the selected p50/p90/mean stage buckets.
+the selected percentile/mean stage buckets.
 
 Future result rows also carry compact histogram bins for `_total` and every
 stage. Use `--histogram-out` to write a companion Vega-Lite HTML report for
@@ -443,7 +443,18 @@ def main() -> None:
     )
     ap.add_argument(
         "--stat",
-        choices=("p50_ms", "p90_ms", "mean_ms"),
+        choices=(
+            "min_ms",
+            "p10_ms",
+            "p25_ms",
+            "p50_ms",
+            "p75_ms",
+            "p90_ms",
+            "p95_ms",
+            "p99_ms",
+            "max_ms",
+            "mean_ms",
+        ),
         default="p50_ms",
         help="profile statistic to render in Speedscope",
     )
