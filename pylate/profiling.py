@@ -195,13 +195,40 @@ def _percentile(sorted_ms: list[float], q: float) -> float:
     return sorted_ms[idx]
 
 
+def _histogram(ms: list[float], bins: int = 20) -> dict[str, Any]:
+    if not ms:
+        return {"edges_ms": [], "counts": []}
+    lo = ms[0]
+    hi = ms[-1]
+    if lo == hi:
+        return {
+            "edges_ms": [round(lo, 4), round(hi, 4)],
+            "counts": [len(ms)],
+        }
+    width = (hi - lo) / bins
+    counts = [0] * bins
+    for value in ms:
+        idx = min(bins - 1, int((value - lo) / width))
+        counts[idx] += 1
+    edges = [round(lo + i * width, 4) for i in range(bins + 1)]
+    return {"edges_ms": edges, "counts": counts}
+
+
 def _stats(ns: list[int]) -> dict[str, Any]:
     ms = sorted(x / 1e6 for x in ns)
     return {
+        "min_ms": round(ms[0], 4) if ms else float("nan"),
+        "p10_ms": round(_percentile(ms, 0.10), 4),
+        "p25_ms": round(_percentile(ms, 0.25), 4),
         "p50_ms": round(_percentile(ms, 0.50), 4),
+        "p75_ms": round(_percentile(ms, 0.75), 4),
         "p90_ms": round(_percentile(ms, 0.90), 4),
+        "p95_ms": round(_percentile(ms, 0.95), 4),
+        "p99_ms": round(_percentile(ms, 0.99), 4),
+        "max_ms": round(ms[-1], 4) if ms else float("nan"),
         "mean_ms": round(sum(ms) / len(ms), 4) if ms else float("nan"),
         "n": len(ms),
+        "histogram": _histogram(ms),
     }
 
 
@@ -215,7 +242,7 @@ def reduce_stage_timings(roots: list[Span]) -> dict[str, Any]:
     a stage is marked ``amortized`` (and gets no latency reading) when any of
     its spans cover more than one query.
 
-    Returns ``{stage: {p50_ms, p90_ms, mean_ms, n, [amortized, count]}, ...}``
+    Returns per-stage stats including percentiles and compact histogram bins,
     plus ``_total`` and ``_maxsim_backend`` keys.
     """
     if not roots:

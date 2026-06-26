@@ -1,19 +1,25 @@
 #!/usr/bin/env python
-"""profflame - write an HTML flamegraph-style view of profiling JSONL rows.
+"""profflame - export profiling JSONL rows to Speedscope.
 
-The benchmark artifacts currently store reduced per-stage timing summaries, not
-raw span trees. This exporter therefore renders an aggregate icicle/flamegraph:
-each selected run/profile section gets a total bar and its p50 stage segments.
+Benchmark artifacts currently store reduced per-stage timing summaries, not raw
+span trees. This exporter maps those summaries to synthetic Speedscope evented
+profiles: each selected run/profile section becomes one profile whose frames are
+the selected p50/p90/mean stage buckets.
+
+Future result rows also carry compact histogram bins for `_total` and every
+stage. Use `--histogram-out` to write a companion Vega-Lite HTML report for
+whole-query and per-stage distributions.
 
 Run:
-  uv run python scripts/profflame.py results.jsonl --out profile.html
+  uv run python scripts/profflame.py results.jsonl --out profile.speedscope.json
   uv run python scripts/profflame.py results.jsonl --profile query --detail stage
+  uv run python scripts/profflame.py results.jsonl --histogram-out profile_hist.html
 """
 
 from __future__ import annotations
 
 import argparse
-import html
+import json
 from pathlib import Path
 from typing import Any
 
@@ -33,29 +39,13 @@ from profview import (
 )
 
 
-def esc(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def fmt_duration(ms: float) -> str:
-    if ms >= 1000:
-        return f"{ms / 1000:.3f} s"
-    return f"{ms:.2f} ms"
-
-
 def row_title(row: dict[str, Any]) -> str:
     dataset = str(row.get("dataset", "")).replace("beir/", "").replace("/test", "")
-    quality = row.get("ndcg@10")
-    qps = row.get("qps")
-    parts = [
-        short_model(row.get("model")),
-        dataset,
-        run_label(row),
-    ]
-    if qps is not None:
-        parts.append(f"{float(qps):.2f} qps")
-    if quality is not None:
-        parts.append(f"nDCG@10 {float(quality):.4f}")
+    parts = [short_model(row.get("model")), dataset, run_label(row)]
+    if row.get("qps") is not None:
+        parts.append(f"{float(row['qps']):.2f} qps")
+    if row.get("ndcg@10") is not None:
+        parts.append(f"nDCG@10 {float(row['ndcg@10']):.4f}")
     return " / ".join(parts)
 
 
@@ -191,18 +181,88 @@ def collect_blocks(
     return blocks
 
 
-def render_segment(name: str, value: float, color: str, total: float, left: float) -> str:
-    width = 100.0 * value / total if total > 0 else 0.0
-    title = f"{name}: {fmt_duration(value)} ({width:.1f}%)"
-    label = name if width >= 6.0 else ""
-    return (
-        f'<div class="seg" style="left:{left:.5f}%;width:{width:.5f}%;'
-        f'background:{esc(color)}" title="{esc(title)}">'
-        f'<span>{esc(label)}</span></div>'
-    )
+def group_for_stage(stage: str) -> str:
+    for group, _color, members in QUERY_GROUPS:
+        if stage in members:
+            return group
+    for group, _color, members in ENCODE_GROUPS:
+        if stage in members:
+            return group
+    return "stage"
 
 
-def render_html(
+class FrameTable:
+    def __init__(self) -> None:
+        self.frames: list[dict[str, str]] = []
+        self.by_name: dict[str, int] = {}
+
+    def frame(self, name: str) -> int:
+        if name not in self.by_name:
+            self.by_name[name] = len(self.frames)
+            self.frames.append({"name": name})
+        return self.by_name[name]
+
+
+def append_interval(
+    events: list[dict[str, Any]],
+    frame: int,
+    start: float,
+    end: float,
+) -> None:
+    if end <= start:
+        return
+    events.append({"type": "O", "at": round(start, 6), "frame": frame})
+    events.append({"type": "C", "at": round(end, 6), "frame": frame})
+
+
+def block_to_profile(block: dict[str, Any], frames: FrameTable, detail: str) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    root_name = f"{block['run']} / {block['section']}"
+    root_frame = frames.frame(root_name)
+    section_frame = frames.frame(str(block["section"]))
+    total = float(block["total"])
+
+    events.append({"type": "O", "at": 0.0, "frame": root_frame})
+    events.append({"type": "O", "at": 0.0, "frame": section_frame})
+    cursor = 0.0
+    open_group: str | None = None
+    group_start = 0.0
+    group_frame: int | None = None
+    for stage, value, _color in block["segments"]:
+        duration = float(value)
+        if duration <= 0:
+            continue
+        start = cursor
+        end = cursor + duration
+        if detail == "stage":
+            group = group_for_stage(stage)
+            if open_group != group:
+                if group_frame is not None:
+                    events.append({"type": "C", "at": round(start, 6), "frame": group_frame})
+                open_group = group
+                group_start = start
+                group_frame = frames.frame(group)
+                events.append({"type": "O", "at": round(group_start, 6), "frame": group_frame})
+            append_interval(events, frames.frame(stage), start, end)
+        else:
+            append_interval(events, frames.frame(stage), start, end)
+        cursor = end
+    if group_frame is not None:
+        events.append({"type": "C", "at": round(cursor, 6), "frame": group_frame})
+    events.append({"type": "C", "at": round(total, 6), "frame": section_frame})
+    events.append({"type": "C", "at": round(total, 6), "frame": root_frame})
+
+    return {
+        "type": "evented",
+        "name": root_name,
+        "unit": "milliseconds",
+        "startValue": 0,
+        "endValue": round(total, 6),
+        "events": events,
+    }
+
+
+def write_speedscope(
     path: Path,
     blocks: list[dict[str, Any]],
     *,
@@ -210,142 +270,148 @@ def render_html(
     detail: str,
     stat: str,
 ) -> None:
-    max_total = max((block["total"] for block in blocks), default=1.0)
-    body: list[str] = []
-    for block in blocks:
-        scale_width = 100.0 * block["total"] / max_total if max_total > 0 else 0.0
-        body.append('<section class="block">')
-        body.append(
-            '<div class="meta">'
-            f'<div><strong>{esc(block["section"])}</strong> '
-            f'<span class="muted">row {block["idx"]}</span></div>'
-            f'<div>{esc(block["run"])}</div>'
-            f'<div class="muted">{esc(block["note"])}</div>'
-            "</div>"
-        )
-        body.append(
-            f'<div class="root" title="total: {esc(fmt_duration(block["total"]))}">'
-            f'<div class="root-scale" style="width:{scale_width:.5f}%"></div>'
-            f'<span>{esc(fmt_duration(block["total"]))}</span>'
-            "</div>"
-        )
-        body.append('<div class="flame">')
-        left = 0.0
-        for name, value, color in block["segments"]:
-            pct = 100.0 * value / block["total"] if block["total"] > 0 else 0.0
-            body.append(render_segment(name, value, color, block["total"], left))
-            left += pct
-        body.append("</div>")
-        body.append("</section>")
+    frames = FrameTable()
+    profiles = [block_to_profile(block, frames, detail) for block in blocks]
+    payload = {
+        "$schema": "https://www.speedscope.app/file-format-schema.json",
+        "exporter": "pylate scripts/profflame.py",
+        "name": f"{source} ({stat}, {detail})",
+        "activeProfileIndex": 0,
+        "shared": {"frames": frames.frames},
+        "profiles": profiles,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n")
 
+
+def iter_profile_sections(
+    row: dict[str, Any],
+    sections: set[str],
+) -> list[tuple[str, dict[str, Any]]]:
+    out: list[tuple[str, dict[str, Any]]] = []
+    if "query" in sections and isinstance(row.get("profile"), dict):
+        out.append(("query", row["profile"]))
+    if "query_encode" in sections and isinstance(row.get("query_encode_profile"), dict):
+        out.append(("query encode", row["query_encode_profile"]))
+    if "doc_encode" in sections and isinstance(row.get("doc_encode_profile"), dict):
+        out.append(("document encode", row["doc_encode_profile"]))
+    return out
+
+
+def histogram_records(rows: list[dict[str, Any]], sections: set[str]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        run = row_title(row)
+        for section, profile in iter_profile_sections(row, sections):
+            for stage, stats in profile.items():
+                if stage.startswith("_") and stage != "_total":
+                    continue
+                if not isinstance(stats, dict):
+                    continue
+                hist = stats.get("histogram")
+                if not isinstance(hist, dict):
+                    continue
+                edges = hist.get("edges_ms") or []
+                counts = hist.get("counts") or []
+                if len(edges) != len(counts) + 1:
+                    continue
+                stage_name = "total" if stage == "_total" else stage
+                for left, right, count in zip(edges, edges[1:], counts):
+                    records.append(
+                        {
+                            "row": idx,
+                            "run": run,
+                            "section": section,
+                            "stage": stage_name,
+                            "bin_start_ms": left,
+                            "bin_end_ms": right,
+                            "bin_mid_ms": (float(left) + float(right)) / 2.0,
+                            "count": int(count),
+                            "p50_ms": stats.get("p50_ms"),
+                            "p90_ms": stats.get("p90_ms"),
+                            "p95_ms": stats.get("p95_ms"),
+                            "p99_ms": stats.get("p99_ms"),
+                        }
+                    )
+    return records
+
+
+def write_histogram_html(path: Path, records: list[dict[str, Any]], source: Path) -> None:
+    data = json.dumps(records)
     doc = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>profile flamegraph</title>
+<title>PyLate profile histograms</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
 <style>
-:root {{
-  color-scheme: light;
-  --bg: #f7f7f4;
-  --ink: #1f2328;
-  --muted: #687076;
-  --line: #d8d8d0;
-  --panel: #ffffff;
-}}
-* {{ box-sizing: border-box; }}
 body {{
   margin: 0;
-  padding: 24px;
-  background: var(--bg);
-  color: var(--ink);
+  padding: 20px;
   font: 13px/1.35 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1f2328;
 }}
-h1 {{
-  margin: 0 0 4px;
-  font-size: 22px;
-  font-weight: 700;
-}}
-.subhead {{
-  color: var(--muted);
-  margin-bottom: 20px;
-}}
-.block {{
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 12px;
-  margin: 0 0 12px;
-  box-shadow: 0 1px 2px rgb(31 35 40 / 0.04);
-}}
-.meta {{
-  display: grid;
-  grid-template-columns: minmax(120px, 180px) minmax(280px, 1fr) minmax(120px, 0.8fr);
-  gap: 12px;
-  align-items: baseline;
-  margin-bottom: 8px;
-}}
-.muted {{ color: var(--muted); }}
-.root {{
-  position: relative;
-  height: 18px;
-  border: 1px solid var(--line);
-  background: #efefea;
-  border-radius: 4px;
-  margin-bottom: 4px;
-  overflow: hidden;
-}}
-.root-scale {{
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: #d8dee4;
-}}
-.root span {{
-  position: relative;
-  display: inline-block;
-  padding: 1px 6px;
-  font-weight: 650;
-}}
-.flame {{
-  position: relative;
-  height: 34px;
-  border-radius: 5px;
-  overflow: hidden;
-  background: #ecece7;
-  border: 1px solid var(--line);
-}}
-.seg {{
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  min-width: 1px;
-  border-right: 1px solid rgb(255 255 255 / 0.7);
-  color: #111;
-  overflow: hidden;
-  white-space: nowrap;
-}}
-.seg span {{
-  display: block;
-  padding: 8px 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-weight: 650;
-  text-shadow: 0 1px 0 rgb(255 255 255 / 0.45);
-}}
-@media (max-width: 850px) {{
-  body {{ padding: 12px; }}
-  .meta {{ grid-template-columns: 1fr; gap: 3px; }}
-}}
+h1 {{ margin: 0 0 4px; font-size: 22px; }}
+.subhead {{ color: #687076; margin-bottom: 16px; }}
 </style>
 </head>
 <body>
-<h1>profile flamegraph</h1>
-<div class="subhead">source: {esc(source)} / detail: {esc(detail)} / statistic: {esc(stat)}</div>
-{''.join(body)}
+<h1>PyLate profile histograms</h1>
+<div class="subhead">source: {source}</div>
+<div id="vis"></div>
+<script>
+const values = {data};
+const spec = {{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": {{"values": values}},
+  "resolve": {{"scale": {{"x": "independent", "y": "independent"}}}},
+  "facet": {{
+    "row": {{"field": "run", "type": "nominal", "title": null, "header": {{"labelLimit": 900}}}},
+    "column": {{"field": "section", "type": "nominal", "title": null}}
+  }},
+  "spec": {{
+    "width": 260,
+    "height": 110,
+    "mark": {{"type": "bar", "tooltip": true}},
+    "encoding": {{
+      "x": {{"field": "bin_mid_ms", "type": "quantitative", "title": "ms"}},
+      "x2": {{"field": "bin_end_ms"}},
+      "y": {{"field": "count", "type": "quantitative", "title": "count"}},
+      "color": {{"field": "stage", "type": "nominal", "legend": {{"columns": 2}}}},
+      "tooltip": [
+        {{"field": "stage", "type": "nominal"}},
+        {{"field": "bin_start_ms", "type": "quantitative", "format": ".3f"}},
+        {{"field": "bin_end_ms", "type": "quantitative", "format": ".3f"}},
+        {{"field": "count", "type": "quantitative"}},
+        {{"field": "p50_ms", "type": "quantitative", "format": ".3f"}},
+        {{"field": "p90_ms", "type": "quantitative", "format": ".3f"}},
+        {{"field": "p95_ms", "type": "quantitative", "format": ".3f"}},
+        {{"field": "p99_ms", "type": "quantitative", "format": ".3f"}}
+      ]
+    }}
+  }}
+}};
+vegaEmbed("#vis", spec, {{"actions": true}});
+</script>
 </body>
 </html>
 """
     path.write_text(doc)
+
+
+def filtered_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
+    rows = load_rows(Path(args.file))
+    if args.dataset:
+        rows = [row for row in rows if args.dataset in str(row.get("dataset", ""))]
+    if args.index:
+        rows = [row for row in rows if args.index in str(row.get("index_type", ""))]
+    if args.backend:
+        rows = [row for row in rows if args.backend in str(row.get("maxsim_backend") or "")]
+    if args.last:
+        rows = rows[-args.last :]
+    return rows
 
 
 def main() -> None:
@@ -354,7 +420,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("file", nargs="?", default="results.jsonl")
-    ap.add_argument("--out", default="profile_flamegraph.html")
+    ap.add_argument("--out", default="profile.speedscope.json")
+    ap.add_argument("--histogram-out", help="write a companion Vega-Lite HTML histogram report")
     ap.add_argument("--dataset", help="substring filter on dataset")
     ap.add_argument("--index", help="substring filter on index_type")
     ap.add_argument("--backend", help="substring filter on maxsim_backend")
@@ -378,7 +445,7 @@ def main() -> None:
         "--stat",
         choices=("p50_ms", "p90_ms", "mean_ms"),
         default="p50_ms",
-        help="profile statistic to render",
+        help="profile statistic to render in Speedscope",
     )
     args = ap.parse_args()
     try:
@@ -386,24 +453,29 @@ def main() -> None:
     except argparse.ArgumentTypeError as exc:
         ap.error(str(exc))
 
-    source = Path(args.file)
-    rows = load_rows(source)
-    if args.dataset:
-        rows = [row for row in rows if args.dataset in str(row.get("dataset", ""))]
-    if args.index:
-        rows = [row for row in rows if args.index in str(row.get("index_type", ""))]
-    if args.backend:
-        rows = [row for row in rows if args.backend in str(row.get("maxsim_backend") or "")]
-    if args.last:
-        rows = rows[-args.last :]
-
+    rows = filtered_rows(args)
     blocks = collect_blocks(rows, sections, args.detail, args.stat)
     if not blocks:
         raise SystemExit("no profile blocks matched")
 
     out = Path(args.out)
-    render_html(out, blocks, source=source, detail=args.detail, stat=args.stat)
-    print(f"wrote {out} ({len(blocks)} block(s))")
+    write_speedscope(
+        out,
+        blocks,
+        source=Path(args.file),
+        detail=args.detail,
+        stat=args.stat,
+    )
+    print(f"wrote {out} ({len(blocks)} Speedscope profile(s))")
+
+    if args.histogram_out:
+        records = histogram_records(rows, sections)
+        if not records:
+            print("no histogram bins found; rerun benchmarks with the updated reducer")
+        else:
+            hist_out = Path(args.histogram_out)
+            write_histogram_html(hist_out, records, Path(args.file))
+            print(f"wrote {hist_out} ({len(records)} histogram bin(s))")
 
 
 if __name__ == "__main__":

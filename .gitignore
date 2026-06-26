@@ -165,6 +165,8 @@ colbert-training/
 uv.lock
 
 # Generated local profile visualizations.
+profile*.speedscope.json
+profile_hist*.html
 profile_flamegraph*.html
 
 # Local third-party Rust checkouts used by this profiling branch. Keep the
