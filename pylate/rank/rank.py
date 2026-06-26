@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from typing_extensions import TypedDict
 
+from ..profiling import active
 from ..scores import colbert_scores
 from ..utils import convert_to_tensor as func_convert_to_tensor
 
@@ -44,6 +45,7 @@ def rerank(
     queries_embeddings: list[list[float | int] | np.ndarray | torch.Tensor],
     documents_embeddings: list[list[float | int] | np.ndarray | torch.Tensor],
     device: str = None,
+    maxsim_backend: str | None = None,
 ) -> list[list[RerankResult]]:
     """Rerank the documents based on the queries embeddings.
 
@@ -57,6 +59,10 @@ def rerank(
         The documents embeddings which is a dictionary of documents ids and their embeddings.
     device
         The device to use for the reranking. If None, the device of the queries embeddings will be used.
+    maxsim_backend
+        MaxSim scoring kernel forwarded to :func:`pylate.scores.colbert_scores`
+        as its ``backend`` (``"auto"`` / ``"torch"`` / ``"flash"`` / ``"lik"``).
+        ``None`` defers to the ``PYLATE_SCORES_BACKEND`` env var / ``auto``.
 
     Examples
     --------
@@ -111,48 +117,66 @@ def rerank(
     """
     results = []
 
-    queries_embeddings = reshape_embeddings(embeddings=queries_embeddings)
-    documents_embeddings = reshape_embeddings(embeddings=documents_embeddings)
+    with active().span("reshape_inputs"):
+        queries_embeddings = reshape_embeddings(embeddings=queries_embeddings)
+        documents_embeddings = reshape_embeddings(embeddings=documents_embeddings)
 
     for query_embeddings, query_documents_ids, query_documents_embeddings in zip(
         queries_embeddings, documents_ids, documents_embeddings
     ):
-        query_embeddings = func_convert_to_tensor(query_embeddings)
+        n_candidates = len(query_documents_ids)
+        with active().span("prepare_tensors", n_candidates=n_candidates):
+            query_embeddings = func_convert_to_tensor(query_embeddings)
 
-        query_documents_embeddings = [
-            func_convert_to_tensor(query_document_embeddings)
-            for query_document_embeddings in query_documents_embeddings
-        ]
+            query_documents_embeddings = [
+                func_convert_to_tensor(query_document_embeddings)
+                for query_document_embeddings in query_documents_embeddings
+            ]
 
-        # Pad the documents embeddings
-        query_documents_embeddings = torch.nn.utils.rnn.pad_sequence(
-            query_documents_embeddings, batch_first=True, padding_value=0
-        )
-
-        if device is not None:
-            query_embeddings = query_embeddings.to(device)
-            query_documents_embeddings = query_documents_embeddings.to(device)
-        else:
-            query_documents_embeddings = query_documents_embeddings.to(
-                query_embeddings.device
+            # Pad the documents embeddings
+            query_documents_embeddings = torch.nn.utils.rnn.pad_sequence(
+                query_documents_embeddings, batch_first=True, padding_value=0
             )
+
+        transfer_device = device or str(query_embeddings.device)
+        with active().span(
+            "device_transfer",
+            device="cuda" if str(transfer_device).startswith("cuda") else "cpu",
+            target=transfer_device,
+            n_candidates=n_candidates,
+        ):
+            if device is not None:
+                query_embeddings = query_embeddings.to(device)
+                query_documents_embeddings = query_documents_embeddings.to(device)
+            else:
+                query_documents_embeddings = query_documents_embeddings.to(
+                    query_embeddings.device
+                )
 
         query_scores = colbert_scores(
             queries_embeddings=query_embeddings.unsqueeze(0),
             documents_embeddings=query_documents_embeddings,
+            backend=maxsim_backend,
         )[0]
 
-        scores, sorted_indices = torch.sort(input=query_scores, descending=True)
-        scores = scores.cpu().tolist()
+        with active().span(
+            "topk",
+            device="cuda" if query_scores.is_cuda else "cpu",
+            n_candidates=int(query_scores.shape[0]),
+        ):
+            scores, sorted_indices = torch.sort(input=query_scores, descending=True)
+            scores = scores.cpu().tolist()
+            sorted_indices = sorted_indices.tolist()
 
-        query_documents = [query_documents_ids[idx] for idx in sorted_indices.tolist()]
+        with active().span("result_materialize", n_candidates=n_candidates):
+            query_documents = [query_documents_ids[idx] for idx in sorted_indices]
 
-        results.append(
-            [
-                RerankResult(id=doc_id, score=score)
-                for doc_id, score in zip(query_documents, scores)
-            ]
-        )
+            results.append(
+                [
+                    RerankResult(id=doc_id, score=score)
+                    for doc_id, score in zip(query_documents, scores)
+                ]
+            )
 
     return results
 

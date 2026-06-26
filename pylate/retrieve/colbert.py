@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from ..profiling import active
 from ..rank import RerankResult, rerank
 from .base import BaseRetriever
 
@@ -97,22 +98,27 @@ class ColBERT(BaseRetriever):
         *,
         k: int,
         device: str,
+        maxsim_backend: str | None = None,
     ) -> list[list[RerankResult]]:
-        documents_ids = [
-            list(
-                {
-                    document_id
-                    for query_token_document_ids in query_documents_ids
-                    for document_id in query_token_document_ids
-                }
-            )
-            for query_documents_ids in hits["documents_ids"]
-        ]
-        documents_embeddings = self.index.get_documents_embeddings(documents_ids)
+        with active().span("candidate_dedup", count=len(hits["documents_ids"])):
+            documents_ids = [
+                list(
+                    {
+                        document_id
+                        for query_token_document_ids in query_documents_ids
+                        for document_id in query_token_document_ids
+                    }
+                )
+                for query_documents_ids in hits["documents_ids"]
+            ]
+        n_candidates = sum(len(group) for group in documents_ids)
+        with active().span("gather", count=len(documents_ids), n_candidates=n_candidates):
+            documents_embeddings = self.index.get_documents_embeddings(documents_ids)
         reranked = rerank(
             documents_ids=documents_ids,
             queries_embeddings=batch_queries_embeddings,
             documents_embeddings=documents_embeddings,
             device=device,
+            maxsim_backend=maxsim_backend,
         )
         return [query_results[:k] for query_results in reranked]

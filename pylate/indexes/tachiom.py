@@ -706,7 +706,7 @@ class TachiomIndex(Base):
             offsets = np.zeros(n_queries + 1, dtype=np.uint64)
             np.cumsum(lens, out=offsets[1:])
 
-        scores, doc_ids = self._index.batch_search(
+        search_kwargs = dict(
             tokens=tokens,
             n_queries=n_queries,
             k=k,
@@ -721,6 +721,16 @@ class TachiomIndex(Base):
             impute_missing=self.impute_missing,
             gap_relative=self.gap_relative,
         )
+        try:
+            scores, doc_ids = self._index.batch_search(**search_kwargs)
+        except TypeError as exc:
+            msg = str(exc)
+            optional_kwargs = ("impute_missing", "gap_relative")
+            if not any(f"'{name}'" in msg or f'"{name}"' in msg for name in optional_kwargs):
+                raise
+            for name in optional_kwargs:
+                search_kwargs.pop(name, None)
+            scores, doc_ids = self._index.batch_search(**search_kwargs)
 
         results = []
         for query_scores, query_doc_ids in zip(scores, doc_ids):

@@ -4,7 +4,7 @@ defaults:
 
 type: tachiom
 retrieval:
-  - xtr
+  - colbert
 # Build params (official TachiomIndex interface)
 center_dataset: true
 total_centroids: null  # null = auto via auto_build_params

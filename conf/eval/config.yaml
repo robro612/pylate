@@ -57,6 +57,18 @@ search:
   k: 100
   k_token: 10000
   repeats: 1
+  # Maxsim scoring kernel for the ColBERT token path: auto | torch | flash | lik
+  # (null = the colbert_scores default / PYLATE_SCORES_BACKEND env). flash/lik
+  # need Ampere+ (L40S/A100) and the kernels layered via `uv run --with`.
+  maxsim_backend: null
+  # Collect per-stage span timings. Retrieval writes `profile`; encode stages,
+  # when explicitly enabled in `stages`, write `doc_encode_profile` and
+  # `query_encode_profile`. Query encoding profiles run bs=1 for latency-grade
+  # per-query stats. CUDA-synced, so profiling adds latency.
+  profile: false
+  # Optional outer batch size for end-to-end index profiling (tachiom/warp/plaid).
+  # Set to 1 to get one coarse search span per query. Null keeps normal behavior.
+  e2e_profile_batch_size: null
   metrics:
     - map
     - ndcg@10
