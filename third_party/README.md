@@ -17,6 +17,16 @@ symlinked to:
 `pyproject.toml` points `uv` at these paths through `[tool.uv.sources]`, so
 `uv run` and `uv sync` use local editable builds instead of released wheels.
 
+Push profiling changes to the user forks, not upstream:
+
+- `tachiom`: remote `fork` (`https://github.com/robro612/tachiom.git`)
+- `fast-plaid`: remote `origin` (`https://github.com/robro612/fast-plaid.git`)
+- `xtr-warp-rs`: remote `origin` (`https://github.com/robro612/xtr-warp-rs.git`)
+
+As of this profiling pass, Tachiom and FastPlaid have committed `tracing`
+bridge/search-span changes. WARP / xtr-warp-rs is wired as a local dependency
+but its rust-internal tracing is still pending.
+
 To recreate the local layout in another checkout:
 
 ```bash

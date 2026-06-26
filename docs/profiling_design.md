@@ -94,6 +94,7 @@ uv run python scripts/profview.py results.jsonl --last 10
 uv run python scripts/profview.py results.jsonl --section query,index
 uv run python scripts/profview.py results.jsonl --section query --detail stage
 uv run python scripts/profflame.py results.jsonl --profile query --out profile.speedscope.json
+uv run python scripts/profflame.py results.jsonl --profile query --detail stage --stat p95_ms --out profile.speedscope.json
 uv run python scripts/profflame.py results.jsonl --profile query --histogram-out profile_hist.html
 ```
 
@@ -116,9 +117,10 @@ the same filters and `--detail` controls as `profview.py`. Open the result in
 Speedscope, for example at `https://www.speedscope.app/`, or with a local
 Speedscope viewer/extension. Current benchmark JSONL files persist reduced
 per-stage summaries rather than raw span trees, so this is an aggregate
-Speedscope profile over p50/p90/mean stage buckets. A true nested call-stack
-flamegraph requires saving raw span trees or an additional folded-stack export
-at collection time.
+Speedscope profile over the selected statistic (`p50_ms` by default; new rows
+also support `min_ms`, `p10_ms`, `p25_ms`, `p75_ms`, `p95_ms`, `p99_ms`,
+`max_ms`, and `mean_ms`). A true nested call-stack flamegraph requires saving
+raw span trees or an additional folded-stack export at collection time.
 
 New result rows also include compact histogram bins for `_total` and every
 stage, so `--histogram-out profile_hist.html` can render whole-query and
@@ -453,27 +455,43 @@ Pre-req checklist: confirm the extras are actually installed in the venv
 
 Extend, don't replace. The harness already has `canonical_stage_order`,
 `append_stage_marker()` (env `BENCH_STAGE_MARKERS_FILE`), and `*_time_s` fields.
-Add one key per row:
+Profiling adds these optional keys per row:
 
 ```jsonc
 "profile": {
-  "mode": "latency",                // "latency" (bs=1, count==1) | "throughput" (amortized)
-  "stages": {                       // reduced per-stage, ns
-    "encode":       {"p50": ..., "p90": ..., "mean": ..., "n": ..., "count": 1},
-    "index_lookup": {...},
-    "gather":       {...},
-    "maxsim":       {..., "backend": "flash"},
-    "topk":         {...}
-    // count > 1 stages (e.g. WARP centroid_score) carry only "amortized" + "count",
-    // never p50/p90 — the reducer drops percentiles when count != 1.
+  "_root": "retrieve",              // "retrieve" (token path) | "search" (E2E rust)
+  "_total": {
+    "min_ms": 23.1,
+    "p10_ms": 25.4,
+    "p25_ms": 27.0,
+    "p50_ms": 31.2,
+    "p75_ms": 40.8,
+    "p90_ms": 54.6,
+    "p95_ms": 61.3,
+    "p99_ms": 88.9,
+    "max_ms": 95.0,
+    "mean_ms": 35.7,
+    "n": 323,
+    "histogram": {
+      "edges_ms": [23.1, 26.7, "..."],
+      "counts": [42, 87, "..."]
+    }
   },
-  "tree_sample": { ... }            // one full per-query span tree, for drill-down
-}
+  "index_lookup": { "...same stats shape...": "..." },
+  "maxsim": { "...same stats shape...": "..." },
+  "unaccounted": { "...same stats shape...": "..." },
+  "_maxsim_backend": ["torch"]
+},
+"query_encode_profile": { "...same reduced profile shape...": "..." },
+"doc_encode_profile": { "...same reduced profile shape...": "..." }
 ```
 
-Build-time stages (`encode_docs`, `cluster`, `build_index`) already flow through
-the existing `*_time_s` fields; query-time stages become the same shape one
-level down.
+Older result rows only have `p50_ms`, `p90_ms`, `mean_ms`, and `n`. They remain
+readable in both viewers, but cannot produce histogram reports or the newer
+percentile selections. Build-time/index-construction stages currently flow
+through the existing coarse `doc_encode_time_s`, `query_encode_time_s`,
+`cluster_time_s`, and `build_time_s` fields; deeper build/index internals are
+still pending.
 
 ---
 
@@ -500,17 +518,25 @@ uv run python scripts/profview.py results.jsonl --last 10
 uv run python scripts/profview.py results.jsonl --section query,index
 uv run python scripts/profview.py results.jsonl --section query --detail stage
 uv run python scripts/profflame.py results.jsonl --profile query --out profile.speedscope.json
+uv run python scripts/profflame.py results.jsonl --profile query --detail stage --stat p95_ms --out profile.speedscope.json
 uv run python scripts/profflame.py results.jsonl --profile query --histogram-out profile_hist.html
 ```
 
 The default `--detail group` mode collapses raw spans into semantic buckets.
-Use `--detail stage` when investigating a specific backend's internals.
+Use `--detail stage` when investigating a specific backend's internals. Both
+tools accept `--section` / `--profile` aliases with `query`, `query_encode`,
+`doc_encode`, `index`, `all`, or comma-separated combinations.
+
 `scripts/profflame.py` produces Speedscope JSON using the same section/detail
 filters. Because result rows currently store reduced stage summaries rather
 than raw span trees, this browser view is an aggregate profile over the selected
-p50/p90/mean buckets rather than a true nested call-stack flamegraph. Rows
-produced with the updated reducer also carry compact histogram bins, which
-`--histogram-out` turns into a Vega-Lite HTML report.
+statistic rather than a true nested call-stack flamegraph. The Speedscope
+statistic selector accepts `min_ms`, `p10_ms`, `p25_ms`, `p50_ms`, `p75_ms`,
+`p90_ms`, `p95_ms`, `p99_ms`, `max_ms`, and `mean_ms`; older rows only support
+the fields they already contain. Rows produced with the updated reducer also
+carry compact histogram bins, which `--histogram-out` turns into a Vega-Lite
+HTML report. Existing rows from before this reducer change cannot produce real
+histograms because the per-query samples were not persisted.
 
 The terminal CLI remains the fastest comparison surface; Speedscope is the
 richer drill-down view for wide legends and visual inspection.
