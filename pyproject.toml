@@ -63,23 +63,53 @@ lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
 ]
 image = ["sentence-transformers[image]", "peft >= 0.13.0"]
-# GPU clustering (scripts/gpu_cluster.py backend=cagra/brute). cu13 build — matches the
-# current torch 2.11+cu130 venv; runs on L40S/A100 (NOT V100; cu13 dropped Volta sm_70).
-# A cu12 variant for V100 can be added later as a conflicting extra.
-# NOTE: pypi.nvidia.com wheels report no upload date, so `uv sync` filters them via
-# exclude-newer. Install with uv pip (ignores the lock cutoff):
-#   uv pip install "cuvs-cu13>=25.10" --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match
-gpu = ["cuvs-cu13 >= 25.10; sys_platform == 'linux' and python_version < '3.14'"]
+# CUDA build selection (mutually exclusive -- see [tool.uv] conflicts). Pick one
+# at sync time so the same project runs across heterogeneous GPUs:
+#   uv sync --extra cu12   # torch+cu126: V100 (sm_70) .. A100/L40S/H100. Broadest.
+#   uv sync --extra cu13   # torch+cu130: A100/L40S/H100 (cu13 dropped Volta sm_70).
+# torch is pinned to the matching PyTorch index in [tool.uv.sources]; cuvs (the GPU
+# clustering backend for scripts/gpu_cluster.py) follows the same split and is
+# skipped on py3.14 until NVIDIA ships cp314 wheels.
+cu12 = [
+    "torch",
+    "cuvs-cu12 >= 25.10; sys_platform == 'linux' and python_version < '3.14'",
+]
+cu13 = [
+    "torch",
+    "cuvs-cu13 >= 25.10; sys_platform == 'linux' and python_version < '3.14'",
+]
+
+[tool.uv]
+# cu12 and cu13 are mutually exclusive: select exactly one at sync time.
+conflicts = [
+    [{ extra = "cu12" }, { extra = "cu13" }],
+]
 
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.nvidia.com"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu12"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu13"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.uv.sources]
 # To use a local tachiom build instead of PyPI, point this at your checkout.
 # Comment out to fall back to the version constraint above.
 tachiom = { path = "../tachiom", editable = true }
+# torch comes from the PyTorch CUDA index matching the selected extra.
+torch = [
+    { index = "pytorch-cu12", extra = "cu12" },
+    { index = "pytorch-cu13", extra = "cu13" },
+]
+cuvs-cu12 = { index = "nvidia" }
 cuvs-cu13 = { index = "nvidia" }
 
 
