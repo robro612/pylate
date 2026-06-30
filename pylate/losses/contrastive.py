@@ -169,12 +169,54 @@ class Contrastive(nn.Module):
             The labels for the contrastive loss. Not used in this implementation, but kept for compatibility with Trainer.
 
         """
-        embeddings = [
+        return self.loss_from_embeddings(
+            embeddings=self.embed(sentence_features),
+            sentence_features=sentence_features,
+            labels=labels,
+        )
+
+    def embed(
+        self, sentence_features: Iterable[dict[str, Tensor]]
+    ) -> list[torch.Tensor]:
+        """Run the model once per text column and L2-normalize the token embeddings.
+
+        Split out from :meth:`forward` so a wrapper (e.g.
+        :class:`~pylate.losses.CompressionAwareLoss`) can reuse a single model
+        pass and feed the embeddings to :meth:`loss_from_embeddings` more than
+        once (e.g. raw vs. compressed).
+        """
+        return [
             torch.nn.functional.normalize(
                 self.model(sentence_feature)["token_embeddings"], p=2, dim=-1
             )
             for sentence_feature in sentence_features
         ]
+
+    def loss_from_embeddings(
+        self,
+        embeddings: list[torch.Tensor],
+        sentence_features: Iterable[dict[str, Tensor]],
+        labels: torch.Tensor | None = None,
+        masks: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Compute the contrastive loss from already-embedded token tensors.
+
+        Parameters
+        ----------
+        embeddings
+            Per-column token embeddings (anchor first), as returned by
+            :meth:`embed`.
+        sentence_features
+            The tokenized inputs, used to derive the skiplist masks when
+            ``masks`` is not given.
+        labels
+            Unused; kept for Trainer compatibility.
+        masks
+            Optional per-column boolean masks (e.g. for compressed/pooled
+            embeddings whose token axis no longer matches ``sentence_features``).
+            When ``None`` the skiplist + attention masks are derived from
+            ``sentence_features``.
+        """
         # handle the model being wrapped in (D)DP and so require to access module first
         skiplist = (
             self.model.skiplist
@@ -186,9 +228,10 @@ class Contrastive(nn.Module):
             if hasattr(self.model, "do_query_expansion")
             else self.model.module.do_query_expansion
         )
-        masks = extract_skiplist_mask(
-            sentence_features=sentence_features, skiplist=skiplist
-        )
+        if masks is None:
+            masks = extract_skiplist_mask(
+                sentence_features=sentence_features, skiplist=skiplist
+            )
         batch_size = embeddings[0].size(0)
         # Possibly gather the embeddings across devices to have more in-batch negatives.
         if self.gather_across_devices:

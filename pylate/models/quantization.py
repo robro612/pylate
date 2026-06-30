@@ -14,6 +14,9 @@ __all__ = [
     "IdentityQuantizer",
     "ScalarQuantizer",
     "BinaryQuantizer",
+    "CastQuantizer",
+    "SHBQQuantizer",
+    "build_quantizer",
     "QUANTIZERS",
     "StraightThroughEstimator",
 ]
@@ -186,12 +189,278 @@ class BinaryQuantizer(Quantizer):
         return {"scale": self.scale}
 
 
+class CastQuantizer(Quantizer):
+    """Quantize by casting to an explicit output ``dtype``, then back to float.
+
+    The output dtype *is* the knob -- this models "store the embedding in this
+    format," which is what actually happens at serving time:
+
+    * **Float formats** (``float32`` / ``float16`` / ``bfloat16``) use a true IEEE
+      cast (``x.to(dtype).to(x.dtype)``). These are *non-uniform* (denser near
+      zero), so they are not the same as uniform N-bit quantization; ``float32``
+      is a no-op. They carry so much resolution that they are effectively no-ops
+      for QAT, but are available for completeness / inference parity.
+    * **Integer formats** (``int8`` / ``uint8``) use uniform affine quantization to
+      that integer's range, de-quantized back to float so the value lives on the
+      int grid. ``int8`` is symmetric (per-vector max-abs, 127 levels), matching
+      the scrambled-Hadamard int8 query path; ``uint8`` is asymmetric over
+      ``[min, max]`` (255 levels), matching ``quantize_embeddings``.
+
+    Parameters
+    ----------
+    dtype
+        Output format: ``"float32"``, ``"float16"`` (``"fp16"``), ``"bfloat16"``
+        (``"bf16"``), ``"int8"``, or ``"uint8"``.
+    value_range
+        Optional fixed ``(min, max)`` calibration range for the integer formats.
+        ``None`` (default) calibrates dynamically per embedding vector.
+
+    Examples
+    --------
+    >>> import torch
+    >>> CastQuantizer("int8")(torch.randn(2, 8)).shape
+    torch.Size([2, 8])
+    >>> x = torch.randn(2, 8)
+    >>> bool(torch.equal(CastQuantizer("float32")(x), x))  # fp32 is a no-op
+    True
+
+    """
+
+    _FLOAT_DTYPES = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    _INT_DTYPES = {"int8", "uint8"}
+
+    def __init__(
+        self,
+        dtype: str = "int8",
+        value_range: tuple[float, float] | None = None,
+    ) -> None:
+        super().__init__()
+        key = str(dtype).lower().replace("torch.", "")
+        if key not in self._FLOAT_DTYPES and key not in self._INT_DTYPES:
+            valid = sorted({*self._FLOAT_DTYPES, *self._INT_DTYPES})
+            raise ValueError(f"Unknown dtype {dtype!r}. Expected one of {valid}.")
+        # Canonicalize aliases so the saved config is unambiguous.
+        if key in self._FLOAT_DTYPES:
+            self.dtype = {
+                torch.float32: "float32",
+                torch.float16: "float16",
+                torch.bfloat16: "bfloat16",
+            }[self._FLOAT_DTYPES[key]]
+        else:
+            self.dtype = key
+        self.value_range = tuple(value_range) if value_range is not None else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.dtype in self._FLOAT_DTYPES:
+            return x.to(self._FLOAT_DTYPES[self.dtype]).to(x.dtype)
+
+        eps = torch.finfo(x.dtype).eps
+        if self.dtype == "int8":
+            levels = 127
+            if self.value_range is not None:
+                bound = max(abs(self.value_range[0]), abs(self.value_range[1]))
+                scale = torch.full_like(x[..., :1], max(bound, eps)) / levels
+            else:
+                scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / levels
+            return torch.round(x / scale).clamp(-levels, levels) * scale
+
+        # uint8: asymmetric affine over [min, max].
+        levels = 255
+        if self.value_range is not None:
+            xmin = torch.full_like(x[..., :1], float(self.value_range[0]))
+            xmax = torch.full_like(x[..., :1], float(self.value_range[1]))
+        else:
+            xmin = x.amin(dim=-1, keepdim=True)
+            xmax = x.amax(dim=-1, keepdim=True)
+        scale = (xmax - xmin).clamp_min(eps) / levels
+        return torch.round((x - xmin) / scale).clamp(0, levels) * scale + xmin
+
+    def get_config_dict(self) -> dict:
+        return {
+            "dtype": self.dtype,
+            "value_range": list(self.value_range)
+            if self.value_range is not None
+            else None,
+        }
+
+
+def _build_hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Normalized Sylvester--Hadamard matrix of size ``dim`` (power of two).
+
+    Divided by ``sqrt(dim)`` so the matrix is orthonormal (``H @ H == I`` since the
+    Sylvester construction is symmetric). This makes the scrambled-Hadamard
+    transform a norm-preserving rotation, so dot products -- and therefore MaxSim
+    -- are invariant to it.
+    """
+    if dim < 1 or (dim & (dim - 1)):
+        raise ValueError(f"SHBQ dimension must be a power of two, got {dim}.")
+    h = torch.ones((1, 1), dtype=dtype, device=device)
+    while h.shape[0] < dim:
+        h = torch.cat(
+            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0
+        )
+    return h / (dim**0.5)
+
+
+class SHBQQuantizer(Quantizer):
+    """Scrambled-Hadamard quantization: an orthonormal rotation around an inner quantizer.
+
+    Applies a fixed random sign flip followed by a (normalized) Hadamard rotation
+    -- ``r = (x * d) @ H`` -- runs an ``inner`` quantizer **in that rotated space**,
+    then rotates the result back into the original space (``(q @ H) * d``). The
+    rotation is the entire contribution of SHBQ: because it is orthonormal it
+    spreads each coordinate's information evenly, so quantizing the rotated vector
+    loses far less than quantizing the raw one. The de-quantized output stays in
+    the input's coordinate system, so :func:`straight_through` is well defined and
+    the existing MaxSim losses consume it unchanged.
+
+    The inner quantizer is what decides the *format* in the rotated space:
+
+    * ``BinaryQuantizer()`` (default) -- canonical SHBQ binary documents.
+    * ``CastQuantizer("int8")`` -- the scrambled-Hadamard int8 query companion.
+
+    This is exactly ``rotation(inner(rotation^{-1}))``; with ``BinaryQuantizer`` the
+    formulation is identical to a plain sign on the rotated vector.
+
+    Queries and documents must share the same ``(H, d)`` for their scores to match
+    the rotated-space dot product. Since ``H`` is determined by ``dim`` and ``d``
+    by ``seed``, two SHBQ quantizers with the same ``dim`` and ``seed`` are
+    automatically consistent (e.g. an int8-query / binary-document pair).
+
+    Parameters
+    ----------
+    inner
+        Quantizer applied in the rotated space. A :class:`Quantizer` instance, a
+        ``{"type": ..., **config}`` spec, or ``None`` (defaults to
+        :class:`BinaryQuantizer`).
+    dim
+        Embedding dimension (a power of two). If ``None`` it is inferred from the
+        first input and the transform is built lazily.
+    seed
+        Seed for the Rademacher sign vector ``d``. Must match across the query and
+        document quantizers for asymmetric setups.
+
+    Examples
+    --------
+    >>> import torch
+    >>> _ = torch.manual_seed(0)
+    >>> q = SHBQQuantizer(dim=128)  # binary documents
+    >>> q(torch.randn(4, 128)).shape
+    torch.Size([4, 128])
+    >>> # int8 queries score against binary documents (shared dim+seed).
+    >>> query = SHBQQuantizer(inner=CastQuantizer("int8"), dim=128)
+    >>> doc = SHBQQuantizer(inner=BinaryQuantizer(), dim=128)
+    >>> (query(torch.randn(3, 128)) @ doc(torch.randn(5, 128)).T).shape
+    torch.Size([3, 5])
+
+    """
+
+    def __init__(
+        self,
+        inner: "Quantizer | dict | None" = None,
+        dim: int | None = None,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        if inner is None:
+            inner = BinaryQuantizer()
+        elif isinstance(inner, dict):
+            inner = build_quantizer(inner)
+        self.inner = inner
+        self.seed = seed
+        self.dim = dim
+        # Registered (initially empty) so they move with .to()/.cuda() and load
+        # from the state dict; populated by _ensure_transform on first use.
+        self.register_buffer("H", None)
+        self.register_buffer("d", None)
+        if dim is not None:
+            self._ensure_transform(dim, torch.float32, torch.device("cpu"))
+
+    def _ensure_transform(
+        self, dim: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        if self.H is not None and self.H.shape[0] == dim:
+            return
+        if self.dim is not None and dim != self.dim:
+            raise ValueError(
+                f"SHBQQuantizer was configured for dim={self.dim} but received "
+                f"input of dim={dim}."
+            )
+        self.H = _build_hadamard(dim, dtype=dtype, device=device)
+        generator = torch.Generator(device="cpu").manual_seed(self.seed)
+        signs = torch.randint(0, 2, (dim,), generator=generator).to(dtype) * 2 - 1
+        self.d = signs.to(device=device)
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_transform(x.shape[-1], x.dtype, x.device)
+        h = self.H.to(dtype=x.dtype, device=x.device)
+        d = self.d.to(dtype=x.dtype, device=x.device)
+
+        rotated = (x * d) @ h
+        quantized = self.inner(rotated)
+        # Rotate back into the original coordinate system (H is orthonormal and
+        # symmetric, d is its own inverse), so the output is same-space as x.
+        return (quantized @ h) * d
+
+    def get_config_dict(self) -> dict:
+        return {
+            "inner": _friendly_quantizer_spec(self.inner),
+            "dim": self.dim,
+            "seed": self.seed,
+        }
+
+
 # Registry of serializable quantizers, keyed by class name. Custom quantizers
 # can be registered here (or simply passed as a callable, in which case they
 # cannot be serialized -- see StraightThroughEstimator).
 QUANTIZERS: dict[str, type[Quantizer]] = {
-    cls.__name__: cls for cls in (IdentityQuantizer, ScalarQuantizer, BinaryQuantizer)
+    cls.__name__: cls
+    for cls in (
+        IdentityQuantizer,
+        ScalarQuantizer,
+        BinaryQuantizer,
+        CastQuantizer,
+        SHBQQuantizer,
+    )
 }
+
+
+def build_quantizer(spec: "Quantizer | dict | None") -> Quantizer | None:
+    """Build a :class:`Quantizer` from a friendly ``{"type": ..., **config}`` spec.
+
+    Returns the instance unchanged if ``spec`` is already a :class:`Quantizer`, and
+    ``None`` for ``None`` / an empty spec / a spec with no ``type``. Nested specs
+    (e.g. :class:`SHBQQuantizer`'s ``inner``) are resolved recursively by the
+    target class. Unknown types raise, so config typos fail loudly.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, Quantizer):
+        return spec
+    spec = dict(spec)
+    quantizer_type = spec.pop("type", None)
+    if quantizer_type is None:
+        return None
+    if quantizer_type not in QUANTIZERS:
+        raise ValueError(
+            f"Unknown quantizer {quantizer_type!r}. Available: {sorted(QUANTIZERS)}."
+        )
+    return QUANTIZERS[quantizer_type](**spec)
+
+
+def _friendly_quantizer_spec(transform) -> dict | None:
+    """Serialize a quantizer to a friendly ``{"type": ..., **config}`` spec."""
+    if isinstance(transform, Quantizer):
+        return {"type": type(transform).__name__, **transform.get_config_dict()}
+    return None
 
 
 def _build_quantizer(spec: dict | None) -> Quantizer:
