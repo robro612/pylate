@@ -31,7 +31,7 @@ embeddings, using the existing loss functions unchanged.
   asymmetric routing, config round-trip, non-serializable-callable fallback, and an
   end-to-end asymmetric-QAT training + save/reload test.
 
-- **Config-driven runner** (`examples/train/qat_run.py` + `examples/train/configs/`):
+- **Config-driven runner** (`examples/train/train.py` + `examples/train/configs/`):
   enabling/disabling the `quantization` block gives a QAT run or an iso (full-precision)
   baseline from the same script. wandb optional (`--with wandb`; creds in `~/.netrc`).
 
@@ -55,10 +55,10 @@ binarized document embeddings. Saved models:
 ```bash
 cd /exp/rjha/pylate-STE
 # QAT run (int8 query / binary doc):
-srunl40s uv run --with wandb python -u examples/train/qat_run.py \
+srunl40s uv run --with wandb python -u examples/train/train.py \
   --config examples/train/configs/qat_int8_binary_10k.yaml
 # Iso baseline (full precision, identical otherwise):
-srunl40s uv run --with wandb python -u examples/train/qat_run.py \
+srunl40s uv run --with wandb python -u examples/train/train.py \
   --config examples/train/configs/baseline_fp32_10k.yaml
 # Tests:
 srunl40s uv run --extra dev python -m pytest tests/test_quantization.py \

@@ -1,0 +1,36 @@
+# Compression-aware training (CAT): SHBQ-binary documents pooled with Ward, int8
+# queries, mixed against the full-precision loss with lambda. Trains a vanilla
+# model -- the CompressionAwareLoss applies the compression, so no STE module is
+# appended. Apply the matching quantizer (and index-time pooling) at inference.
+run_name: cat-shbq-ward
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/cat-shbq-ward
+dataset: lightonai/lighton-ms-marco-mini
+dataset_config: triplet
+max_train_samples: 512
+eval_fraction: 0.1
+
+compression:
+  enabled: true
+  lambda: 0.5
+  query:
+    quantizer:
+      type: SHBQQuantizer            # Hadamard rotation around an inner quantizer
+      inner: {type: CastQuantizer, dtype: int8}   # int8 queries in the rotated space
+  document:
+    quantizer:
+      type: SHBQQuantizer
+      inner: {type: BinaryQuantizer}   # SHBQ binary documents
+    pooler:
+      name: ward
+      similarity_threshold: 0.7   # adaptive token count; merge tokens above this cosine
+      protected_tokens: 1
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 16
+  learning_rate: 3.0e-6
+  fp16: false
+  bf16: false
+  eval_steps: 10
+  logging_steps: 5

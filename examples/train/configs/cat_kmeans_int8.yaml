@@ -1,0 +1,32 @@
+# Compression-aware training (CAT): int8 documents pooled with spherical k-means
+# to a fixed cluster count, full-precision queries, lambda-mixed with the
+# uncompressed loss. Demonstrates the k-means pooler and num_clusters control.
+run_name: cat-kmeans-int8
+base_model: sentence-transformers/all-MiniLM-L6-v2
+output_dir: output/cat-kmeans-int8
+dataset: lightonai/lighton-ms-marco-mini
+dataset_config: triplet
+max_train_samples: 512
+eval_fraction: 0.1
+
+compression:
+  enabled: true
+  lambda: 0.5
+  # No query block -> queries are left uncompressed (the default).
+  document:
+    quantizer:
+      type: CastQuantizer
+      dtype: int8        # explicit output dtype (float16 / bfloat16 / float32 / int8)
+    pooler:
+      name: kmeans
+      num_clusters: 16    # fixed cluster budget per document (or use pool_factor)
+      protected_tokens: 1
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 16
+  learning_rate: 3.0e-6
+  fp16: false
+  bf16: false
+  eval_steps: 10
+  logging_steps: 5
