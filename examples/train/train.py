@@ -22,6 +22,9 @@ Config schema
     run_name: str
     base_model: str                 # HF id or local path
     output_dir: str
+    base_model: str                 # HF id or local path
+    document_length: int | null     # max doc tokens (ModernBERT defaults huge; set ~300)
+    query_length: int | null        # max query tokens
     dataset: str                    # HF dataset id
     dataset_config: str | null      # HF config name, e.g. "triplet" (omit for RLHN)
     num_negatives: int              # hard negatives/query when the dataset is RLHN-style
@@ -93,7 +96,15 @@ def main() -> None:
     with open(cli_args.config) as f:
         cfg = yaml.safe_load(f)
 
-    model = models.ColBERT(model_name_or_path=cfg["base_model"])
+    # Model kwargs (e.g. document_length / query_length) are forwarded from the
+    # config; ModernBERT-based encoders default to a very long context, so a
+    # sensible document_length keeps memory in check.
+    model_kwargs = {
+        key: cfg[key]
+        for key in ("document_length", "query_length")
+        if cfg.get(key) is not None
+    }
+    model = models.ColBERT(model_name_or_path=cfg["base_model"], **model_kwargs)
 
     # Two mutually exclusive QAT paths:
     #   * `compression:` -> CompressionAwareLoss mixes the base loss over raw and
