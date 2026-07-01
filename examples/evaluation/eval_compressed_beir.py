@@ -60,11 +60,15 @@ def load_beir_hf(dataset: str, split: str = "test"):
     return documents, queries, qrels
 
 
-def load_compressors(model_dir: str):
-    """Return (query_compressor, document_compressor) from <model_dir>/compression.json."""
-    spec_path = os.path.join(model_dir, "compression.json")
-    if not os.path.exists(spec_path):
-        return build_compressor(None), build_compressor(None)  # identity (full precision)
+def load_compressors(spec_path: str | None):
+    """Return (query_compressor, document_compressor) from a compression.json path.
+
+    ``None`` / missing -> identity (full precision). Passing a *different* model's
+    spec applies that compression to this model -- e.g. compressing a
+    full-precision baseline at eval time, to test whether STE training was needed.
+    """
+    if spec_path is None or not os.path.exists(spec_path):
+        return build_compressor(None), build_compressor(None)
     spec = json.load(open(spec_path))
     return build_compressor(spec.get("query")), build_compressor(spec.get("document"))
 
@@ -102,8 +106,9 @@ def brute_force_scores(
     return top_values, top_indices
 
 
-def evaluate_model_on_dataset(model_dir, dataset, k, device):
-    query_compressor, document_compressor = load_compressors(model_dir)
+def evaluate_model_on_dataset(model_dir, dataset, k, device, compression_spec=None):
+    spec_path = compression_spec or os.path.join(model_dir, "compression.json")
+    query_compressor, document_compressor = load_compressors(spec_path)
     model = models.ColBERT(
         model_name_or_path=model_dir,
         document_length=300,
@@ -150,15 +155,24 @@ def main():
     parser.add_argument("--models", required=True, help="Comma-separated model dirs.")
     parser.add_argument("--datasets", default="nfcorpus,scifact,fiqa")
     parser.add_argument("--k", type=int, default=100)
+    parser.add_argument(
+        "--compression_spec",
+        default=None,
+        help="Override the compression applied at eval with this compression.json "
+        "(e.g. apply an STE variant's compressor to the full-precision baseline).",
+    )
+    parser.add_argument("--label", default=None, help="Override the printed model name.")
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     results = {}
     for model_dir in args.models.split(","):
-        name = os.path.basename(os.path.dirname(model_dir.rstrip("/")))
+        name = args.label or os.path.basename(os.path.dirname(model_dir.rstrip("/")))
         results[name] = {}
         for dataset in args.datasets.split(","):
-            metrics = evaluate_model_on_dataset(model_dir, dataset, args.k, device)
+            metrics = evaluate_model_on_dataset(
+                model_dir, dataset, args.k, device, compression_spec=args.compression_spec
+            )
             results[name][dataset] = metrics
             print(f"[{name}] {dataset}: {metrics}", flush=True)
 
