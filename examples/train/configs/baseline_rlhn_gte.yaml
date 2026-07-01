@@ -23,8 +23,8 @@ training:
   num_train_epochs: 3
   per_device_train_batch_size: 48
   per_device_eval_batch_size: 32
-  learning_rate: 3.0e-5
-  warmup_ratio: 0.05
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.1
   bf16: true
   fp16: false
   eval_steps: 500
