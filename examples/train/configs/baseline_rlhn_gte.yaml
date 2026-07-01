@@ -1,0 +1,28 @@
+# Iso baseline for cat_rlhn_gte.yaml: identical recipe, NO compression (plain
+# full-precision contrastive). Train this alongside the CAT run to measure the
+# retrieval-quality gap the compression introduces.
+run_name: baseline-rlhn-gte
+base_model: Alibaba-NLP/gte-modernbert-base
+document_length: 300
+query_length: 32
+output_dir: output/baseline-rlhn-gte
+
+dataset: rlhn/rlhn-100K
+num_negatives: 7
+eval_fraction: 0.005
+evaluator: nanobeir
+nanobeir_datasets: [nfcorpus, fiqa2018, scifact, scidocs, arguana]
+
+# No `compression:` block -> plain Contrastive (full precision).
+
+training:
+  num_train_epochs: 3
+  per_device_train_batch_size: 48
+  per_device_eval_batch_size: 32
+  learning_rate: 3.0e-5
+  warmup_ratio: 0.05
+  bf16: true
+  fp16: false
+  eval_steps: 500
+  logging_steps: 20
+  save_steps: 5000

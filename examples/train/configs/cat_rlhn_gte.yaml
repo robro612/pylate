@@ -10,7 +10,10 @@ output_dir: output/cat-rlhn-gte-shbq
 
 dataset: rlhn/rlhn-100K
 num_negatives: 7
-eval_fraction: 0.005        # small held-out triplet slice for the evaluator
+eval_fraction: 0.005        # tiny held-out slice for eval_loss
+# Retrieval-quality eval (full-precision nDCG@10). Subset keeps each eval cheap.
+evaluator: nanobeir
+nanobeir_datasets: [nfcorpus, fiqa2018, scifact, scidocs, arguana]
 
 compression:
   enabled: true
@@ -25,7 +28,7 @@ compression:
       inner: {type: BinaryQuantizer}
 
 training:
-  num_train_epochs: 1
+  num_train_epochs: 3
   # A100-80GB probe: B=64 fits at 61 GB, B=96 OOMs. 48 leaves headroom for eval /
   # longer batches; bump to 64 to maximize throughput. Effective batch = x num GPUs.
   per_device_train_batch_size: 48

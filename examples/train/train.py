@@ -165,13 +165,27 @@ def main() -> None:
             print("Full-precision (iso) baseline: no quantization module appended.")
         train_loss = losses.Contrastive(model=model)
 
-    # Triplet datasets expose "negative"; flattened RLHN exposes "negative_1..k".
-    negative_column = "negative" if "negative" in eval_dataset.column_names else "negative_1"
-    dev_evaluator = evaluation.ColBERTTripletEvaluator(
-        anchors=eval_dataset["query"],
-        positives=eval_dataset["positive"],
-        negatives=eval_dataset[negative_column],
-    )
+    # Evaluator: "nanobeir" (retrieval nDCG@10 on NanoBEIR -- the meaningful
+    # quality signal, full-precision) or "triplet" (cheap triplet accuracy on the
+    # held-out split). NanoBEIR measures the un-compressed model; the compressed
+    # retrieval payoff is a post-hoc eval that applies the document Compressor.
+    evaluator_name = cfg.get("evaluator", "triplet")
+    eval_batch_size = cfg.get("training", {}).get("per_device_eval_batch_size", 32)
+    if evaluator_name == "nanobeir":
+        dev_evaluator = evaluation.NanoBEIREvaluator(
+            dataset_names=cfg.get("nanobeir_datasets"),  # None -> all NanoBEIR-en
+            batch_size=eval_batch_size,
+        )
+    else:
+        # Triplet datasets expose "negative"; flattened RLHN exposes "negative_1..k".
+        negative_column = (
+            "negative" if "negative" in eval_dataset.column_names else "negative_1"
+        )
+        dev_evaluator = evaluation.ColBERTTripletEvaluator(
+            anchors=eval_dataset["query"],
+            positives=eval_dataset["positive"],
+            negatives=eval_dataset[negative_column],
+        )
 
     # Weights & Biases logging (uses ~/.netrc credentials). Disabled => "none".
     wandb_cfg = cfg.get("wandb") or {}
