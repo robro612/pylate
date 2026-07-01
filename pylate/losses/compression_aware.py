@@ -74,6 +74,8 @@ class CompressionAwareLoss(nn.Module):
         query_compressor: Compressor | None = None,
         document_compressor: Compressor | None = None,
         lam: float = 0.5,
+        lam_end: float | None = None,
+        anneal_steps: int = 0,
     ) -> None:
         super().__init__()
         for required in ("embed", "loss_from_embeddings"):
@@ -83,13 +85,29 @@ class CompressionAwareLoss(nn.Module):
                     f"training: it must expose a callable '{required}'. "
                     "Contrastive is supported."
                 )
-        if not 0.0 <= lam <= 1.0:
-            raise ValueError(f"lam must be in [0, 1], got {lam}.")
+        for value in (lam, lam_end):
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(f"lam values must be in [0, 1], got {value}.")
         self.loss = loss
         self.model = loss.model
         self.query_compressor = query_compressor or Compressor()
         self.document_compressor = document_compressor or Compressor()
+        # Annealing curriculum: lam goes linearly from `lam` (start) to `lam_end`
+        # over `anneal_steps` training steps, then holds. Starting near 1.0 trains
+        # (almost) unquantized first, then ramps compression pressure in as the
+        # representation matures -- avoids the from-scratch collapse / degradation
+        # that heavy compressed-loss weight causes on a random projection.
         self.lam = lam
+        self.lam_end = lam_end
+        self.anneal_steps = anneal_steps
+        self._train_step = 0
+
+    def current_lam(self) -> float:
+        """The lam for the current step (constant unless annealing is configured)."""
+        if self.lam_end is None or self.anneal_steps <= 0:
+            return self.lam
+        frac = min(self._train_step / self.anneal_steps, 1.0)
+        return self.lam + (self.lam_end - self.lam) * frac
 
     def _skiplist(self) -> list[int]:
         # Unwrap (D)DP to reach the model attributes, mirroring the base loss.
@@ -102,6 +120,11 @@ class CompressionAwareLoss(nn.Module):
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
         sentence_features = list(sentence_features)
+        # Advance the annealing schedule only on training forwards (eval-loss
+        # passes run under no_grad and must not consume schedule steps).
+        if torch.is_grad_enabled():
+            self._train_step += 1
+        lam = self.current_lam()
 
         # One model pass shared by both loss terms.
         embeddings = self.loss.embed(sentence_features)
@@ -114,7 +137,7 @@ class CompressionAwareLoss(nn.Module):
 
         # Skip the compressed term entirely when it carries no weight and the
         # pipelines are trivial -- avoids needless scoring on the lam == 1 path.
-        if self.lam >= 1.0 and (
+        if lam >= 1.0 and (
             self.query_compressor.is_identity and self.document_compressor.is_identity
         ):
             return full_loss
@@ -139,7 +162,7 @@ class CompressionAwareLoss(nn.Module):
             masks=compressed_masks,
         )
 
-        return self.lam * full_loss + (1.0 - self.lam) * compressed_loss
+        return lam * full_loss + (1.0 - lam) * compressed_loss
 
 
 def build_compression_aware_loss(
@@ -149,18 +172,25 @@ def build_compression_aware_loss(
 
     ``spec`` is the ``compression:`` mapping used by the training runner::
 
-        {"lambda": 0.5,
+        {"lambda": 0.5,                 # (start) weight on the full-precision loss
+         "lambda_end": 0.25,            # optional: anneal lambda to this value ...
+         "anneal_steps": 970,           # ... linearly over this many training steps
          "query":    {"quantizer": {...}, "pooler": {...}},
          "document": {"quantizer": {...}, "pooler": {...}}}
 
-    The per-side ``query`` / ``document`` blocks are passed to
+    With ``lambda_end`` + ``anneal_steps`` this is a curriculum: start near
+    ``lambda`` (e.g. 1.0 = unquantized) and ramp compression pressure in. The
+    per-side ``query`` / ``document`` blocks are passed to
     :func:`pylate.models.build_compressor`, so the same config atoms drive both
     training and index-time compression.
     """
     spec = spec or {}
+    lam_end = spec.get("lambda_end")
     return CompressionAwareLoss(
         loss=base_loss,
         query_compressor=build_compressor(spec.get("query")),
         document_compressor=build_compressor(spec.get("document")),
         lam=float(spec.get("lambda", 0.5)),
+        lam_end=None if lam_end is None else float(lam_end),
+        anneal_steps=int(spec.get("anneal_steps", 0)),
     )
