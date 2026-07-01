@@ -23,7 +23,8 @@ nanobeir_datasets: [nfcorpus, fiqa2018, scifact, scidocs, arguana]
 
 compression:
   enabled: true
-  lambda: 0.5
+  lambda: 0.9  # 0.5 from a random projection collapses; QAT-finetune from a
+                # trained baseline (base_model=<baseline>/final) to use a heavier compression weight
   query:
     quantizer:
       type: SHBQQuantizer
