@@ -7,6 +7,10 @@ document_length: 300
 query_length: 32
 output_dir: output/baseline-rlhn-gte
 
+wandb:
+  enabled: true
+  project: pylate-cat
+
 dataset: rlhn/rlhn-100K
 num_negatives: 7
 eval_fraction: 0.005

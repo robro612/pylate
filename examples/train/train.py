@@ -191,9 +191,20 @@ def main() -> None:
     wandb_cfg = cfg.get("wandb") or {}
     report_to = "none"
     if wandb_cfg.get("enabled", False):
-        report_to = "wandb"
-        if wandb_cfg.get("project"):
-            os.environ.setdefault("WANDB_PROJECT", wandb_cfg["project"])
+        try:
+            import wandb  # noqa: F401  (creds come from ~/.netrc)
+
+            report_to = "wandb"
+            if wandb_cfg.get("project"):
+                os.environ.setdefault("WANDB_PROJECT", wandb_cfg["project"])
+        except ModuleNotFoundError:
+            # Don't crash a long run over a missing logger: wandb is injected at
+            # launch (`uv run --with wandb ...`), not a project dependency.
+            print(
+                "WARNING: wandb enabled in config but not installed. Relaunch with "
+                "`uv run --with wandb python examples/train/train.py ...`. "
+                "Continuing WITHOUT wandb logging."
+            )
 
     t = cfg.get("training", {})
     batch_size = t.get("per_device_train_batch_size", 16)
