@@ -1165,14 +1165,10 @@ class ColBERT(SentenceTransformer):
                 pooled_embeddings.append(document_embeddings_cpu)
                 continue
 
-            # Compute cosine similarity and convert to condensed distance matrix
-            cos_sim = torch.mm(to_pool, to_pool.t()).numpy()
-            dist_full = 1 - cos_sim
-            # Extract upper triangle as condensed form for scipy linkage
-            condensed = dist_full[np.triu_indices(num_embeddings, k=1)]
-
-            # Hierarchical clustering
-            linkage_matrix = hierarchy.linkage(condensed, method="ward")
+            # Ward linkage is defined over Euclidean observations; pass point
+            # coordinates so scipy computes the required distances internally.
+            linkage_points = to_pool.to(torch.float32).numpy()
+            linkage_matrix = hierarchy.linkage(linkage_points, method="ward")
             labels = hierarchy.fcluster(
                 linkage_matrix, t=num_clusters, criterion="maxclust"
             )

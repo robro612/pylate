@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from pylate import models, rank
+from pylate.models import colbert
 
 
 @pytest.mark.flaky(reruns=3, reruns_delay=5)
@@ -92,3 +94,37 @@ def test_model_creation(**kwargs) -> None:
     assert math.isclose(
         reranked_documents[0][1]["score"], 26.98, rel_tol=0.01, abs_tol=0.01
     )
+
+
+def test_pool_embeddings_hierarchical_passes_points_to_ward(monkeypatch) -> None:
+    """Ward linkage should receive Euclidean observations, not cosine distances."""
+    captured = {}
+
+    def fake_linkage(points, method):
+        captured["points"] = points
+        captured["method"] = method
+        return np.zeros((4, 4), dtype=np.float64)
+
+    def fake_fcluster(linkage_matrix, t, criterion):
+        captured["threshold"] = t
+        captured["criterion"] = criterion
+        return np.array([1, 1, 2, 2, 2])
+
+    monkeypatch.setattr(colbert.hierarchy, "linkage", fake_linkage)
+    monkeypatch.setattr(colbert.hierarchy, "fcluster", fake_fcluster)
+
+    model = object.__new__(models.ColBERT)
+    embeddings = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+
+    pooled = model.pool_embeddings_hierarchical(
+        documents_embeddings=[embeddings],
+        pool_factor=2,
+        protected_tokens=1,
+    )
+
+    assert captured["method"] == "ward"
+    assert captured["points"].shape == (5, 3)
+    assert captured["threshold"] == 2
+    assert captured["criterion"] == "maxclust"
+    assert pooled[0].shape == (3, 3)
+    torch.testing.assert_close(pooled[0][0], embeddings[0])
