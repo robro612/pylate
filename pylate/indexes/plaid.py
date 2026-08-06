@@ -330,13 +330,17 @@ class PLAID(Base):
             )
 
         if self.use_fast:
-            return self._index(
+            results = self._index(
                 queries_embeddings,
                 k=k,
                 subset=subset,
             )
+            self.last_profile = getattr(self._index, "last_profile", None)
+            return results
 
-        return self._index(queries_embeddings, k=k)
+        results = self._index(queries_embeddings, k=k)
+        self.last_profile = getattr(self._index, "last_profile", None)
+        return results
 
     def get_documents_embeddings(
         self, document_ids: list[list[str]]

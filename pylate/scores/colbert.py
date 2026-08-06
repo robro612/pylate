@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 
+from ..profiling import active
 from ..utils.tensor import convert_to_tensor
 
 # FlashUnsupported / LIKUnsupported are the only exceptions we silently fall
@@ -157,48 +158,66 @@ def colbert_scores(
         documents_mask = convert_to_tensor(documents_mask)
 
     resolved = _resolve_backend(backend)
-    if _try_flash(resolved, queries_embeddings, documents_embeddings):
-        try:
-            from ._flash_backend import colbert_scores_flash
-
-            return colbert_scores_flash(
-                queries_embeddings,
-                documents_embeddings,
-                queries_mask=queries_mask,
-                documents_mask=documents_mask,
-            )
-        except FlashUnsupported:
-            if resolved == "flash":
-                raise
-            # auto: try LIK next, else the torch path below.
-    if _try_lik(resolved, queries_embeddings, documents_embeddings):
-        try:
-            from ._lik_backend import colbert_scores_lik
-
-            return colbert_scores_lik(
-                queries_embeddings,
-                documents_embeddings,
-                queries_mask=queries_mask,
-                documents_mask=documents_mask,
-            )
-        except LIKUnsupported:
-            if resolved == "lik":
-                raise
-            # auto: silently fall back to the torch path below.
-
-    scores = torch.einsum(
-        "ash,bth->abst",
-        queries_embeddings,
-        documents_embeddings,
+    device = (
+        "cuda"
+        if isinstance(queries_embeddings, torch.Tensor) and queries_embeddings.is_cuda
+        else "cpu"
     )
+    # One "maxsim" span around the dispatch. `backend` records the *requested*
+    # backend; we overwrite it with the one that actually ran (auto may fall
+    # back). A device="cuda" span is CUDA-synced by the profiler so the timing
+    # reflects kernel execution, not async launch. No-op when not profiling.
+    with active().span("maxsim", device=device, backend=resolved) as msp:
+        if _try_flash(resolved, queries_embeddings, documents_embeddings):
+            try:
+                from ._flash_backend import colbert_scores_flash
 
-    if queries_mask is not None:
-        scores = scores * queries_mask.unsqueeze(1).unsqueeze(3)
+                out = colbert_scores_flash(
+                    queries_embeddings,
+                    documents_embeddings,
+                    queries_mask=queries_mask,
+                    documents_mask=documents_mask,
+                )
+                if msp is not None:
+                    msp.meta["backend"] = "flash"
+                return out
+            except FlashUnsupported:
+                if resolved == "flash":
+                    raise
+                # auto: try LIK next, else the torch path below.
+        if _try_lik(resolved, queries_embeddings, documents_embeddings):
+            try:
+                from ._lik_backend import colbert_scores_lik
 
-    if documents_mask is not None:
-        scores = scores * documents_mask.unsqueeze(0).unsqueeze(2)
-    scores = scores.max(axis=-1).values.sum(axis=-1)
-    return scores
+                out = colbert_scores_lik(
+                    queries_embeddings,
+                    documents_embeddings,
+                    queries_mask=queries_mask,
+                    documents_mask=documents_mask,
+                )
+                if msp is not None:
+                    msp.meta["backend"] = "lik"
+                return out
+            except LIKUnsupported:
+                if resolved == "lik":
+                    raise
+                # auto: silently fall back to the torch path below.
+
+        scores = torch.einsum(
+            "ash,bth->abst",
+            queries_embeddings,
+            documents_embeddings,
+        )
+
+        if queries_mask is not None:
+            scores = scores * queries_mask.unsqueeze(1).unsqueeze(3)
+
+        if documents_mask is not None:
+            scores = scores * documents_mask.unsqueeze(0).unsqueeze(2)
+        scores = scores.max(axis=-1).values.sum(axis=-1)
+        if msp is not None:
+            msp.meta["backend"] = "torch"
+        return scores
 
 
 def colbert_scores_pairwise(

@@ -23,7 +23,10 @@ dependencies = [
     "ujson == 5.12.0",
     "ninja == 1.11.1.4",
     "fastkmeans == 0.5.0",
-    "fast-plaid>=1.4.7,<=1.4.7.2110",
+    # Upper bound relaxed from 1.4.7.2110 so the local profiling build (upstream
+    # 1.6.0 + stage-profile) satisfies it; see [tool.uv.sources] below. 1.6.0
+    # changes search chunking/device placement, so re-baseline fastplaid timings.
+    "fast-plaid>=1.4.7",
 ]
 keywords = []
 
@@ -63,27 +66,84 @@ lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
 ]
 image = ["sentence-transformers[image]", "peft >= 0.13.0"]
-# GPU clustering (scripts/gpu_cluster.py backend=cagra/brute). cu13 build — matches the
-# current torch 2.11+cu130 venv; runs on L40S/A100 (NOT V100; cu13 dropped Volta sm_70).
-# A cu12 variant for V100 can be added later as a conflicting extra.
-# NOTE: pypi.nvidia.com wheels report no upload date, so `uv sync` filters them via
-# exclude-newer. Install with uv pip (ignores the lock cutoff):
-#   uv pip install "cuvs-cu13>=25.10" --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match
-gpu = ["cuvs-cu13 >= 25.10; sys_platform == 'linux' and python_version < '3.14'"]
+# ── CUDA variants ────────────────────────────────────────────────────────────
+# Mutually exclusive (see `conflicts` in [tool.uv]); pick one per environment:
+#
+#   cu130  L40S / A100 / H100 — torch 2.11.0 from PyPI, which ships CUDA 13
+#   cu126  V100              — torch 2.11.0 from the cu126 index; CUDA 13
+#                              dropped Volta sm_70, CUDA 12.6 still has it
+#
+# Same torch *version* either way, so the Rust forks (fast-plaid, tachiom) link
+# the same libtorch API on both node types and their instrumentation is
+# comparable. Only the bundled CUDA runtime differs.
+#
+# `cuvs-*` powers GPU clustering (scripts/gpu_cluster.py backend=cagra/brute).
+# Its pypi.nvidia.com entries carry no upload date, so any `exclude-newer`
+# cutoff filters out every compatible wheel — the global uv.toml has that
+# setting disabled for this project; use per-command `--exclude-newer` instead
+# of turning it back on.
+cu130 = [
+    "torch == 2.11.0",
+    "cuvs-cu13 >= 25.10; sys_platform == 'linux' and python_version < '3.14'",
+]
+cu126 = [
+    "torch == 2.11.0",
+    "cuvs-cu12 >= 25.10; sys_platform == 'linux' and python_version < '3.14'",
+]
 
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.nvidia.com"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
 [tool.uv.sources]
 # To use a local tachiom build instead of PyPI, point this at your checkout.
 # Comment out to fall back to the version constraint above.
 tachiom = { path = "../tachiom", editable = true }
+# Local fast-plaid checkout — required for Rust stage profiling, since the PyPI
+# wheel exports no begin_profile/take_profile and the index silently skips it.
+#
+# NOT editable, deliberately. A maturin editable install is a .pth pointing at
+# `../fast-plaid/python`, so every environment would share the one compiled .so
+# sitting in the source tree — the last build would win, and a cu126 venv would
+# import an extension linked against cu130 libtorch. A regular install puts a
+# per-environment .so in site-packages, which is what makes .venv-cu126 /
+# .venv-cu130 / .venv-profile independent. The cost is that Rust edits need a
+# re-sync (or a `maturin develop` into a specific venv) rather than being picked
+# up live — which a compiled extension requires anyway.
+fast-plaid = { path = "../fast-plaid", editable = false }
 cuvs-cu13 = { index = "nvidia" }
+cuvs-cu12 = { index = "nvidia" }
+# Only the cu126 extra redirects torch; cu130 takes the PyPI wheel, which is
+# already a CUDA 13 build.
+torch = [{ index = "pytorch-cu126", extra = "cu126" }]
+
+[tool.uv]
+# Groups, unlike extras, can be enabled by default — which is the whole point:
+# a bare `uv run` re-syncs, and anything not in the default set gets *pruned*.
+# Keeping the working set in a default group means `uv run` stops uninstalling
+# tachiom / hydra / ranx behind your back. The extras stay as the published
+# install surface for people who `pip install pylate[eval]`.
+default-groups = ["research", "docs"]
+# One environment cannot hold both CUDA variants.
+conflicts = [[{ extra = "cu126" }, { extra = "cu130" }]]
 
 
 [dependency-groups]
+# The everyday research working set, enabled by default (see [tool.uv]). Mirrors
+# the extras rather than duplicating their contents, so the published extras stay
+# the single source of truth for what each one pulls in.
+research = [
+    "pylate[dev,eval,api,scann,voyager,tachiom]",
+    # For rebuilding the Rust forks in place (`maturin develop --features ...`)
+    # without a separate tool install.
+    "maturin >= 1.8.6",
+]
 docs = [
     "mkdocs-material == 9.5.32",
     "mkdocs-awesome-pages-plugin == 2.9.3",

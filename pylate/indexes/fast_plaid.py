@@ -8,8 +8,9 @@ from bisect import bisect_left
 
 import numpy as np
 import torch
-from fast_plaid import search
+from fast_plaid import fast_plaid_rust, search
 
+from ..profiling import active, require_rust_profile, spans_from_rust
 from ..rank import RerankResult
 from .base import Base
 from .utils import convert_embeddings_to_torch
@@ -389,17 +390,48 @@ class FastPlaid(Base):
                     if doc_id in documents_ids_to_plaid_ids
                 ]
 
-        # Perform search using fast-plaid
-        search_results = self.fast_plaid.search(
-            queries_embeddings=queries_embeddings,
-            top_k=k,
-            batch_size=self.batch_size,
-            n_ivf_probe=self.n_ivf_probe,
-            n_full_scores=self.n_full_scores,
-            show_progress=self.show_progress,
-            subset=plaid_subset,
-            n_processes=self.num_threads,
+        self.last_profile = None
+        prof = active()
+        # Rust stages come from the shared stage-profile crate, and only exist if
+        # fast-plaid was built with `--features profile`; require_rust_profile
+        # raises rather than let the run report an empty breakdown.
+        #
+        # The collector is process-global, so stages survive fast-plaid
+        # dispatching the search onto a ThreadPoolExecutor worker. A multi-query
+        # call still sums each stage across queries (see spans_from_rust); use
+        # search.e2e_profile_batch_size=1 for latency-grade stats.
+        collect_rust_profile = prof.enabled and require_rust_profile(
+            fast_plaid_rust,
+            name="fast-plaid",
+            build_hint=(
+                "cd /exp/rjha/fast-plaid && "
+                "maturin develop --features profile --release"
+            ),
         )
+
+        try:
+            if collect_rust_profile:
+                fast_plaid_rust.begin_profile()
+            # Perform search using fast-plaid
+            search_results = self.fast_plaid.search(
+                queries_embeddings=queries_embeddings,
+                top_k=k,
+                batch_size=self.batch_size,
+                n_ivf_probe=self.n_ivf_probe,
+                n_full_scores=self.n_full_scores,
+                show_progress=self.show_progress,
+                subset=plaid_subset,
+                n_processes=self.num_threads,
+            )
+            if collect_rust_profile:
+                self.last_profile = spans_from_rust(
+                    list(fast_plaid_rust.take_profile()),
+                    count=len(queries_embeddings),
+                )
+        except Exception:
+            if collect_rust_profile:
+                fast_plaid_rust.take_profile()
+            raise
 
         # Convert results to expected format
         results = []

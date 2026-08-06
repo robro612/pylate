@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Selects the environment (PYLATE_VENV, default .venv-cu130) and exports
+# UV_PROJECT_ENVIRONMENT for the uv invocations below. See docs/environments.md.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/env.sh"
 # LoTTE head-to-head: GPU-CAGRA clustering vs the best CPU-PGC clustering
 # (lotte_pgc_m4t05), through the IDENTICAL tachiom pipeline — same build params
 # (M=32, hnsw_m=32, alpha=0.45 defaults) and the same kc×kd retrieval grid. The ONLY

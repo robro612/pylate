@@ -58,6 +58,10 @@ def main():
     ap.add_argument("--pgc-empty-strategy", default="split")
     ap.add_argument("--pgc-assign-topm", type=int, default=1)
     ap.add_argument("--pgc-assign-temp", type=float, default=0.1)
+    ap.add_argument("--max-sample-size", type=int, default=None,
+                    help="TAC only: cap the per-token k-means TRAINING sample (None -> "
+                         "auto: max(1M, 2*39*k, n/(2*n_iter))). Lower bounds head-token "
+                         "training cost; keep >= 39*max_k to respect the points/centroid floor.")
     ap.add_argument("--out-dir", type=Path, required=True)
     a = ap.parse_args()
     a.out_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +87,7 @@ def main():
     else:
         centroids, assignments = tachiom.cluster_tac(
             vectors_u16, tids, dl, total_centroids=a.total_centroids, tac_n_iter=a.n_iter,
+            max_sample_size=a.max_sample_size,
             verbose=True,
         )
     print(f"  {a.method} clustering done in {time.time()-tc:.1f}s -> {centroids.shape[0]} centroids")

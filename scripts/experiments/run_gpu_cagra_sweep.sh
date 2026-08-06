@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Selects the environment (PYLATE_VENV, default .venv-cu130) and exports
+# UV_PROJECT_ENVIRONMENT for the uv invocations below. See docs/environments.md.
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/env.sh"
 # trec-covid GPU-PGC (CAGRA-guided Lloyd) fidelity + speed sweep.
 #
 # Question: does CAGRA-guided GPU clustering preserve downstream tachiom retrieval
@@ -8,9 +12,9 @@
 # Design: every condition is clustered to the SAME K and ingested through the SAME
 # precomputed-centroids path (clustering=gpu/external), so the downstream build (PQ ->
 # HNSW -> IVF) and search params are byte-identical — the ONLY variable is the
-# clustering method. Clustering jobs run on V100 via the cu12 sidecar (.venv-cu12; build it
+# clustering method. Clustering jobs run on V100 via the cu12 sidecar (.venv-cu126; build it
 # with scripts/setup_cu12_venv.sh) — V100 allocates faster than L40S. Build+eval run on the
-# cpu partition with the main cu13 .venv.
+# cpu partition with the .venv-cu130.
 #
 # Robustness: sbatch (not srun) so jobs survive the launching session; eval jobs use
 # --dependency=afterok on their clustering job.
@@ -24,8 +28,8 @@ MODEL=lateon_regularized
 DS='[beir/trec-covid]'
 CL=clusterings
 RES=results/gpucagra; mkdir -p "$RES" logs/gpucagra
-UVG="uv run --no-sync python"  # main cu13 .venv (CPU build+eval); --no-sync keeps pip-installed cuvs
-PY_CU12=".venv-cu12/bin/python" # V100 sidecar (Volta sm_70 + cuvs-cu12) for GPU clustering
+UVG="uv run --no-sync python"  # .venv-cu130 (CPU build+eval); --no-sync keeps pip-installed cuvs
+PY_CU12=".venv-cu126/bin/python" # V100 sidecar (Volta sm_70 + cuvs-cu12) for GPU clustering
 
 # CAGRA grid (build_algo|graph_degree|intermediate|itopk). nn_descent baseline +
 # graph-degree / itopk sweep + one ivf_pq point.

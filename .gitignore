@@ -115,8 +115,8 @@ celerybeat.pid
 
 # Environments
 .env
-.venv
-.venv-cu12
+# One venv per CUDA variant x profiling build — see docs/environments.md
+.venv*
 env/
 venv/
 ENV/
@@ -162,7 +162,10 @@ evaluation_datasets/
 
 /test-model/
 colbert-training/
-uv.lock
+# uv.lock IS tracked here, unlike upstream. The four environments
+# (docs/environments.md) are defined as four resolutions of one lockfile, and
+# scripts/sync_env.sh runs `uv sync --locked` — without it committed, a fresh
+# checkout cannot build any of them and the no-drift guarantee is meaningless.
 
 indexes/*
 pylate-index/*
@@ -178,3 +181,8 @@ multirun
 outputs
 results
 runs
+clusterings
+
+# Machine-local checkout symlinks; see third_party/README.md
+third_party/*
+!third_party/README.md

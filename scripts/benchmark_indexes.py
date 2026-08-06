@@ -44,6 +44,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm.auto import tqdm
 
 from pylate import evaluation, indexes, models, retrieve
+from pylate.profiling import active
 
 logger = logging.getLogger(__name__)
 
@@ -334,102 +335,129 @@ def encode_documents_sharded(
             model_kwargs["torch_dtype"] = getattr(torch, dtype_str)
     trust_remote_code = bool(cfg.model.get("trust_remote_code", False))
 
-    model = models.ColBERT(
-        model_name_or_path=model_name,
-        document_length=cfg.doc_length,
-        device="cpu" if use_multi_gpu else None,
-        trust_remote_code=trust_remote_code,
-        **({"model_kwargs": model_kwargs} if model_kwargs else {}),
+    prof = active()
+    n_docs_to_encode = sum(
+        min((idx + 1) * shard_size, num_documents) - idx * shard_size
+        for idx in to_encode
     )
-    if cfg.get("compile", False) and not use_multi_gpu:
-        model = torch.compile(model)
-
-    pool = None
-    if use_multi_gpu:
-        logger.info("Starting multi-GPU encoding pool (%d GPUs).", n_gpus)
-        pool = model.start_multi_process_pool()
-
-    encode_start = time.perf_counter()
-
-    for shard_idx in to_encode:
-        start = shard_idx * shard_size
-        end = min(start + shard_size, num_documents)
-        logger.info("Encoding shard %d/%d (docs %d-%d)", shard_idx + 1, num_shards, start, end - 1)
-
-        shard_token_ids = None
-        if use_multi_gpu:
-            shard_embeddings = model.encode_multi_process(
-                sentences=[_doc_payload(doc) for doc in documents[start:end]],
-                pool=pool,
-                batch_size=cfg.encode.batch_size,
-                is_query=False,
-                pool_factor=pool_factor,
-                protected_tokens=cfg.encode.get("protected_tokens", 1),
+    with prof.span("encode_docs", count=n_docs_to_encode):
+        with prof.span("model_init"):
+            model = models.ColBERT(
+                model_name_or_path=model_name,
+                document_length=cfg.doc_length,
+                device="cpu" if use_multi_gpu else None,
+                trust_remote_code=trust_remote_code,
+                **({"model_kwargs": model_kwargs} if model_kwargs else {}),
             )
-        else:
-            if save_token_ids:
-                # output_value=None returns unfiltered embeddings + mask + input_ids.
-                # Apply the mask here so shards store only valid (non-padding) tokens.
-                encode_result = model.encode(
-                    sentences=[_doc_payload(doc) for doc in documents[start:end]],
-                    batch_size=cfg.encode.batch_size,
-                    is_query=False,
-                    show_progress_bar=True,
-                    pool_factor=pool_factor,
-                    protected_tokens=cfg.encode.get("protected_tokens", 1),
-                    output_value=None,
+            if cfg.get("compile", False) and not use_multi_gpu:
+                model = torch.compile(model)
+
+        pool = None
+        if use_multi_gpu:
+            logger.info("Starting multi-GPU encoding pool (%d GPUs).", n_gpus)
+            with prof.span("start_pool"):
+                pool = model.start_multi_process_pool()
+
+        encode_start = time.perf_counter()
+
+        for shard_idx in to_encode:
+            start = shard_idx * shard_size
+            end = min(start + shard_size, num_documents)
+            n_shard_docs = end - start
+            logger.info("Encoding shard %d/%d (docs %d-%d)", shard_idx + 1, num_shards, start, end - 1)
+
+            shard_token_ids = None
+            with prof.span(
+                "model_encode",
+                device="cuda" if torch.cuda.is_available() and not use_multi_gpu else "cpu",
+                count=n_shard_docs,
+                shard=shard_idx,
+                batch_size=cfg.encode.batch_size,
+            ):
+                if use_multi_gpu:
+                    shard_embeddings = model.encode_multi_process(
+                        sentences=[_doc_payload(doc) for doc in documents[start:end]],
+                        pool=pool,
+                        batch_size=cfg.encode.batch_size,
+                        is_query=False,
+                        pool_factor=pool_factor,
+                        protected_tokens=cfg.encode.get("protected_tokens", 1),
+                    )
+                else:
+                    if save_token_ids:
+                        # output_value=None returns unfiltered embeddings + mask + input_ids.
+                        encode_result = model.encode(
+                            sentences=[_doc_payload(doc) for doc in documents[start:end]],
+                            batch_size=cfg.encode.batch_size,
+                            is_query=False,
+                            show_progress_bar=True,
+                            pool_factor=pool_factor,
+                            protected_tokens=cfg.encode.get("protected_tokens", 1),
+                            output_value=None,
+                        )
+                    else:
+                        shard_embeddings = model.encode(
+                            sentences=[_doc_payload(doc) for doc in documents[start:end]],
+                            batch_size=cfg.encode.batch_size,
+                            is_query=False,
+                            show_progress_bar=True,
+                            pool_factor=pool_factor,
+                            protected_tokens=cfg.encode.get("protected_tokens", 1),
+                        )
+                        encode_result = None
+
+            if not use_multi_gpu and save_token_ids:
+                with prof.span("filter_tokens", count=n_shard_docs, shard=shard_idx):
+                    shard_embeddings = []
+                    shard_token_ids = []
+                    for emb, mask, ids in zip(
+                        encode_result["token_embeddings"],
+                        encode_result["masks"],
+                        encode_result["input_ids"],
+                    ):
+                        filtered = emb[mask]
+                        if hasattr(filtered, "cpu"):
+                            filtered = filtered.cpu().numpy()
+                        shard_embeddings.append(np.asarray(filtered))
+                        filtered_ids = ids[mask]
+                        if hasattr(filtered_ids, "cpu"):
+                            filtered_ids = filtered_ids.cpu().numpy()
+                        shard_token_ids.append(np.asarray(filtered_ids, dtype=np.int64))
+
+            # Convert to numpy, cast to target dtype, and save
+            save_dtype = NUMPY_DTYPES.get(cfg.encode.get("dtype", "fp32"), np.float32)
+            with prof.span("prepare_shard", count=n_shard_docs, shard=shard_idx):
+                doclens = []
+                all_tokens = []
+                for emb in shard_embeddings:
+                    if isinstance(emb, torch.Tensor):
+                        emb = emb.cpu().numpy()
+                    doclens.append(emb.shape[0])
+                    all_tokens.append(emb.astype(save_dtype))
+                concatenated = np.concatenate(all_tokens, axis=0)
+
+            with prof.span("save_shard", count=n_shard_docs, shard=shard_idx):
+                np.save(_shard_path(cache_dir, shard_idx), concatenated)
+                np.save(
+                    _doclens_path(cache_dir, shard_idx),
+                    np.array(doclens, dtype=np.int32),
                 )
-                shard_embeddings = []
-                shard_token_ids = []
-                for emb, mask, ids in zip(
-                    encode_result["token_embeddings"],
-                    encode_result["masks"],
-                    encode_result["input_ids"],
-                ):
-                    filtered = emb[mask]
-                    if hasattr(filtered, "cpu"):
-                        filtered = filtered.cpu().numpy()
-                    shard_embeddings.append(np.asarray(filtered))
-                    filtered_ids = ids[mask]
-                    if hasattr(filtered_ids, "cpu"):
-                        filtered_ids = filtered_ids.cpu().numpy()
-                    shard_token_ids.append(np.asarray(filtered_ids, dtype=np.int64))
-            else:
-                shard_embeddings = model.encode(
-                    sentences=[_doc_payload(doc) for doc in documents[start:end]],
-                    batch_size=cfg.encode.batch_size,
-                    is_query=False,
-                    show_progress_bar=True,
-                    pool_factor=pool_factor,
-                    protected_tokens=cfg.encode.get("protected_tokens", 1),
-                )
-                shard_token_ids = None
 
-        # Convert to numpy, cast to target dtype, and save
-        save_dtype = NUMPY_DTYPES.get(cfg.encode.get("dtype", "fp32"), np.float32)
-        doclens = []
-        all_tokens = []
-        for emb in shard_embeddings:
-            if isinstance(emb, torch.Tensor):
-                emb = emb.cpu().numpy()
-            doclens.append(emb.shape[0])
-            all_tokens.append(emb.astype(save_dtype))
+                if shard_token_ids is not None:
+                    np.save(
+                        _token_ids_path(cache_dir, shard_idx),
+                        np.concatenate(shard_token_ids),
+                    )
 
-        concatenated = np.concatenate(all_tokens, axis=0)
-        np.save(_shard_path(cache_dir, shard_idx), concatenated)
-        np.save(_doclens_path(cache_dir, shard_idx), np.array(doclens, dtype=np.int32))
+        encode_time = time.perf_counter() - encode_start
 
-        if shard_token_ids is not None:
-            np.save(_token_ids_path(cache_dir, shard_idx), np.concatenate(shard_token_ids))
-
-    encode_time = time.perf_counter() - encode_start
-
-    if pool is not None:
-        model.stop_multi_process_pool(pool)
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        with prof.span("cleanup"):
+            if pool is not None:
+                model.stop_multi_process_pool(pool)
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Write metadata
     meta_path.write_text(json.dumps({
@@ -460,14 +488,17 @@ def encode_queries(
 
     if emb_path.exists() and doclens_path.exists():
         logger.info("Loading cached query embeddings.")
-        data = np.load(emb_path)
-        doclens = np.load(doclens_path)
-        embeddings = []
-        offset = 0
-        for length in doclens:
-            emb = torch.from_numpy(data[offset:offset + length].copy()).float()
-            embeddings.append(emb)
-            offset += length
+        with active().span("load_cached_queries", count=len(queries)):
+            with active().span("load_cache_arrays", count=len(queries)):
+                data = np.load(emb_path)
+                doclens = np.load(doclens_path)
+            embeddings = []
+            offset = 0
+            with active().span("reconstruct_query_tensors", count=len(queries)):
+                for length in doclens:
+                    emb = torch.from_numpy(data[offset:offset + length].copy()).float()
+                    embeddings.append(emb)
+                    offset += length
         return embeddings, 0.0
 
     dataset_id = None
@@ -487,42 +518,74 @@ def encode_queries(
             model_kwargs["torch_dtype"] = getattr(torch, dtype_str)
     trust_remote_code = bool(cfg.model.get("trust_remote_code", False))
 
-    model = models.ColBERT(
-        model_name_or_path=model_name,
-        query_length=query_length,
-        trust_remote_code=trust_remote_code,
-        **({"model_kwargs": model_kwargs} if model_kwargs else {}),
-    )
-    if cfg.get("compile", False):
-        model = torch.compile(model)
+    prof = active()
+    with prof.span("encode_queries", count=len(queries)):
+        with prof.span("model_init"):
+            model = models.ColBERT(
+                model_name_or_path=model_name,
+                query_length=query_length,
+                trust_remote_code=trust_remote_code,
+                **({"model_kwargs": model_kwargs} if model_kwargs else {}),
+            )
+            if cfg.get("compile", False):
+                model = torch.compile(model)
 
-    encode_start = time.perf_counter()
-    query_embeddings = model.encode(
-        sentences=list(queries.values()),
-        is_query=True,
-        show_progress_bar=True,
-        batch_size=cfg.encode.query_batch_size,
-    )
-    encode_time = time.perf_counter() - encode_start
-
-    # Save to .npy
-    doclens = []
-    all_tokens = []
-    for emb in query_embeddings:
-        if isinstance(emb, torch.Tensor):
-            emb_np = emb.cpu().numpy()
+        encode_start = time.perf_counter()
+        if prof.enabled:
+            query_embeddings = []
+            for query_text in tqdm(
+                list(queries.values()),
+                desc="Encoding queries (profile bs=1)",
+                unit="query",
+            ):
+                with prof.span(
+                    "encode_query",
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    count=1,
+                    batch_size=1,
+                ):
+                    encoded = model.encode(
+                        sentences=[query_text],
+                        is_query=True,
+                        show_progress_bar=False,
+                        batch_size=1,
+                    )
+                if isinstance(encoded, (list, tuple)):
+                    query_embeddings.append(encoded[0])
+                elif isinstance(encoded, (torch.Tensor, np.ndarray)) and encoded.ndim == 3:
+                    query_embeddings.append(encoded[0])
+                else:
+                    query_embeddings.append(encoded)
         else:
-            emb_np = emb
-        doclens.append(emb_np.shape[0])
-        all_tokens.append(emb_np)
+            query_embeddings = model.encode(
+                sentences=list(queries.values()),
+                is_query=True,
+                show_progress_bar=True,
+                batch_size=cfg.encode.query_batch_size,
+            )
+        encode_time = time.perf_counter() - encode_start
 
-    np.save(emb_path, np.concatenate(all_tokens, axis=0))
-    np.save(doclens_path, np.array(doclens, dtype=np.int32))
+        # Save to .npy
+        with prof.span("prepare_cache", count=len(queries)):
+            doclens = []
+            all_tokens = []
+            for emb in query_embeddings:
+                if isinstance(emb, torch.Tensor):
+                    emb_np = emb.cpu().numpy()
+                else:
+                    emb_np = emb
+                doclens.append(emb_np.shape[0])
+                all_tokens.append(emb_np)
 
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        with prof.span("save_cache", count=len(queries)):
+            np.save(emb_path, np.concatenate(all_tokens, axis=0))
+            np.save(doclens_path, np.array(doclens, dtype=np.int32))
+
+        with prof.span("cleanup"):
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return query_embeddings, encode_time
 
@@ -944,10 +1007,11 @@ def build_index(
             documents_embeddings = load_result
             documents_token_ids = None
         build_start = time.perf_counter()
+        # ScaNN scores on embeddings only; token IDs are a tachiom (TAC) concern,
+        # and ScaNN.add_documents does not accept them.
         index.add_documents(
             documents_ids=doc_ids,
             documents_embeddings=documents_embeddings,
-            documents_token_ids=documents_token_ids,
         )
         build_time = time.perf_counter() - build_start
         del documents_embeddings, documents_token_ids
@@ -1037,8 +1101,18 @@ def benchmark_search(
     warp_outer_batch_size: int | None = None,
     run_save_path: str | None = None,
     metrics: list | None = None,
+    profile: bool = False,
+    maxsim_backend: str | None = None,
+    e2e_profile_batch_size: int | None = None,
 ) -> dict:
-    """Run search on a pre-built index and collect metrics."""
+    """Run search on a pre-built index and collect metrics.
+
+    ``maxsim_backend`` selects the maxsim scoring kernel on the ColBERT token
+    path (scann + colbert): auto | torch | flash | lik; ignored by XTR /
+    end-to-end indices. ``profile`` attaches a CUDA-synced
+    :class:`pylate.Profiler` and records a per-stage ``profile`` breakdown
+    (token path only).
+    """
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1059,17 +1133,56 @@ def benchmark_search(
         retriever = retrieve.ColBERT(index=index)
         retrieve_kwargs = dict(
             queries_embeddings=queries_embeddings, k=k,
-            k_token=k_token, device=device or "cpu",
+            k_token=k_token, device=device or "cpu", maxsim_backend=maxsim_backend,
         )
     else:
         raise ValueError(f"Unknown index_type/retrieval combo: {index_type}/{retrieval}")
+
+    if profile:
+        from pylate.profiling import Profiler
+
+        retriever.profiler = Profiler(cuda_sync=True)
+        # Per-query latency mode: bs=1 makes every stage span count=1 (clean
+        # latency-grade p50/p90) instead of amortizing index_lookup/gather over
+        # a batch. Token path only (retrieve_kwargs carries batch_size there).
+        if "k_token" in retrieve_kwargs:
+            retrieve_kwargs["batch_size"] = 1
+
+    profile_roots = None
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     tracemalloc.start()
 
     search_start = time.perf_counter()
-    if index_type == "warp" and warp_outer_batch_size is not None:
+    if (
+        profile
+        and e2e_profile_batch_size is not None
+        and index_type in ("warp", "plaid", "fast_plaid", "tachiom")
+    ):
+        # End-to-end indexes normally profile as one coarse span over the full
+        # query set. This opt-in path runs smaller outer batches, commonly bs=1,
+        # so the coarse E2E span is latency-grade even before Rust internals are
+        # instrumented.
+        outer_batch_size = max(int(e2e_profile_batch_size), 1)
+        scores = []
+        profile_roots = []
+        for start in tqdm(
+            range(0, len(queries_embeddings), outer_batch_size),
+            desc=f"{index_type} profile batches",
+            unit="batch",
+        ):
+            end = start + outer_batch_size
+            scores.extend(
+                retriever.retrieve(
+                    queries_embeddings=queries_embeddings[start:end],
+                    k=k,
+                )
+            )
+            last = getattr(retriever, "last_profile", None)
+            if last:
+                profile_roots.extend(last)
+    elif index_type == "warp" and warp_outer_batch_size is not None:
         outer_batch_size = max(int(warp_outer_batch_size), 1)
         scores = []
         for start in tqdm(
@@ -1140,12 +1253,22 @@ def benchmark_search(
         metrics=metrics,
     )
 
+    profile_summary = None
+    if profile:
+        from pylate.profiling import reduce_stage_timings
+
+        last = profile_roots if profile_roots is not None else getattr(retriever, "last_profile", None)
+        if last:
+            profile_summary = reduce_stage_timings(last)
+
     return {
         "search_time_s": round(search_time, 4),
         "qps": round(qps, 2),
         "peak_vram_mb": round(peak_vram_bytes / (1024 * 1024), 2),
         "peak_ram_mb": round(peak_ram_bytes / (1024 * 1024), 2),
         "n_queries": n_queries,
+        "maxsim_backend": maxsim_backend,
+        "profile": profile_summary,
         **{k: round(v, 4) for k, v in eval_scores.items()},
     }
 
@@ -1359,6 +1482,8 @@ def main(cfg: DictConfig) -> None:
         # Track timing for results
         doc_encode_time = 0.0
         query_encode_time = 0.0
+        doc_encode_profile = None
+        query_encode_profile = None
         cluster_time = 0.0
         build_time = 0.0
         disk_mb = 0.0
@@ -1369,12 +1494,26 @@ def main(cfg: DictConfig) -> None:
         if "encode_docs" in stage_set:
             append_stage_marker("encode_docs", "start", dataset_id, index_type)
             print(f"\n  Encoding {len(documents)} documents...")
-            shard_dir, doc_encode_time = encode_documents_sharded(
-                model_name=model_name,
-                documents=documents,
-                cache_dir=cache_dir,
-                cfg=cfg,
-            )
+            if cfg.search.get("profile", False):
+                from pylate.profiling import Profiler, reduce_stage_timings, use
+
+                prof = Profiler(cuda_sync=True)
+                with use(prof):
+                    shard_dir, doc_encode_time = encode_documents_sharded(
+                        model_name=model_name,
+                        documents=documents,
+                        cache_dir=cache_dir,
+                        cfg=cfg,
+                    )
+                if prof.roots:
+                    doc_encode_profile = reduce_stage_timings(prof.roots)
+            else:
+                shard_dir, doc_encode_time = encode_documents_sharded(
+                    model_name=model_name,
+                    documents=documents,
+                    cache_dir=cache_dir,
+                    cfg=cfg,
+                )
             print(f"  Encode time: {doc_encode_time:.2f}s")
             append_stage_marker("encode_docs", "end", dataset_id, index_type)
 
@@ -1387,12 +1526,26 @@ def main(cfg: DictConfig) -> None:
         if "encode_queries" in stage_set:
             append_stage_marker("encode_queries", "start", dataset_id, index_type)
             print(f"  Encoding {len(queries)} queries...")
-            queries_embeddings, query_encode_time = encode_queries(
-                model_name=model_name,
-                queries=queries,
-                cache_dir=cache_dir,
-                cfg=cfg,
-            )
+            if cfg.search.get("profile", False):
+                from pylate.profiling import Profiler, reduce_stage_timings, use
+
+                prof = Profiler(cuda_sync=True)
+                with use(prof):
+                    queries_embeddings, query_encode_time = encode_queries(
+                        model_name=model_name,
+                        queries=queries,
+                        cache_dir=cache_dir,
+                        cfg=cfg,
+                    )
+                if prof.roots:
+                    query_encode_profile = reduce_stage_timings(prof.roots)
+            else:
+                queries_embeddings, query_encode_time = encode_queries(
+                    model_name=model_name,
+                    queries=queries,
+                    cache_dir=cache_dir,
+                    cfg=cfg,
+                )
             print(f"  Query encode time: {query_encode_time:.2f}s")
             append_stage_marker("encode_queries", "end", dataset_id, index_type)
 
@@ -1451,12 +1604,26 @@ def main(cfg: DictConfig) -> None:
             if queries_embeddings is None:
                 query_cache = cache_dir / "queries"
                 if (query_cache / "query_emb.npy").exists():
-                    queries_embeddings, _ = encode_queries(
-                        model_name=model_name,
-                        queries=queries,
-                        cache_dir=cache_dir,
-                        cfg=cfg,
-                    )
+                    if cfg.search.get("profile", False):
+                        from pylate.profiling import Profiler, reduce_stage_timings, use
+
+                        prof = Profiler(cuda_sync=True)
+                        with use(prof):
+                            queries_embeddings, _ = encode_queries(
+                                model_name=model_name,
+                                queries=queries,
+                                cache_dir=cache_dir,
+                                cfg=cfg,
+                            )
+                        if prof.roots:
+                            query_encode_profile = reduce_stage_timings(prof.roots)
+                    else:
+                        queries_embeddings, _ = encode_queries(
+                            model_name=model_name,
+                            queries=queries,
+                            cache_dir=cache_dir,
+                            cfg=cfg,
+                        )
                 else:
                     raise FileNotFoundError(
                         f"No cached query embeddings at {query_cache}. "
@@ -1500,6 +1667,11 @@ def main(cfg: DictConfig) -> None:
                         warp_outer_batch_size=cfg.index.get("warp_search_batch_size", None),
                         run_save_path=run_save_path,
                         metrics=list(cfg.search.metrics),
+                        profile=bool(cfg.search.get("profile", False)),
+                        maxsim_backend=cfg.search.get("maxsim_backend", None),
+                        e2e_profile_batch_size=cfg.search.get(
+                            "e2e_profile_batch_size", None
+                        ),
                     )
                     print(f"  QPS: {search_result['qps']}, NDCG@10: {search_result.get('ndcg@10', 'N/A')}")
                     print(f"  Recall@100: {search_result.get('recall@100', 'N/A')}")
@@ -1516,6 +1688,8 @@ def main(cfg: DictConfig) -> None:
                         "n_doc_tokens": n_doc_tokens,
                         "doc_encode_time_s": round(doc_encode_time, 2),
                         "query_encode_time_s": round(query_encode_time, 2),
+                        "doc_encode_profile": doc_encode_profile,
+                        "query_encode_profile": query_encode_profile,
                         "cluster_time_s": round(cluster_time, 2),
                         "build_time_s": round(build_time, 2),
                         "disk_mb": round(disk_mb, 2),
@@ -1549,6 +1723,8 @@ def main(cfg: DictConfig) -> None:
                 "n_doc_tokens": n_doc_tokens,
                 "doc_encode_time_s": round(doc_encode_time, 2),
                 "query_encode_time_s": round(query_encode_time, 2),
+                "doc_encode_profile": doc_encode_profile,
+                "query_encode_profile": query_encode_profile,
                 "cluster_time_s": round(cluster_time, 2),
                 "build_time_s": round(build_time, 2),
                 "disk_mb": round(disk_mb, 2),

@@ -9,6 +9,7 @@ import warnings
 import numpy as np
 import torch
 
+from ..profiling import Span, active, require_rust_profile, spans_from_rust
 from ..rank import RerankResult
 from .base import Base
 
@@ -696,6 +697,9 @@ class TachiomIndex(Base):
             q.squeeze(0) if q.ndim == 3 and q.shape[0] == 1 else q for q in queries_list
         ]
 
+        self.last_profile = None
+        prof = active()
+
         n_queries = len(queries_list)
         lens = [q.shape[0] for q in queries_list]
         tokens = np.ascontiguousarray(np.vstack(queries_list), dtype=np.float32)
@@ -706,7 +710,7 @@ class TachiomIndex(Base):
             offsets = np.zeros(n_queries + 1, dtype=np.uint64)
             np.cumsum(lens, out=offsets[1:])
 
-        scores, doc_ids = self._index.batch_search(
+        search_kwargs = dict(
             tokens=tokens,
             n_queries=n_queries,
             k=k,
@@ -721,6 +725,44 @@ class TachiomIndex(Base):
             impute_missing=self.impute_missing,
             gap_relative=self.gap_relative,
         )
+        # Rust stages need a `--features profile` build; require_rust_profile
+        # raises rather than let the run report an empty breakdown. The collector
+        # is process-global, so Rayon-worker stages are drained too, but a
+        # multi-query batch sums each stage across queries (see spans_from_rust)
+        # — use e2e_profile_batch_size=1 or num_threads=1 for latency-grade stats.
+        collect_rust_profile = prof.enabled and require_rust_profile(
+            self._index,
+            name="tachiom",
+            build_hint=(
+                "cd /exp/rjha/tachiom && "
+                "maturin develop --features python,profile --release"
+            ),
+        )
+
+        def _drain_rust_stages() -> list[Span]:
+            """Flat stage list from stage-profile (or peel legacy nested search root)."""
+            return spans_from_rust(list(self._index.take_profile()), count=n_queries)
+
+        try:
+            if collect_rust_profile:
+                self._index.begin_profile()
+            scores, doc_ids = self._index.batch_search(**search_kwargs)
+            if collect_rust_profile:
+                self.last_profile = _drain_rust_stages()
+        except TypeError as exc:
+            if collect_rust_profile:
+                self._index.take_profile()
+            msg = str(exc)
+            optional_kwargs = ("impute_missing", "gap_relative")
+            if not any(f"'{name}'" in msg or f'"{name}"' in msg for name in optional_kwargs):
+                raise
+            for name in optional_kwargs:
+                search_kwargs.pop(name, None)
+            if collect_rust_profile:
+                self._index.begin_profile()
+            scores, doc_ids = self._index.batch_search(**search_kwargs)
+            if collect_rust_profile:
+                self.last_profile = _drain_rust_stages()
 
         results = []
         for query_scores, query_doc_ids in zip(scores, doc_ids):

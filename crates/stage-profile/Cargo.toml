@@ -1,0 +1,10 @@
+[package]
+name = "stage-profile"
+version = "0.1.0"
+edition = "2021"
+description = "Flat RAII stage timers for PyLate Rust index backends"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"

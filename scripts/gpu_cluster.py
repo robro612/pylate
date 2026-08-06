@@ -39,7 +39,7 @@ Usage:
   uv run --no-sync python scripts/gpu_cluster.py shard_dir=<docs> out_dir=<o> \
     clustering.backend=cagra clustering.k=262144
   # streamed/subsampled (large corpus), V100 sidecar:
-  srunv100 .venv-cu12/bin/python scripts/gpu_cluster.py shard_dir=<docs> out_dir=<o> \
+  srunv100 .venv-cu126/bin/python scripts/gpu_cluster.py shard_dir=<docs> out_dir=<o> \
     clustering.backend=cagra clustering.k=2792304 clustering.train_sample=11200000
 """
 from __future__ import annotations

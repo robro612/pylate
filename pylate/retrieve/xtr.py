@@ -103,6 +103,7 @@ class XTR(BaseRetriever):
         *,
         k: int,
         device: str,
+        maxsim_backend: str | None = None,  # XTR scores via score_xtr, not colbert_scores; ignored.
     ) -> list[list[RerankResult]]:
         return [
             score_xtr(
