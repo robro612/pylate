@@ -53,7 +53,7 @@ third_party/            symlinks to the fork checkouts (see its README)
 scripts/                durable tools: benchmark_indexes.py, profview.py,
                         gpu_cluster.py, cluster_only.py, sync_env.sh
 scripts/lib/env.sh      environment selection, sourced by experiment scripts
-scripts/experiments/    one-off sweep drivers (read PYLATE_VENV)
+scripts/experiments/    one-off sweep drivers (read PYLATE_VENV) — currently empty
 scripts/slurm/          .sbatch job files
 scripts/analysis/       one-off measurement scripts
 docs/environments.md    environment reference — the authority on venv handling
