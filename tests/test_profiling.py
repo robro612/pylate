@@ -217,6 +217,77 @@ def test_reduce_marks_coalesced_stages_amortized():
     assert out["exact_score"]["mean_ms"] == round(800 / 1e6, 4)
 
 
+def test_reduce_builds_parent_stats_from_per_query_sums():
+    """A phase's percentiles come from summing *within* each query, not across.
+
+    Two queries whose rerank cost is split differently between seed and stream
+    but sums to the same total must yield a parent p50 equal to that total. A
+    reducer that (wrongly) combined the children's own percentiles would land
+    somewhere else entirely.
+    """
+    from pylate.profiling import reduce_stage_timings
+
+    roots = []
+    for seed_ns, stream_ns in ((100, 900), (400, 600)):
+        root = Span(name="search", dur_ns=1000)
+        root.children = [
+            Span(name="rerank/seed", dur_ns=seed_ns),
+            Span(name="rerank/stream", dur_ns=stream_ns),
+        ]
+        roots.append(root)
+
+    out = reduce_stage_timings(roots)
+    assert out["_parents"]["rerank"]["p50_ms"] == round(1000 / 1e6, 4)
+    assert out["_parents"]["rerank"]["mean_ms"] == round(1000 / 1e6, 4)
+    assert out["_parents"]["rerank"]["n"] == 2
+    # Leaves survive under their full names; the split is still visible.
+    assert out["rerank/seed"]["mean_ms"] == round(250 / 1e6, 4)
+
+
+def test_parent_counters_take_the_max_not_the_sum():
+    """Set sizes roll up by max, because a phase's leaves share one candidate set.
+
+    exact/lookup, exact/pad and exact/matmul each report the same ~1500 docs
+    they all processed. Summing would claim 4500 documents were reranked.
+    """
+    from pylate.profiling import reduce_stage_timings
+
+    root = Span(name="search", dur_ns=1000)
+    root.children = [
+        Span(name="exact/lookup", dur_ns=100, meta={"n_docs": 1500}),
+        Span(name="exact/pad", dur_ns=200, meta={"n_docs": 1500, "n_embeddings": 90000}),
+        Span(name="exact/matmul", dur_ns=700, meta={"n_docs": 1500}),
+    ]
+    out = reduce_stage_timings([root])
+    assert out["_parents"]["exact"]["meta"]["n_docs"]["mean"] == 1500.0
+    assert out["_parents"]["exact"]["meta"]["n_embeddings"]["mean"] == 90000.0
+
+
+def test_parent_counter_max_is_per_query_before_reduction():
+    """The max is taken within a query, then averaged — not the other way round."""
+    from pylate.profiling import reduce_stage_timings
+
+    roots = []
+    for n_docs in (100, 300):
+        root = Span(name="search", dur_ns=1000)
+        root.children = [
+            Span(name="exact/lookup", dur_ns=500, meta={"n_docs": n_docs}),
+            Span(name="exact/pad", dur_ns=500, meta={"n_docs": n_docs // 2}),
+        ]
+        roots.append(root)
+    out = reduce_stage_timings(roots)
+    # per-query maxes are 100 and 300 -> mean 200
+    assert out["_parents"]["exact"]["meta"]["n_docs"]["mean"] == 200.0
+
+
+def test_reduce_omits_parents_without_slash_names():
+    from pylate.profiling import reduce_stage_timings
+
+    root = Span(name="search", dur_ns=100)
+    root.children = [Span(name="rerank_seed", dur_ns=40)]
+    assert "_parents" not in reduce_stage_timings([root])
+
+
 def test_reset_clears_session():
     prof = Profiler()
     with prof.span("a"):

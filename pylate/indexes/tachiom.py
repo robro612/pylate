@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import shutil
+import time
 import warnings
 
 import numpy as np
@@ -701,14 +702,20 @@ class TachiomIndex(Base):
         prof = active()
 
         n_queries = len(queries_list)
-        lens = [q.shape[0] for q in queries_list]
-        tokens = np.ascontiguousarray(np.vstack(queries_list), dtype=np.float32)
+        # Packing queries into one contiguous f32 buffer is Python-side work that
+        # would otherwise land in `unaccounted`; span it so the Rust/Python split
+        # is visible.
+        with active().span("query_pack", count=n_queries) as _sp:
+            lens = [q.shape[0] for q in queries_list]
+            tokens = np.ascontiguousarray(np.vstack(queries_list), dtype=np.float32)
 
-        if len(set(lens)) == 1:
-            offsets = None
-        else:
-            offsets = np.zeros(n_queries + 1, dtype=np.uint64)
-            np.cumsum(lens, out=offsets[1:])
+            if len(set(lens)) == 1:
+                offsets = None
+            else:
+                offsets = np.zeros(n_queries + 1, dtype=np.uint64)
+                np.cumsum(lens, out=offsets[1:])
+            if _sp is not None:
+                _sp.meta["n_tokens"] = int(tokens.shape[0])
 
         search_kwargs = dict(
             tokens=tokens,
@@ -739,16 +746,42 @@ class TachiomIndex(Base):
             ),
         )
 
-        def _drain_rust_stages() -> list[Span]:
-            """Flat stage list from stage-profile (or peel legacy nested search root)."""
-            return spans_from_rust(list(self._index.take_profile()), count=n_queries)
+        def _drain_rust_stages(wrapper_ns: int) -> list[Span]:
+            """Ordered stage list: derived dispatch cost, then the Rust stages.
+
+            Draining is timed (`profile_drain`) rather than left in
+            `unaccounted`, and `search_dispatch` is the pyo3 boundary plus any
+            Rust work outside a stage — wall time of the call minus the stages
+            it contains. It has to be a subtraction: a span around the call
+            would enclose every stage inside it and double count.
+
+            Attached in place so the stages sit where they ran, keeping the
+            reducer's child order equal to pipeline order.
+            """
+            with active().span("overhead/drain") as drain_span:
+                rust_spans = spans_from_rust(
+                    list(self._index.take_profile()), count=n_queries
+                )
+                if drain_span is not None:
+                    drain_span.meta["n_stages"] = len(rust_spans)
+            dispatch = Span(
+                name="overhead/dispatch",
+                count=n_queries,
+                dur_ns=max(wrapper_ns - sum(s.dur_ns for s in rust_spans), 0),
+                meta={"derived": 1.0, "n_queries": n_queries},
+            )
+            ordered = [dispatch, *rust_spans]
+            active().attach(ordered)
+            return ordered
 
         try:
             if collect_rust_profile:
                 self._index.begin_profile()
+            wrapper_start = time.perf_counter_ns()
             scores, doc_ids = self._index.batch_search(**search_kwargs)
+            wrapper_ns = time.perf_counter_ns() - wrapper_start
             if collect_rust_profile:
-                self.last_profile = _drain_rust_stages()
+                self.last_profile = _drain_rust_stages(wrapper_ns)
         except TypeError as exc:
             if collect_rust_profile:
                 self._index.take_profile()
@@ -760,22 +793,27 @@ class TachiomIndex(Base):
                 search_kwargs.pop(name, None)
             if collect_rust_profile:
                 self._index.begin_profile()
+            wrapper_start = time.perf_counter_ns()
             scores, doc_ids = self._index.batch_search(**search_kwargs)
+            wrapper_ns = time.perf_counter_ns() - wrapper_start
             if collect_rust_profile:
-                self.last_profile = _drain_rust_stages()
+                self.last_profile = _drain_rust_stages(wrapper_ns)
 
-        results = []
-        for query_scores, query_doc_ids in zip(scores, doc_ids):
-            query_results = []
-            for score, doc_id in zip(query_scores, query_doc_ids):
-                if doc_id == _SENTINEL_DOC_ID:
-                    break
-                query_results.append(
-                    RerankResult(
-                        id=self._int_to_doc_id[int(doc_id)], score=float(score)
+        with active().span("result/convert", count=n_queries) as _sp:
+            results = []
+            for query_scores, query_doc_ids in zip(scores, doc_ids):
+                query_results = []
+                for score, doc_id in zip(query_scores, query_doc_ids):
+                    if doc_id == _SENTINEL_DOC_ID:
+                        break
+                    query_results.append(
+                        RerankResult(
+                            id=self._int_to_doc_id[int(doc_id)], score=float(score)
+                        )
                     )
-                )
-            results.append(query_results)
+                results.append(query_results)
+            if _sp is not None:
+                _sp.meta["n_results"] = sum(len(r) for r in results)
 
         return results
 

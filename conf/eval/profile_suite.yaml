@@ -1,0 +1,92 @@
+# Stage-profiling suite — the standing config for retrieval profiling runs.
+#
+#   UV_PROJECT_ENVIRONMENT=.venv-cu130-profile uv run --no-sync \
+#     python scripts/benchmark_indexes.py --config-name profile_suite index=tachiom
+#
+# Differences from conf/eval/config.yaml, and why:
+#
+#   * `delete_index` is gone from `stages`. Indexes are built once and reused;
+#     profiling changes the *timing* of the search path, never the on-disk index
+#     or its interface, so a rebuild between runs buys nothing and costs the
+#     build every time. Rebuild explicitly with `index.override=true` when the
+#     indexing code itself changes.
+#   * Profiling is on by default, at batch size 1 — the only setting that yields
+#     per-query percentiles rather than per-batch totals.
+#
+# Read the QPS in these rows as diagnostic only. `e2e_profile_batch_size=1`
+# makes every query pay per-call Python overhead that a batched run amortises
+# (on nfcorpus/fastplaid that is ~7 ms/query of `id_map_load` alone). For
+# throughput numbers, re-run without `search.profile` from a non-profile venv.
+defaults:
+  - model: lateon
+  - index: plaid
+  - override hydra/job_logging: custom
+  - _self_
+
+# Small → large. nfcorpus is the fast smoke; lotte-pooled is the scale check.
+datasets:
+  - "beir/nfcorpus/test"
+  - "beir/fiqa/test"
+  - "beir/trec-covid"
+  - "lotte/pooled/dev/search"
+
+doc_length: 300
+
+query_length:
+  "beir/nfcorpus/test": 32
+  "beir/fiqa/test": 32
+  "beir/trec-covid": 48
+  "lotte/pooled/dev/search": 32
+
+encode:
+  # Single-GPU encode path, deliberately. The multi-GPU path
+  # (`encode_multi_process`, auto-enabled when device_count > 1) does not persist
+  # token IDs — benchmark_indexes.py gates `save_token_ids` on `not use_multi_gpu`
+  # — and Tachiom needs them. Parallelise across slurm array tasks with
+  # `encode.shards="${i}::${N}"` instead; see scripts/slurm/msmarco_encode_array.sbatch.
+  batch_size: 3000
+  query_batch_size: 32
+  shard_size: 100000
+  pool_factor: 1
+  pool_method: none
+  protected_tokens: 1
+  dtype: fp16
+  shards: null
+  save_token_ids: true
+
+cache:
+  dir: "embeddings_cache"
+  enabled: true
+
+search:
+  k: 100
+  k_token: 10000
+  repeats: 1
+  maxsim_backend: null
+  profile: true
+  e2e_profile_batch_size: 1
+  metrics:
+    - map
+    - ndcg@10
+    - ndcg@100
+    - recall@10
+    - recall@100
+    - mrr@10
+    - mrr@100
+    - hit_rate@5
+
+output:
+  results_file: "results/profile_suite.jsonl"
+  index_folder: "indexes"
+  runs_dir: "results/runfiles"
+
+compile: false
+
+device: null
+
+# No delete_index — indexes persist and are reused across runs.
+stages:
+  - encode_docs
+  - encode_queries
+  - build_index
+  - retrieve

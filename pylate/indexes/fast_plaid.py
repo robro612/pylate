@@ -4,13 +4,14 @@ import logging
 import os
 import pickle
 import shutil
+import time
 from bisect import bisect_left
 
 import numpy as np
 import torch
 from fast_plaid import fast_plaid_rust, search
 
-from ..profiling import active, require_rust_profile, spans_from_rust
+from ..profiling import Span, active, require_rust_profile, spans_from_rust
 from ..rank import RerankResult
 from .base import Base
 from .utils import convert_embeddings_to_torch
@@ -359,12 +360,18 @@ class FastPlaid(Base):
             """
             raise ValueError(error)
 
-        # Load mappings into memory
-        plaid_ids_to_documents_ids = self._load_plaid_ids_to_documents_ids()
-        documents_ids_to_plaid_ids = self._load_documents_ids_to_plaid_ids()
+        # Load mappings into memory. These unpickle from disk on *every* call, so
+        # the span is here to make that visible rather than leaving it inside
+        # `unaccounted`; at e2e_profile_batch_size=1 it is paid once per query.
+        with active().span("id_map_load") as _sp:
+            plaid_ids_to_documents_ids = self._load_plaid_ids_to_documents_ids()
+            documents_ids_to_plaid_ids = self._load_documents_ids_to_plaid_ids()
+            if _sp is not None:
+                _sp.meta["n_documents"] = len(plaid_ids_to_documents_ids)
 
         # Convert queries to torch tensor format expected by fast-plaid
-        queries_embeddings = convert_embeddings_to_torch(queries_embeddings)
+        with active().span("query/convert"):
+            queries_embeddings = convert_embeddings_to_torch(queries_embeddings)
 
         # Convert subset from document IDs to plaid IDs if provided
         plaid_subset = None
@@ -413,6 +420,7 @@ class FastPlaid(Base):
             if collect_rust_profile:
                 fast_plaid_rust.begin_profile()
             # Perform search using fast-plaid
+            wrapper_start = time.perf_counter_ns()
             search_results = self.fast_plaid.search(
                 queries_embeddings=queries_embeddings,
                 top_k=k,
@@ -423,25 +431,56 @@ class FastPlaid(Base):
                 subset=plaid_subset,
                 n_processes=self.num_threads,
             )
+            wrapper_ns = time.perf_counter_ns() - wrapper_start
             if collect_rust_profile:
-                self.last_profile = spans_from_rust(
-                    list(fast_plaid_rust.take_profile()),
+                # Draining is real work inside the enclosing span — building a
+                # Span per stage and coalescing them — so it is timed rather
+                # than left to inflate `unaccounted`.
+                with active().span("overhead/drain") as drain_span:
+                    rust_spans = spans_from_rust(
+                        list(fast_plaid_rust.take_profile()),
+                        count=len(queries_embeddings),
+                    )
+                    if drain_span is not None:
+                        drain_span.meta["n_stages"] = len(rust_spans)
+
+                # Everything in fast-plaid's Python layer that is not the Rust
+                # search: `_prepare_search` packing/moving queries, the
+                # ThreadPoolExecutor dispatch, and QueryResult conversion. It
+                # wraps the Rust call, so it cannot be timed with a span without
+                # overlapping every stage inside it — hence the subtraction,
+                # which is exact given the Rust stages are disjoint.
+                rust_ns = sum(s.dur_ns for s in rust_spans)
+                dispatch = Span(
+                    name="overhead/dispatch",
                     count=len(queries_embeddings),
+                    dur_ns=max(wrapper_ns - rust_ns, 0),
+                    meta={"derived": 1.0, "n_queries": len(queries_embeddings)},
                 )
+                # Attach in place so these land between `query_convert` and
+                # `result_convert` — pipeline order — instead of being appended
+                # after the call returns. Falls back to `last_profile`, which
+                # the retriever grafts, when no span is open.
+                ordered = [dispatch, *rust_spans]
+                self.last_profile = ordered
+                active().attach(ordered)
         except Exception:
             if collect_rust_profile:
                 fast_plaid_rust.take_profile()
             raise
 
         # Convert results to expected format
-        results = []
-        for query_results in search_results:
-            query_docs = []
-            for plaid_id, score in query_results:
-                if plaid_id in plaid_ids_to_documents_ids:
-                    doc_id = plaid_ids_to_documents_ids[plaid_id]
-                    query_docs.append(RerankResult(id=doc_id, score=float(score)))
-            results.append(query_docs)
+        with active().span("result/convert") as _sp:
+            results = []
+            for query_results in search_results:
+                query_docs = []
+                for plaid_id, score in query_results:
+                    if plaid_id in plaid_ids_to_documents_ids:
+                        doc_id = plaid_ids_to_documents_ids[plaid_id]
+                        query_docs.append(RerankResult(id=doc_id, score=float(score)))
+                results.append(query_docs)
+            if _sp is not None:
+                _sp.meta["n_results"] = sum(len(r) for r in results)
 
         return results
 

@@ -100,17 +100,83 @@ cd /exp/rjha/fast-plaid && maturin develop --features profile --release
 
 ### Stages
 
-| Backend | Stages |
+| Backend | Where | Stages |
+|---|---|---|
+| tachiom | Rust | `coarse_accumulate`, `candidate_select`, `rerank/{encoder,seed,stream,select}` (`rerank/score_full` on the non-early-exit path) |
+| tachiom | Python | `query_pack`, `result/convert`, `overhead/{drain,dispatch}` |
+| fastplaid | Rust | `query/{layout,prepare}`, `centroid_score`, `ivf/{select,lookup}`, `candidate/{dedup,lengths}`, `approx/{plan,lookup,gather,pad,reduce,merge,topk}`, `exact/{lengths,plan,lookup,residual_decompress,pad,matmul,reduce,merge}`, `final_topk`, `result/materialize` |
+| fastplaid | Python | `id_map_load`, `query/convert`, `result/convert`, `overhead/{drain,dispatch}` |
+
+Stages named `parent/leaf` roll up into a phase — see [Hierarchy](#hierarchy).
+Singletons (`centroid_score`, `final_topk`, `query_pack`) stay flat.
+
+#### Counters
+
+Every stage that touches a candidate set records its size, so the funnel is
+readable end to end without re-deriving it from parameters:
+
+| backend | funnel |
 |---|---|
-| tachiom | `coarse_accumulate`, `candidate_select`, `rerank` |
-| fastplaid | `query_prepare`, `centroid_score`, `ivf_select`, `ivf_lookup`, `candidate_dedup`, `candidate_lengths`, `approx_score`, `approx_topk`, `rerank_lengths`, `exact_score`, `final_topk`, `result_materialize` |
+| tachiom | `coarse_accumulate.n_docs_touched` → `candidate_select.n_candidates` → `rerank/seed.n_scored` + `rerank/stream.n_scored` → `rerank/select.k` |
+| fastplaid | `ivf/select.n_cells` → `ivf/lookup.n_ids` → `candidate/dedup.n_candidates` → `approx/topk.n_rerank` → `exact/*.n_docs` → `final_topk.top_k` |
+
+Two pairs are worth reading together. `ivf/lookup.n_ids` against
+`candidate/dedup.n_candidates` is the duplication factor of probing wide, which
+`n_candidates` alone hides. And `exact/pad.n_embeddings` against
+`exact/matmul.n_padded_tokens × n_docs` is the padding waste — `exact/matmul`
+scales in the padded rectangle, not in the real token count.
+
+`rerank/stream` additionally carries `n_admitted` / `n_skipped` /
+`early_terminated`, which is what explains its tail. No guard sits inside the
+scoring loop: the *sample machinery* (String allocation plus the global mutex,
+~21 µs per drained sample) would cost more than the stage — 1274 samples ≈ 26 ms
+against a 37 ms stage. The clock read itself is negligible.
+
+Counters roll up to a phase by **max, not sum**: a phase's leaves mostly operate
+on the same set, so summing `n_docs` over `exact/lookup`, `exact/pad` and
+`exact/matmul` would report three times the documents actually reranked.
+
+`overhead/dispatch` is derived by subtraction (wrapper wall-clock minus the sum
+of Rust stages), not measured directly. A span wrapped around the call would
+enclose every Rust stage and double count.
+
+The `approx/*` / `exact/*` stages inside the chunk closures fire once per chunk;
+`spans_from_rust` coalesces them by name and records `n_calls`. The Python stages
+are emitted by the PyLate index wrapper and sit alongside the Rust ones as
+siblings, so `unaccounted` is now genuinely unmeasured time rather than the whole
+Python layer.
 
 Stages are recorded as **disjoint** segments, so durations sum without double
-counting and `unaccounted` is real self-time. The shared collector is flat: it
-cannot express nesting, so a sub-stage inside another stage (e.g. breaking
-`exact_score` into `exact_lookup` / `residual_decompress`) would overlap its
-parent and inflate the total. That detail is deferred until the crate grows a
-span tree.
+counting and `unaccounted` is real self-time. The shared collector is flat and
+stays that way: a guard nested inside another guard would overlap its parent and
+inflate the total.
+
+### Hierarchy
+
+Nesting is expressed in the *name*, not in the collector — a stage called
+`parent/leaf` declares its phase while remaining a disjoint sibling of every
+other stage. `reduce_stage_timings` then emits a `_parents` entry per phase.
+
+The parent's distribution is accumulated **per query and only then reduced**,
+because percentiles do not add: a phase's p50 is the median of the per-query
+sums of its leaves, which cannot be recovered from the leaves' own p50s. Means
+do add, so a phase's mean and share are exact either way — but p90 and the tail
+multiple are most of the reason to have the row at all.
+
+Two levels, owned in two different places on purpose:
+
+| level | owner | why there |
+|---|---|---|
+| structural (`rerank/seed` ⊂ `rerank`) | the span marker, in code | containment is a fact only the code knows, and a post-hoc name map silently drops every stage added after it was written |
+| semantic (`exact_matmul` ≈ `rerank_stream` ≈ "scoring") | `QUERY_GROUPS` in `scripts/profview.py` | no single fork can classify another backend's stages, and the taxonomy must be re-cuttable over archived results without re-running |
+
+The semantic map keys on *parents* where it can, so a new `rerank/*` leaf
+inherits its bucket instead of falling out unclassified.
+
+Stage names predating the convention carry their phase as an underscore prefix
+(`rerank_seed`, `approx_lookup`); profview reconstructs the pivot from those so
+existing artifacts render, but such phases show `·` for p50/p90 since the
+per-query sums were never recorded. Prefer `parent/leaf` for new stages.
 
 ### CUDA correctness
 

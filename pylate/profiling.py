@@ -180,6 +180,27 @@ class Profiler:
             node.dur_ns = time.perf_counter_ns() - start
             self._current.reset(token)
 
+    def attach(self, spans: list[Span]) -> bool:
+        """Splice already-timed ``spans`` in as children of the open span.
+
+        For stages a backend timed itself (the Rust collector). Attaching at
+        drain time puts them at the point in the child list where they actually
+        ran, between the Python spans that bracket the call — so the reducer's
+        insertion order stays true pipeline order. A caller that appends them
+        after the enclosing call returns instead gets every Rust stage sorted to
+        the end, behind Python work that came later.
+
+        Returns ``False`` when profiling is off or no span is open, so the
+        caller can fall back to stashing them on ``last_profile``.
+        """
+        if not self.enabled or not spans:
+            return False
+        parent = self._current.get()
+        if parent is None:
+            return False
+        parent.children.extend(spans)
+        return True
+
     @property
     def root(self) -> Span | None:
         """The most recently opened top-level span tree, or ``None``."""
@@ -236,6 +257,24 @@ def _stats(ns: list[int]) -> dict[str, Any]:
     }
 
 
+def _meta_stats(meta_acc: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+    """Reduce per-query counter series to mean/p50/p90.
+
+    Counters keep all three because they are routinely bimodal in a way
+    latencies are not — a 0/1 flag like ``early_terminated`` has a meaningless
+    median and an informative mean (the rate), while a candidate count is the
+    other way round.
+    """
+    return {
+        key: {
+            "mean": round(sum(values) / len(values), 4),
+            "p50": round(_percentile(sorted(values), 0.50), 4),
+            "p90": round(_percentile(sorted(values), 0.90), 4),
+        }
+        for key, values in meta_acc.items()
+    }
+
+
 def reduce_stage_timings(roots: list[Span]) -> dict[str, Any]:
     """Reduce per-call span trees to per-stage timing stats (ms).
 
@@ -246,8 +285,15 @@ def reduce_stage_timings(roots: list[Span]) -> dict[str, Any]:
     a stage is marked ``amortized`` (and gets no latency reading) when any of
     its spans cover more than one query.
 
+    Stage names of the form ``parent/leaf`` additionally yield a ``_parents``
+    entry holding the parent's own distribution. Nesting is declared in the
+    span markers rather than inferred downstream, because containment is a fact
+    about the code and a post-hoc name map goes stale the moment a stage is
+    added. Semantic grouping across *different* backends stays post-hoc — see
+    ``scripts/profview.py`` — since no single fork can define it.
+
     Returns per-stage stats including percentiles and compact histogram bins,
-    plus ``_total`` and ``_maxsim_backend`` keys.
+    plus ``_total``, optional ``_parents``, and ``_maxsim_backend`` keys.
     """
     if not roots:
         return {}
@@ -255,28 +301,77 @@ def reduce_stage_timings(roots: list[Span]) -> dict[str, Any]:
     unaccounted: list[int] = []
     by_stage: dict[str, list[int]] = {}
     stage_counts: dict[str, int] = {}
+    # Numeric annotations (n_candidates, n_scored, ...) per stage, kept as
+    # distributions: how the candidate set narrows down the pipeline is the
+    # thing that explains a stage's cost, and a mean alone hides the tail.
+    by_stage_meta: dict[str, dict[str, list[float]]] = {}
+    # Structural parents, from ``parent/leaf`` stage names. Accumulated *per
+    # root* and only then reduced, because percentiles do not add: a parent's
+    # p50 is the median of the per-query sums of its children, which is not
+    # recoverable from the children's own p50s. Means would add fine; p90 and
+    # the tail multiple are the whole point of having the row, so the sum has
+    # to happen here where the per-query series still exists.
+    by_parent: dict[str, list[int]] = {}
+    # Counters rolled up to the phase. Durations sum; set sizes do **not** — the
+    # leaves of a phase mostly operate on the same candidate set, so summing
+    # n_docs across exact/lookup, exact/pad and exact/matmul would report three
+    # times the documents that were actually reranked. Max is the meaningful
+    # reduction: the largest set the phase handled.
+    by_parent_meta: dict[str, dict[str, list[float]]] = {}
     backends: set[str] = set()
     for r in roots:
         totals.append(r.dur_ns)
         child_sum = 0
+        parent_sums: dict[str, int] = {}
+        parent_meta: dict[str, dict[str, float]] = {}
         for child in r.children:
             by_stage.setdefault(child.name, []).append(child.dur_ns)
+            parent = child.name.split("/", 1)[0] if "/" in child.name else None
+            if parent is not None:
+                parent_sums[parent] = parent_sums.get(parent, 0) + child.dur_ns
             stage_counts[child.name] = max(stage_counts.get(child.name, 1), child.count)
             child_sum += child.dur_ns
+            meta_acc = by_stage_meta.setdefault(child.name, {})
+            for key, value in child.meta.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                meta_acc.setdefault(key, []).append(float(value))
+                if parent is not None and key != "n_calls":
+                    acc = parent_meta.setdefault(parent, {})
+                    acc[key] = max(acc.get(key, float("-inf")), float(value))
             if child.name == "maxsim" and "backend" in child.meta:
                 backends.add(str(child.meta["backend"]))
         unaccounted.append(max(r.dur_ns - child_sum, 0))
+        for parent, ns_sum in parent_sums.items():
+            by_parent.setdefault(parent, []).append(ns_sum)
+        for parent, keys in parent_meta.items():
+            acc = by_parent_meta.setdefault(parent, {})
+            for key, value in keys.items():
+                acc.setdefault(key, []).append(value)
 
     out: dict[str, Any] = {
         "_root": roots[0].name,  # "retrieve" (token path) | "search" (E2E)
         "_total": _stats(totals),
         "unaccounted": _stats(unaccounted),
     }
+    if by_parent:
+        out["_parents"] = {}
+        for name, ns in by_parent.items():
+            s = _stats(ns)
+            meta_acc = by_parent_meta.get(name) or {}
+            if meta_acc:
+                s["meta"] = _meta_stats(meta_acc)
+            out["_parents"][name] = s
+    # Insertion order is the order stages were first seen among a root's
+    # children, i.e. pipeline order — preserved here and relied on by profview.
     for name, ns in by_stage.items():
         s = _stats(ns)
         if stage_counts.get(name, 1) > 1:
             s["amortized"] = True
             s["count"] = stage_counts[name]
+        meta_acc = by_stage_meta.get(name) or {}
+        if meta_acc:
+            s["meta"] = _meta_stats(meta_acc)
         out[name] = s
     if backends:
         out["_maxsim_backend"] = sorted(backends)
