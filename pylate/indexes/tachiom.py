@@ -49,9 +49,12 @@ class TachiomIndex(Base):
         Subtract the global mean token vector from all document vectors before
         building the index. Default: ``True``. May improve HNSW quality.
     total_centroids
-        TAC coarse-centroid budget. ``None`` (default) auto-computes as
+        Requested coarse-centroid budget. ``None`` (default) auto-computes as
         ``max(2^round(log2(n_tokens/128)), ceil(min_tac_budget * 1.1))``,
-        ensuring TAC is used rather than falling back to global k-means.
+        ensuring TAC is used rather than falling back to global k-means. This is
+        the *request*; the count the index ends up with is
+        :attr:`actual_total_centroids` (they differ under the auto budget, or
+        when a request is capped to the token count).
     tac_n_iter
         K-means iterations for Token-Aware Clustering. Default: 10. Reduce for
         fast experimentation; raise for maximum quality. 10 is usually enough.
@@ -201,6 +204,11 @@ class TachiomIndex(Base):
         self.index_name = index_name
 
         self.center_dataset = center_dataset
+        # Requested coarse-centroid budget as configured; ``None`` means "let
+        # auto_build_params decide". Kept verbatim — the count the index actually
+        # ended up with is a separate read (``actual_total_centroids`` below), so
+        # the request is never overwritten by the result. The two differ whenever
+        # TAC auto-derives from the token count, or a request is capped to it.
         self.total_centroids = total_centroids
         self.tac_n_iter = tac_n_iter
         self.tac_micro_threshold = tac_micro_threshold
@@ -265,6 +273,17 @@ class TachiomIndex(Base):
         if self.is_indexed:
             self._ensure_loaded()
             self._ensure_mappings()
+
+    @property
+    def actual_total_centroids(self) -> int | None:
+        """Coarse-centroid count the built/loaded index actually holds.
+
+        Read straight off the Rust index rather than cached at build, so it is
+        correct on a loaded index too — and distinct from ``total_centroids``,
+        which is the *request* (``None`` for TAC's auto budget). ``None`` only
+        before the index exists.
+        """
+        return self._index.n_centroids if self._index is not None else None
 
     def _ensure_loaded(self) -> None:
         if self._index is None:
@@ -414,7 +433,6 @@ class TachiomIndex(Base):
         total_centroids = params["total_centroids"]
         micro_threshold = params["tac_micro_threshold"]
         small_threshold = params["tac_small_threshold"]
-        self.total_centroids = total_centroids
         self.tac_micro_threshold = micro_threshold
         self.tac_small_threshold = small_threshold
         logger.debug(
@@ -569,7 +587,6 @@ class TachiomIndex(Base):
         total_centroids = params["total_centroids"]
         micro_threshold = params["tac_micro_threshold"]
         small_threshold = params["tac_small_threshold"]
-        self.total_centroids = total_centroids
         self.tac_micro_threshold = micro_threshold
         self.tac_small_threshold = small_threshold
 
@@ -875,7 +892,8 @@ class TachiomIndex(Base):
             f"  — build —\n"
             f"  clustering={self.clustering}, "
             f"center_dataset={self.center_dataset}, "
-            f"total_centroids={self.total_centroids}, "
+            f"total_centroids={self.total_centroids} "
+            f"(actual={self.actual_total_centroids}), "
             f"tac_n_iter={self.tac_n_iter}, "
             f"tac_micro_threshold={self.tac_micro_threshold}, "
             f"tac_small_threshold={self.tac_small_threshold},\n"
