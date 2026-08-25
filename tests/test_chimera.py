@@ -99,11 +99,13 @@ def test_results_are_ranked_by_descending_score(index, corpus):
 
 
 def test_search_is_deterministic(index, corpus):
-    """The index PyLate searches must be the reloaded one.
+    """Guards the CAGRA dataset-lifetime fix.
 
-    Searching the object ``ChimeraIndex.build`` returns is unstable upstream —
-    it drops the correct top-1 roughly one call in ten — so ``_build`` discards
-    it and reloads from disk. This is the regression test for that.
+    cuVS attaches rather than copies the dataset handed to ``cagra::build``, and
+    Chimera passed it a local vector of rotated centroids. The resulting
+    dangling host pointer made a freshly built index return a different top-10
+    across repeats and lose the correct answer roughly one call in ten. This
+    searches the built index directly, so it fails if that regresses.
     """
     _, documents = corpus
     query = [documents[42][:QUERY_TOKENS]]

@@ -937,10 +937,17 @@ def build_index(
         if centroid_score_threshold is not None:
             plaid_kwargs["centroid_score_threshold"] = float(centroid_score_threshold)
         use_fast = index_cfg.get("use_fast", True) if index_cfg else True
+        # override defaults to True, matching every other backend in this
+        # function. False is not a usable default here: the build below calls
+        # freeze(), so re-running the build_index stage over an existing index
+        # either raises ("Cannot update a frozen index") or, on an unfrozen one,
+        # silently appends the corpus a second time. To keep an existing index,
+        # drop build_index from `stages` rather than relying on this flag.
+        plaid_override = index_cfg.get("override", True) if index_cfg else True
         index = indexes.PLAID(
             index_folder=index_folder,
             index_name=index_name,
-            override=False,
+            override=plaid_override,
             nbits=nbits,
             n_samples_kmeans=n_samples_kmeans,
             use_fast=use_fast,

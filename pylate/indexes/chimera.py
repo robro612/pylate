@@ -95,7 +95,7 @@ class Chimera(Base):
     ``ex_bits`` ~ ``nbits``, ``nprobe`` ~ ``n_ivf_probe``, ``k_refine`` /
     ``k_full_bit`` ~ ``n_full_scores``.
 
-    Four properties of the upstream backend leak into this wrapper and are
+    Three properties of the upstream backend leak into this wrapper and are
     worth knowing before reading a benchmark number:
 
     * **Scores are ranks, not similarities.** The pybind11 `search` returns
@@ -115,9 +115,6 @@ class Chimera(Base):
       31-token query padded to 32 ranks its own document first on 100/100
       repeats. Longer queries raise rather than truncate, since silently
       dropping tokens would change what the benchmark measures.
-    * **The index is reloaded from disk after building** — searching the object
-      ``ChimeraIndex.build`` returns drops the correct answer about 10% of the
-      time. See ``_build`` for the measurement.
     * **Building is not incremental.** ``ChimeraIndex.build`` takes the whole
       corpus at once and copies the float32 array into a ``std::vector``, so
       peak host memory is about ``2 * n_tokens * dim * 4`` bytes on top of the
@@ -394,22 +391,15 @@ class Chimera(Base):
         os.makedirs(self._chimera_path, exist_ok=True)
         self._index.save(self._chimera_path)
 
-        # Drop the built object and let _ensure_loaded() read the artifact back.
-        # This is not tidiness: searching the index that build() returns is
-        # unreliable upstream. Measured on 2000 self-queries (a document's own
-        # tokens as the query, which must rank it first), same process, same
-        # search options, identical contents:
-        #
-        #     build()-returned : 5/5 queries gave >1 distinct top-10 across
-        #                        repeats; the query's own document missed top-1
-        #                        in 54/500 calls
-        #     load()-ed        : 0/5 unstable, 0/500 misses
-        #
-        # The data written by save() is correct; only the in-memory post-build
-        # search state is not, so the round-trip through disk costs a reload
-        # and buys determinism. Revisit if upstream fixes
-        # initialize_search_state() on the build path.
-        self._index = None
+        # The built index is kept and searched directly. It did not used to be:
+        # searching what build() returned was nondeterministic, losing the
+        # correct top-1 about a tenth of the time, so this dropped the object
+        # and reloaded from disk. The cause was a dangling host pointer — cuVS
+        # attaches rather than copies the dataset it is given, and Chimera
+        # handed cagra::build a local vector of rotated centroids — and is
+        # fixed in the checkout. Re-measured after the fix: 0/5 queries unstable
+        # and 0/500 self-doc misses on the build path, matching the load path.
+        # tests/test_chimera.py::test_search_is_deterministic guards it.
 
         self._params = {
             "n_clusters": n_clusters,
