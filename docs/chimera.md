@@ -119,7 +119,7 @@ nonsense.
 wrapper raises at construction instead of letting the search die several seconds
 in with `RAFT failure ... topk must be lower than or equal to 1024`.
 
-## Two upstream behaviours the wrapper works around
+## Upstream behaviours the wrapper works around
 
 ### Searching a freshly built index is unreliable
 
@@ -155,38 +155,100 @@ means widening `chimera_index::search` and the binding to return the heap's
 `.first`; the wrapper already picks up a `search_scored`/`search_with_scores`
 method automatically if a build exposes one, so that patch needs no change here.
 
+## Memory, and what the fork fixes
+
+`ChimeraIndex.build` takes the whole corpus in one call — there is no
+incremental path, where WARP and PLAID stream shard by shard and tachiom reads
+shards natively in Rust. So the build peak cannot be amortised, and two commits
+on `pylate-packaging` are what make a large collection possible at all.
+
+**The corpus was held twice.** `python/bindings.cpp` copied the NumPy array into
+a `std::vector<float>` before calling `build`, because `build` took a
+`const std::vector<float>&`. Nothing in the build retains or mutates it, so the
+copy was pure duplication of the largest object in the process. `build` now has
+a borrowing `const float*` overload and the binding passes `embeddings.data()`.
+
+**The doc-major 1-bit codes were dead.** `encode_embeddings` produces the 1-bit
+codes in document order; `reorder_by_cluster` copies them into the cluster-major
+array that the GPU probe scan reads. The originals were kept, written to
+`doc_1bit.bin` and read back at load, but no search path touched them. They are
+no longer retained or persisted. `doc_1bit.bin` still exists — it also carries
+the header, the rotator and the full-bit factors — so `IndexHeader` gained a
+magic and format version, and an index written by an older build now fails
+loudly instead of parsing its factors out of the wrong bytes.
+
+Measured peak host RSS building from the lotte shards:
+
+| tokens | before | after |
+|---|---|---|
+| 13.2M | 16.2 GiB | 9.9 GiB |
+| 32.2M | 38.9 GiB | 23.5 GiB |
+| slope | 1.20 GiB / M tokens | **0.72 GiB / M tokens** |
+
+lotte/pooled/dev/search is 354.6M tokens: ~424 GiB before, **~254 GiB after**,
+against 349 GiB on an L40S node. That is the difference between an OOM kill and
+a build with headroom. Reproduce with `scripts/analysis/chimera_scale.py`.
+
+The remaining 169 GiB at that scale is the float32 array itself, forced by
+Chimera's f32-only API — the fp16 cache doubles on the way in. If it ever runs
+tight, the pointer overload means `np.memmap` needs no further C++ change.
+
 ## Other differences from PLAID / tachiom
 
-* **No incremental build.** `ChimeraIndex.build` takes the whole corpus at once
-  and copies the float32 array into a `std::vector` before clustering, so peak
-  host memory is roughly `2 * n_tokens * dim * 4` bytes on top of the shards —
-  where WARP and PLAID stream shard by shard. There is no update or delete path,
-  and `get_documents_embeddings` has no backing API.
 * **No stage profiling.** The C++ search is opaque from Python, so
   `search.profile=true` reports one derived `overhead/dispatch` span rather than
   a breakdown. There is no equivalent of `crates/stage-profile` here.
-* **Denser codes.** `ex_bits=4` is `1 + 4` bits per dimension, above PLAID's
-  `nbits=4` and well above tachiom's default `pq_subspaces=32` (2 bit/dim), and
-  the disk footprint follows.
+* **No update, delete, or embedding reconstruction.** `add_documents` builds
+  once and raises on a second call; `get_documents_embeddings` has no backing
+  API.
+* **Denser codes, and a second representation.** Per token on nfcorpus:
+
+  | file | B/token | |
+  |---|---|---|
+  | `doc_full.bin` | 80.0 | rerank codes, `PADDED_DIM x (1+ex_bits)/8` |
+  | `cluster_1bit.bin` | 28.0 | 1-bit codes cluster-major + doc id, for the GPU probe |
+  | `ivf.bin` | 4.1 | posting lists |
+  | `centroids.carga` | 5.1 | centroids + CAGRA graph (scales with clusters) |
+  | `doc_1bit.bin` | 4.0 | header, rotator, full-bit factors |
+  | **total** | **121.2** | vs tachiom 78.0, plaid 47.0 |
+
+  The gap is `ex_bits`: at the default 4 the rerank code is 5 bits/dim, against
+  2 bits/dim for both PLAID (`nbits: 2`) and tachiom (`pq_subspaces: 32`). The
+  `cluster_1bit.bin` 28 B/token has no analogue in either — it is the price of
+  a GPU-resident coarse stage.
 
 ## Reference numbers
 
 `beir/nfcorpus/test`, `lightonai/LateOn`, 3633 docs / 866k tokens, one L40S.
-Chimera at `Q_DOCLEN=32`, matching this dataset's `query_length` — see the
-query-shape section above for what the current `Q_DOCLEN=48` environment costs
-here:
+Chimera rows are `Q_DOCLEN=48`, so their QPS carries the ~26% padding penalty
+described above; at a matched `Q_DOCLEN=32` the `ex_bits=4` row is 122 QPS.
 
 | index | build | disk | QPS | NDCG@10 | R@100 |
 |---|---|---|---|---|---|
-| plaid | 22.9s | 39 MB | 79 | 0.3804 | 0.3424 |
+| plaid (`nbits=2`) | 22.9s | 39 MB | 79 | 0.3804 | 0.3424 |
 | tachiom (tac, m32) | 54.9s | 64 MB | 168 | 0.3789 | 0.3377 |
-| chimera (`k_full_bit=300`, upstream default) | 3.6s | 117 MB | 347 | 0.3634 | 0.2903 |
-| chimera (`k_full_bit=2000`, repo default) | 3.6s | 117 MB | 122 | 0.3783 | 0.3372 |
+| chimera `ex_bits=1` | 2.6s | 61 MB | 91 | 0.3486 | 0.3088 |
+| chimera `ex_bits=2` | 2.9s | 74 MB | 92 | 0.3762 | 0.3342 |
+| chimera `ex_bits=4` (default) | 3.3s | 100 MB | 91 | 0.3783 | 0.3372 |
+
+Reading it honestly: **at this scale Chimera does not win.** It is 2.6x PLAID's
+disk at slightly worse quality, and slower than tachiom. `ex_bits=2` is the
+sensible operating point — 99.4% of `ex_bits=4`'s NDCG for 74% of the disk —
+and `ex_bits=1` is where quality actually breaks (-0.030 NDCG). QPS is flat
+across all three, so `ex_bits` is a disk/quality knob, not a speed one, and the
+rerank is not the bottleneck here.
+
+The one unambiguous win is build time: 3s against PLAID's 23s and tachiom's 55s,
+which at lotte scale is PLAID's 121 min and tachiom's 346 min against a
+projected ~22 min.
+
+nfcorpus is 3633 documents, so its QPS is dominated by fixed overhead rather
+than by the candidate pipeline. Nothing here settles the scaling claim — that
+needs trec-covid (171k docs, 29.3M tokens) and lotte/pooled (2.4M docs, 355M
+tokens), both of which are now cached and within memory budget.
 
 `k_full_bit` is the recall knob — the same lever as tachiom's
-`k_docs_to_score` — and upstream's 300 is starved on this corpus; raising
+`k_docs_to_score` — and upstream's default of 300 is starved: it gives ndcg@10
+0.3634 / r@100 0.2903 at 347 QPS against 2000's 0.3783 / 0.3372 at 122. Raising
 `nprobe` instead does almost nothing. `conf/eval/index/chimera.yaml` defaults to
-2000, the point where quality matches PLAID and tachiom and the speed comparison
-is apples-to-apples. One small corpus is not a verdict: the interesting
-comparison is at trec-covid / lotte / MS MARCO scale, where Chimera's compressed
-candidate pipeline is meant to pay off.
+2000.

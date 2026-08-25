@@ -36,12 +36,16 @@ Push profiling-related Rust changes to user forks (`robro612/...`), not upstream
 
 ## Chimera
 
-Local checkout on branch `pylate-packaging`, carrying two commits upstream does
-not have: a `pyproject.toml` (upstream is a bare CMake project with no Python
-packaging at all — you were meant to build it in a conda env and put `build/` on
-`PYTHONPATH`), and a CMake fix that sets `CMAKE_CUDA_ARCHITECTURES` before
-`enable_language(CUDA)`, without which the module ships PTX the driver cannot
-JIT. Push to `robro612/Chimera`; both are worth upstreaming.
+Local checkout on branch `pylate-packaging`, carrying five commits upstream does
+not have. Push to `robro612/Chimera`; all five are worth upstreaming.
+
+| commit | what |
+|---|---|
+| packaging | a `pyproject.toml` — upstream is a bare CMake project you were meant to build in a conda env and put on `PYTHONPATH` |
+| CUDA arch | sets `CMAKE_CUDA_ARCHITECTURES` before `enable_language(CUDA)`; without it the module ships PTX the driver cannot JIT |
+| query shape | `PADDED_DIM` / `Q_DOCLEN` as CMake options, exported to Python |
+| borrowing `build()` | takes `const float*` instead of copying the whole corpus into a `std::vector` — 169 GiB of duplication on lotte |
+| dead 1-bit array | stops retaining and persisting doc-major 1-bit codes no search path reads |
 
 With those, it installs like any other backend — `pyproject.toml` declares it as
 the `chimera` extra with `[tool.uv.sources] chimera-retrieval = { path =
