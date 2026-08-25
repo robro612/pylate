@@ -61,6 +61,20 @@ voyager = ["voyager >= 2.0.9; python_version < '3.14'"]
 scann = ["scann >= 1.4.2; python_version < '3.14'"]
 warp = ["xtr-warp-rs == 2.0.3.*"]
 tachiom = ["tachiom >=0.3.3,<0.4.0"]
+# Chimera is cu130-only, and not by convention: compute_full_bit_scores uses
+# AVX-512 intrinsics unconditionally, and the V100 nodes that take cu126 are
+# Broadwell Xeons without it. It also needs cuVS, which only the cu130/cu126
+# extras pull in. scripts/sync_env.sh enables this extra for cu130* targets.
+#
+# scikit-build-core and pybind11 are listed here rather than left to PEP 517
+# because the extension is built with build isolation OFF (see [tool.uv]
+# no-build-isolation-package) — they have to be present in the environment
+# already when it builds.
+chimera = [
+    "chimera-retrieval",
+    "scikit-build-core >= 0.10",
+    "pybind11 >= 2.12",
+]
 flash-maxsim = ["flash-maxsim >= 0.2.1"]
 lik = [
     "late-interaction-kernels >=0.4.0,<0.5.0",
@@ -117,6 +131,12 @@ tachiom = { path = "../tachiom", editable = true }
 # re-sync (or a `maturin develop` into a specific venv) rather than being picked
 # up live — which a compiled extension requires anyway.
 fast-plaid = { path = "../fast-plaid", editable = false }
+# Local Chimera checkout, carrying the packaging commit that gives it a
+# pyproject.toml (upstream has none — it is a bare CMake project). Non-editable
+# for the same reason as fast-plaid, and more strictly: the compiled module
+# RPATHs the RAPIDS wheels in *this* environment's site-packages and is built
+# with -march=native, so it is specific to both the venv and the node class.
+chimera-retrieval = { path = "../Chimera", editable = false }
 cuvs-cu13 = { index = "nvidia" }
 cuvs-cu12 = { index = "nvidia" }
 # Only the cu126 extra redirects torch; cu130 takes the PyPI wheel, which is
@@ -130,6 +150,11 @@ torch = [{ index = "pytorch-cu126", extra = "cu126" }]
 # tachiom / hydra / ranx behind your back. The extras stay as the published
 # install surface for people who `pip install pylate[eval]`.
 default-groups = ["research", "docs"]
+# Chimera resolves cuVS/RAFT/RMM out of the *target* environment's site-packages
+# and bakes those paths into the module's RPATH. An isolated build environment is
+# discarded after the build, so an RPATH into it would dangle — the build has to
+# see the environment it is being installed into.
+no-build-isolation-package = ["chimera-retrieval"]
 # One environment cannot hold both CUDA variants.
 conflicts = [[{ extra = "cu126" }, { extra = "cu130" }]]
 

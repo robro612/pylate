@@ -611,6 +611,11 @@ wheels = [
 ]
 
 [[package]]
+name = "chimera-retrieval"
+version = "0.1.0"
+source = { directory = "../Chimera" }
+
+[[package]]
 name = "click"
 version = "8.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4921,6 +4926,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pybind11"
+version = "3.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/f3/95b0f40b31df41dbfe6bb0857419c9442c15839cbac4796f1c26ae0b6081/pybind11-3.1.0.tar.gz", hash = "sha256:a1cc06b524ab3edca51f8ad3895f9c4fa20b8b19283173dff4ae781449dc9639", size = 603746, upload-time = "2026-08-06T23:33:00.675Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/fd/8762f7ee3e4e4be6d1d846cffb4916dd9bb02b2f800d3603718a0efe494c/pybind11-3.1.0-py3-none-any.whl", hash = "sha256:b8488090f8acffbcb6b5d6a85571a6827a0a2981ffb75e5a0b27b87c4a6b7dd0", size = 319402, upload-time = "2026-08-06T23:32:59.047Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5091,6 +5105,11 @@ api = [
     { name = "fastapi" },
     { name = "uvicorn" },
 ]
+chimera = [
+    { name = "chimera-retrieval" },
+    { name = "pybind11" },
+    { name = "scikit-build-core" },
+]
 cu126 = [
     { name = "cuvs-cu12", marker = "python_full_version < '3.14' and sys_platform == 'linux'" },
     { name = "torch", version = "2.11.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" } },
@@ -5168,6 +5187,7 @@ requires-dist = [
     { name = "batched", marker = "extra == 'dev'", specifier = ">=0.1.2" },
     { name = "beir", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "beir", marker = "extra == 'eval'", specifier = ">=2.0.0" },
+    { name = "chimera-retrieval", marker = "extra == 'chimera'", directory = "../Chimera" },
     { name = "cuvs-cu12", marker = "python_full_version < '3.14' and sys_platform == 'linux' and extra == 'cu126'", specifier = ">=25.10", index = "https://pypi.nvidia.com/" },
     { name = "cuvs-cu13", marker = "python_full_version < '3.14' and sys_platform == 'linux' and extra == 'cu130'", specifier = ">=25.10", index = "https://pypi.nvidia.com/" },
     { name = "datasets", specifier = ">=2.20.0" },
@@ -5185,6 +5205,7 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2.1" },
     { name = "peft", marker = "extra == 'image'", specifier = ">=0.13.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.1.0" },
+    { name = "pybind11", marker = "extra == 'chimera'", specifier = ">=2.12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2.1" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=15.0.0" },
@@ -5193,6 +5214,7 @@ requires-dist = [
     { name = "ranx", marker = "extra == 'eval'", specifier = ">=0.3.16" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.9" },
     { name = "scann", marker = "python_full_version < '3.14' and extra == 'scann'", specifier = ">=1.4.2" },
+    { name = "scikit-build-core", marker = "extra == 'chimera'", specifier = ">=0.10" },
     { name = "sentence-transformers", specifier = "==5.5.1" },
     { name = "sentence-transformers", extras = ["image"], marker = "extra == 'image'" },
     { name = "tachiom", marker = "extra == 'tachiom'", editable = "../tachiom" },
@@ -5207,7 +5229,7 @@ requires-dist = [
     { name = "voyager", marker = "python_full_version < '3.14' and extra == 'voyager'", specifier = ">=2.0.9" },
     { name = "xtr-warp-rs", marker = "extra == 'warp'", specifier = "==2.0.3.*" },
 ]
-provides-extras = ["dev", "eval", "api", "voyager", "scann", "warp", "tachiom", "flash-maxsim", "lik", "image", "cu130", "cu126"]
+provides-extras = ["dev", "eval", "api", "voyager", "scann", "warp", "tachiom", "chimera", "flash-maxsim", "lik", "image", "cu130", "cu126"]
 
 [package.metadata.requires-dev]
 docs = [
@@ -6048,6 +6070,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c0/f8/6ecec0c496a1f771c6874dbb00f619ab4ac1e434fa7661e4eedc4e959623/scann-1.4.2-cp312-cp312-manylinux_2_27_x86_64.whl", hash = "sha256:c0f45d810e629fdcdf8da546d1e25bde4664d27dcf5c3399aa335b4934a0734c", size = 11579291, upload-time = "2025-08-29T14:32:22.855Z" },
     { url = "https://files.pythonhosted.org/packages/89/a1/b868924221e7ec8a8c2e7b74ad9fc730fe5554962dc0d56efc2615d03ea3/scann-1.4.2-cp313-cp313-manylinux_2_27_aarch64.whl", hash = "sha256:469a4a907ea09a15e4c25850330377bd9967c29177d836600051caf281e33612", size = 9296343, upload-time = "2025-08-29T14:32:35.436Z" },
     { url = "https://files.pythonhosted.org/packages/3b/b4/3decfd7039399b6bd9c9fbf0ccda39301bac01c39a09a5a791c8237f5d26/scann-1.4.2-cp313-cp313-manylinux_2_27_x86_64.whl", hash = "sha256:c87e97f91c98d7d1f0bf985b39634e07e1149ba79c20f7dbf9b7b465c94100f2", size = 11579811, upload-time = "2025-08-29T14:32:25.101Z" },
+]
+
+[[package]]
+name = "scikit-build-core"
+version = "1.0.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "exceptiongroup", marker = "python_full_version < '3.11' or (extra == 'extra-6-pylate-cu126' and extra == 'extra-6-pylate-cu130')" },
+    { name = "packaging" },
+    { name = "pathspec" },
+    { name = "tomli", marker = "python_full_version < '3.11' or (extra == 'extra-6-pylate-cu126' and extra == 'extra-6-pylate-cu130')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11' or (extra == 'extra-6-pylate-cu126' and extra == 'extra-6-pylate-cu130')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/7c/0f69b0c7150ce4bcee78c199fe3b7e03a6e01578451bd5d5d1a58beb32f9/scikit_build_core-1.0.3.tar.gz", hash = "sha256:a4d7a05978ee37975c37743510c8991e2debce7ef83afb0a07c0c576fd4f16e8", size = 477539, upload-time = "2026-07-12T05:08:30.298Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/b0/7ad8fa9aebb0835b2e20afebf1483cbe175d1612fe01e85042ce9ced8755/scikit_build_core-1.0.3-py3-none-any.whl", hash = "sha256:ae95427b7d3c14a6cf8bbfd4d901f6138ab64c99e20cbe8ea7d75cd26093f085", size = 278294, upload-time = "2026-07-12T05:08:28.725Z" },
 ]
 
 [[package]]

@@ -10,9 +10,10 @@ Usage:
     python scripts/benchmark_indexes.py model=google_xtr             # override model
     python scripts/benchmark_indexes.py index=plaid                  # override index
     python scripts/benchmark_indexes.py index=tachiom                # Tachiom index
+    python scripts/benchmark_indexes.py index=chimera                # Chimera index
     python scripts/benchmark_indexes.py index=tachiom 'index/clustering=pgc'
     python scripts/benchmark_indexes.py datasets=[beir/fiqa/test,beir/scifact/test]
-    python scripts/benchmark_indexes.py --multirun index=warp,plaid,tachiom
+    python scripts/benchmark_indexes.py --multirun index=plaid,tachiom,chimera
 
 Multimodal (ViDoRe visual document retrieval): documents are page images
 encoded by a ColPali-family VLM. Same pipeline (encode -> cache -> index ->
@@ -149,7 +150,10 @@ def get_index_config_dict(index) -> dict:
         "nbits", "n_ivf_probe", "bound", "t_prime", "max_candidates",
         "centroid_score_threshold", "kmeans_niters", "n_samples_kmeans",
         "min_outliers", "max_growth_rate",
-        # Actual centroid count (WARP/PLAID read from disk; Tachiom stored at build time)
+        # Chimera search/build params
+        "nprobe", "k_refine", "k_full_bit", "cagra_itopk_size", "num_chunks",
+        "ex_bits", "tokens_per_cluster", "scores_are_synthetic",
+        # Actual centroid count (WARP/PLAID read from disk; Tachiom/Chimera stored at build time)
         "actual_total_centroids",
     ):
         val = getattr(index, attr, None)
@@ -244,6 +248,48 @@ def load_dataset(
         len(documents), len(queries), len(qrels),
     )
     return documents, queries, qrels
+
+
+def subsample_queries(query_ids, queries_embeddings, qrels, n, seed, cache_path):
+    """Deterministically keep ``n`` queries, identical across runs and indexes.
+
+    The subset is a fixed permutation of the *sorted* query ids — sorting first
+    makes it independent of dataset load order — and is frozen to ``cache_path``
+    on first use, then reused verbatim so it can never drift (even if this code
+    or the seed later changes). ``query_ids`` and ``queries_embeddings`` are
+    positionally aligned; both are sliced by the same order-preserving mask so
+    the alignment survives, and ``qrels`` is filtered to the kept ids so metrics
+    are computed over exactly the retained set.
+    """
+    if not n or n >= len(query_ids):
+        return query_ids, queries_embeddings, qrels
+    if os.path.exists(cache_path):
+        chosen = set(json.load(open(cache_path))["query_ids"])
+        missing = chosen - set(query_ids)
+        if missing:
+            raise ValueError(
+                f"subsample {cache_path} has {len(missing)} ids absent from this "
+                "dataset — wrong dataset for this frozen subsample."
+            )
+    else:
+        sids = sorted(query_ids)
+        perm = np.random.default_rng(seed).permutation(len(sids))
+        chosen = {sids[j] for j in perm[:n]}
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(
+                {"query_ids": sorted(chosen), "n": n, "seed": seed,
+                 "total": len(query_ids)}, f, indent=0,
+            )
+    keep = [i for i, q in enumerate(query_ids) if q in chosen]
+    q_ids = [query_ids[i] for i in keep]
+    q_emb = [queries_embeddings[i] for i in keep]
+    q_rels = {q: qrels[q] for q in q_ids if q in qrels}
+    logger.info(
+        "query subsample: %d -> %d (seed=%d) from %s",
+        len(query_ids), len(q_ids), seed, cache_path,
+    )
+    return q_ids, q_emb, q_rels
 
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1119,36 @@ def build_index(
         build_time = time.perf_counter() - build_start
         gc.collect()
 
+    elif index_type == "chimera":
+        index = indexes.Chimera(
+            index_folder=index_folder,
+            index_name=index_name,
+            override=True,
+            # Build params (baked into the artifact)
+            n_clusters=index_cfg.get("n_clusters", None) if index_cfg else None,
+            tokens_per_cluster=index_cfg.get("tokens_per_cluster", 150) if index_cfg else 150,
+            ex_bits=index_cfg.get("ex_bits", 4) if index_cfg else 4,
+            # Search params (bound at load time by the C++ index)
+            nprobe=index_cfg.get("nprobe", 128) if index_cfg else 128,
+            k_refine=index_cfg.get("k_refine", 3000) if index_cfg else 3000,
+            k_full_bit=index_cfg.get("k_full_bit", 300) if index_cfg else 300,
+            cagra_itopk_size=index_cfg.get("cagra_itopk_size", None) if index_cfg else None,
+            num_chunks=index_cfg.get("num_chunks", 5) if index_cfg else 5,
+        )
+        # Chimera's build() is one shot over the whole corpus and copies the
+        # float32 array into a std::vector before clustering, so this peaks at
+        # ~2x the flat token buffer. Unlike WARP/PLAID there is no shard-by-shard
+        # add to spread that out.
+        logger.info("Building Chimera index from shards (single-shot C++/CUDA build)...")
+        build_start = time.perf_counter()
+        index.add_documents_from_shards(
+            documents_ids=doc_ids,
+            shard_dir=shard_dir,
+            glob_pattern="doc_shard_*.npy",
+        )
+        build_time = time.perf_counter() - build_start
+        gc.collect()
+
     else:
         raise ValueError(f"Unknown index type: {index_type}")
 
@@ -1120,7 +1196,7 @@ def benchmark_search(
     if index_type == "warp":
         retriever = retrieve.XTR(index=index)
         retrieve_kwargs = dict(queries_embeddings=queries_embeddings, k=k)
-    elif index_type in ("plaid", "fast_plaid", "tachiom"):
+    elif index_type in ("plaid", "fast_plaid", "tachiom", "chimera"):
         retriever = retrieve.ColBERT(index=index)
         retrieve_kwargs = dict(queries_embeddings=queries_embeddings, k=k)
     elif index_type == "scann" and retrieval == "xtr":
@@ -1158,7 +1234,7 @@ def benchmark_search(
     if (
         profile
         and e2e_profile_batch_size is not None
-        and index_type in ("warp", "plaid", "fast_plaid", "tachiom")
+        and index_type in ("warp", "plaid", "fast_plaid", "tachiom", "chimera")
     ):
         # End-to-end indexes normally profile as one coarse span over the full
         # query set. This opt-in path runs smaller outer batches, commonly bs=1,
@@ -1362,6 +1438,21 @@ def load_existing_index(
             gap_relative=index_cfg.get("gap_relative", False) if index_cfg else False,
             num_threads=index_cfg.get("num_threads", 0) if index_cfg else 0,
         )
+    elif index_type == "chimera":
+        # Build params are read back off the index's params.json; only the search
+        # params are this instance's to choose, and the C++ index binds them at
+        # load(), so they cannot be changed on a live index.
+        index = indexes.Chimera(
+            index_folder=index_folder,
+            index_name=index_name,
+            override=False,
+            nprobe=index_cfg.get("nprobe", 128) if index_cfg else 128,
+            k_refine=index_cfg.get("k_refine", 3000) if index_cfg else 3000,
+            k_full_bit=index_cfg.get("k_full_bit", 300) if index_cfg else 300,
+            cagra_itopk_size=index_cfg.get("cagra_itopk_size", None) if index_cfg else None,
+            num_chunks=index_cfg.get("num_chunks", 5) if index_cfg else 5,
+        )
+
     else:
         raise ValueError(f"Unknown index type: {index_type}")
 
@@ -1475,6 +1566,13 @@ def main(cfg: DictConfig) -> None:
                 clustering_slug = f"_{clustering_type}_{src}_m{m}"
             else:
                 clustering_slug = f"_{clustering_type}_m{m}"
+        elif index_type == "chimera":
+            # ex_bits and n_clusters are baked into the on-disk codes and the
+            # CAGRA graph, so two settings must not share an index name — same
+            # reasoning as tachiom's m{M} above.
+            nc = cfg.index.get("n_clusters", None)
+            nc_slug = f"_nc{int(nc)}" if nc else f"_tpc{cfg.index.get('tokens_per_cluster', 150)}"
+            clustering_slug = f"_ex{cfg.index.get('ex_bits', 4)}{nc_slug}"
         index_name = f"bench_{model_slug}_{dataset_slug}_{index_type}{clustering_slug}"
         # Re-snapshot the (possibly path-injected) index config for the result rows.
         index_config = OmegaConf.to_container(cfg.index, resolve=True)
@@ -1641,6 +1739,16 @@ def main(cfg: DictConfig) -> None:
                 )
                 index_path = os.path.join(cfg.output.index_folder, index_name)
                 disk_mb = get_dir_size_mb(index_path)
+
+            sub_n = cfg.search.get("query_subsample", None)
+            if sub_n:
+                sub_path = os.path.join(
+                    "results", "subsamples", f"{dataset_slug}_n{int(sub_n)}.json"
+                )
+                query_ids, queries_embeddings, qrels = subsample_queries(
+                    query_ids, queries_embeddings, qrels, int(sub_n),
+                    int(cfg.search.get("query_subsample_seed", 42)), sub_path,
+                )
 
             search_repeats = cfg.search.get("repeats", 1)
             for retrieval in retrieval_modes:

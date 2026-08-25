@@ -1,0 +1,51 @@
+# Chimera — single-GPU multi-vector retrieval (https://github.com/iidyc/Chimera)
+#
+# Needs the `chimera` extra, which scripts/sync_env.sh builds for cu130 targets:
+#   srunl40s --mem=64G --cpus-per-task=16 ./scripts/sync_env.sh cu130
+# (compute node, not the login node — it wants AVX-512 and a visible GPU, and
+# cu126/V100 cannot run it at all). See docs/chimera.md.
+#
+# Compile-time constants constrain what this index can be pointed at: Q_DOCLEN=32
+# query tokens and PADDED_DIM=128 dimensions. Datasets whose query_length exceeds
+# 32 (scidocs, scifact, trec-covid, arguana, climate-fever) need Q_DOCLEN raised
+# in cpp/include/chimera/config.cuh and a rebuild; the wrapper raises rather than
+# truncating. Shorter queries are zero-padded, which is score-preserving.
+#
+# SCORES ARE SYNTHETIC. Upstream's binding returns document ids without their
+# late-interaction scores, so run files carry descending placeholders. Rank
+# metrics (NDCG / recall / MAP / MRR) are exact; score *values* are not.
+type: chimera
+retrieval:
+  - colbert
+
+# --- build (baked into the artifact; changing either forces a rebuild) ---
+# Upstream recommends n_tokens/200 .. n_tokens/100 clusters. n_clusters: null
+# derives it as n_tokens // tokens_per_cluster.
+n_clusters: null
+tokens_per_cluster: 150
+# Residual quantisation width, 1-7 — total is 1 + ex_bits bits per dimension, so
+# ex_bits=4 sits just above PLAID's nbits=4 and well above tachiom's default
+# pq_subspaces=32 (2 bit/dim). Chimera's disk footprint reflects that: 117 MB on
+# nfcorpus vs PLAID 39 MB and tachiom 64 MB.
+ex_bits: 4
+
+# --- search (bound at load(); a live index cannot be re-tuned) ---
+# nprobe is CAGRA's search k and is hard-capped at 1024 by RAFT's topk kernel;
+# the wrapper raises above that instead of letting the search die mid-run.
+nprobe: 128
+k_refine: 3000        # candidates kept for one-bit refinement
+# k_full_bit is the recall knob, and upstream's default of 300 is starved — the
+# same lever as tachiom's k_docs_to_score. Measured on beir/nfcorpus/test with
+# lightonai/LateOn (866k tokens, 5775 clusters), retrieving from one index:
+#
+#   k_full_bit=300   ndcg@10 0.3634  r@100 0.2903  qps 347
+#   k_full_bit=2000  ndcg@10 0.3783  r@100 0.3371  qps 123
+#   (plaid           ndcg@10 0.3804  r@100 0.3424  qps  79)
+#   (tachiom         ndcg@10 0.3789  r@100 0.3377  qps 168)
+#
+# 2000 is where Chimera matches PLAID/tachiom quality and the speed comparison
+# becomes apples-to-apples; raising nprobe instead does almost nothing. Must not
+# exceed k_refine.
+k_full_bit: 2000
+cagra_itopk_size: null  # null = slightly above nprobe, as upstream recommends
+num_chunks: 5         # GPU one-bit / CPU full-bit pipelining depth

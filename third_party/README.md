@@ -6,6 +6,7 @@ Symlinks (gitignored contents) used for editable / maturin builds:
 third_party/tachiom      -> /exp/rjha/tachiom
 third_party/fast-plaid   -> /exp/rjha/fast-plaid
 third_party/xtr-warp-rs  -> /exp/rjha/xtr-warp-rs
+third_party/Chimera      -> /exp/rjha/Chimera
 ```
 
 `pyproject.toml` `[tool.uv.sources]` points both `tachiom` and `fast-plaid` at these checkouts (`../tachiom`, `../fast-plaid` — the same trees as `/exp/rjha/*` on this machine). `xtr-warp-rs` is installed editable by hand.
@@ -28,6 +29,31 @@ Each fork owns a small `stage_shim` that gates the `stage!` macro on the feature
 |---|---|---|
 | tachiom | yes | CPU; 3 stages |
 | fast-plaid | yes | CUDA-synced; 12 stages, on upstream 1.6.0 |
+| Chimera | n/a | C++/CUDA, not Rust; no stage timers |
 | xtr-warp-rs | **no** | has an orphaned `rust/profile.rs` (env-var JSONL writer, never wired into `lib.rs`); delete it when porting to the shared crate |
 
 Push profiling-related Rust changes to user forks (`robro612/...`), not upstream, until ready.
+
+## Chimera
+
+Local checkout on branch `pylate-packaging`, carrying two commits upstream does
+not have: a `pyproject.toml` (upstream is a bare CMake project with no Python
+packaging at all — you were meant to build it in a conda env and put `build/` on
+`PYTHONPATH`), and a CMake fix that sets `CMAKE_CUDA_ARCHITECTURES` before
+`enable_language(CUDA)`, without which the module ships PTX the driver cannot
+JIT. Push to `robro612/Chimera`; both are worth upstreaming.
+
+With those, it installs like any other backend — `pyproject.toml` declares it as
+the `chimera` extra with `[tool.uv.sources] chimera-retrieval = { path =
+"../Chimera" }` — and `scripts/sync_env.sh cu130` builds it. Non-editable, and
+**built with build isolation off** (`[tool.uv] no-build-isolation-package`): the
+extension resolves cuVS/RAFT/RMM out of the target venv's site-packages and
+RPATHs those paths, so an isolated build environment would leave a dangling
+RPATH. It is also `-march=native`, making the artifact specific to both the venv
+and the node class.
+
+`cu126` deliberately skips it: `compute_full_bit_scores` uses AVX-512
+intrinsics unconditionally and the V100 nodes are Broadwell Xeons without them.
+
+See [docs/chimera.md](../docs/chimera.md) for the two upstream *behaviours* the
+PyLate wrapper works around, as distinct from the two build fixes above.

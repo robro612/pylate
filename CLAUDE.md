@@ -10,7 +10,7 @@ There are **four** venvs and **no `.venv`**. All four come from the single
 
 | venv | nodes | Rust forks |
 |---|---|---|
-| `.venv-cu130` | L40S / A100 / H100 | plain — use for QPS |
+| `.venv-cu130` | L40S / A100 / H100 | plain — use for QPS; only these get Chimera |
 | `.venv-cu126` | V100 (CUDA 13 dropped Volta sm_70) | plain — use for QPS |
 | `.venv-cu130-profile` | L40S / A100 / H100 | stage timing enabled |
 | `.venv-cu126-profile` | V100 | stage timing enabled |
@@ -57,6 +57,7 @@ scripts/experiments/    one-off sweep drivers (read PYLATE_VENV) — currently e
 scripts/slurm/          .sbatch job files
 scripts/analysis/       one-off measurement scripts
 docs/environments.md    environment reference — the authority on venv handling
+docs/chimera.md         Chimera index: conda-free build, upstream caveats
 docs/profiling.md       stage-span profiling: stages, CUDA correctness, caveats
 ```
 
@@ -65,6 +66,14 @@ docs/profiling.md       stage-span profiling: stages, CUDA correctness, caveats
 `tachiom` and `fast-plaid` are built from checkouts next to this repo
 (`../tachiom`, `../fast-plaid`), wired via `[tool.uv.sources]`. Both consume
 `crates/stage-profile` behind an optional Cargo `profile` feature.
+
+`Chimera` is C++/CUDA rather than Rust, and comes from `../Chimera` the same way
+— a local checkout carrying a packaging commit (upstream is a bare CMake project
+with no `pyproject.toml`), installed as the `chimera` extra with build isolation
+off. It links cuVS/RMM from the RAPIDS **pip** wheels in the target venv, so no
+conda is involved. `sync_env.sh` builds it for `cu130*` only: it needs AVX-512,
+and the V100 nodes behind `cu126` are Broadwell Xeons without it. See
+[docs/chimera.md](docs/chimera.md).
 
 `fast-plaid` is installed **non-editable** deliberately — an editable maturin
 install is a `.pth` into the source tree, so every environment would share the

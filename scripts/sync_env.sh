@@ -12,6 +12,12 @@
 # environment per architecture rather than contaminating the fast one. All four
 # resolve from the same lockfile and cannot drift in Python-package versions.
 #
+# The cu130 targets additionally build Chimera (C++/CUDA, cuVS). That one has to
+# run on an L40S/A100/H100 node and nowhere else: CMakeLists.txt uses
+# -march=native with unconditional AVX-512 intrinsics, and CUDA_ARCHITECTURES
+# defaults to `native`, which needs a visible GPU. cu126 skips it — its V100
+# nodes are Broadwell Xeons with no AVX-512, so Chimera cannot run there at all.
+#
 # Run under slurm — these compile the Rust forks, including torch-sys, whose
 # generated C++ translation unit needs several GB per cc job. Ask for memory or
 # the build gets OOM-killed:
@@ -46,12 +52,19 @@ PROFILE_ARGS=(
 REBUILD=(--reinstall-package fast-plaid --reinstall-package tachiom)
 
 case "$TARGET" in
-cu130) CUDA_EXTRA="cu130" PROFILED=0 ;;
-cu126) CUDA_EXTRA="cu126" PROFILED=0 ;;
-cu130-profile) CUDA_EXTRA="cu130" PROFILED=1 ;;
-cu126-profile) CUDA_EXTRA="cu126" PROFILED=1 ;;
+cu130) CUDA_EXTRA="cu130" PROFILED=0 CHIMERA=1 ;;
+cu126) CUDA_EXTRA="cu126" PROFILED=0 CHIMERA=0 ;;
+cu130-profile) CUDA_EXTRA="cu130" PROFILED=1 CHIMERA=1 ;;
+cu126-profile) CUDA_EXTRA="cu126" PROFILED=1 CHIMERA=0 ;;
+# A second profiling environment on the same axes. It exists so a Rust change
+# can be built and measured while a long sweep still runs against
+# .venv-cu130-profile: each sweep point is a fresh `uv run` process, so
+# rebuilding the environment under a running sweep would split its result file
+# across two different binaries. Retire it once the sweep finishes and the
+# change lands in the four standard environments.
+cu130-profile-b) CUDA_EXTRA="cu130" PROFILED=1 CHIMERA=1 ;;
 *)
-    echo "usage: $0 {cu130|cu126|cu130-profile|cu126-profile}" >&2
+    echo "usage: $0 {cu130|cu126|cu130-profile|cu126-profile|cu130-profile-b}" >&2
     exit 2
     ;;
 esac
@@ -60,6 +73,15 @@ VENV=".venv-$TARGET"
 ARGS=(--extra "$CUDA_EXTRA" "${REBUILD[@]}")
 if [[ "$PROFILED" == 1 ]]; then
     ARGS+=("${PROFILE_ARGS[@]}")
+fi
+if [[ "$CHIMERA" == 1 ]]; then
+    # Same reasoning as REBUILD above: the compiled artifact is what differs
+    # between environments, and uv's build cache cannot tell a -march=native
+    # build on one node class from another.
+    ARGS+=(--extra chimera --reinstall-package chimera-retrieval)
+    HOLD_CHIMERA=(--no-install-package chimera-retrieval)
+else
+    HOLD_CHIMERA=()
 fi
 
 export UV_PROJECT_ENVIRONMENT="$VENV"
@@ -75,8 +97,8 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 # longer compiles against torch-sys 0.20.
 TORCH_DIR="$PROJECT_DIR/$VENV/lib/python3.12/site-packages/torch"
 
-echo "==> [1/2] syncing $VENV ($TARGET) without the Rust forks"
-uv sync --locked "${ARGS[@]}" \
+echo "==> [1/2] syncing $VENV ($TARGET) without the compiled backends"
+uv sync --locked "${ARGS[@]}" "${HOLD_CHIMERA[@]}" \
     --no-install-package fast-plaid --no-install-package tachiom
 
 if [[ ! -d "$TORCH_DIR" ]]; then
@@ -84,9 +106,32 @@ if [[ ! -d "$TORCH_DIR" ]]; then
     exit 1
 fi
 
-echo "==> [2/2] building the Rust forks against $VENV torch"
+echo "==> [2/2] building the compiled backends against $VENV"
 export LIBTORCH="$TORCH_DIR"
 export LIBTORCH_BYPASS_VERSION_CHECK=1
+
+if [[ "$CHIMERA" == 1 ]]; then
+    # nvcc is not on PATH on these nodes, so CMake's enable_language(CUDA) has
+    # nothing to find; CUDACXX is the variable it looks at. Match the CUDA major
+    # version to the RAPIDS wheels the cu130 extra installed (libcuvs_cu13), not
+    # to whatever /usr/local/cuda happens to point at.
+    CUDA_MAJOR="$(ls -d "$PROJECT_DIR/$VENV"/lib/python3.12/site-packages/libcuvs_cu*.dist-info 2>/dev/null \
+        | head -1 | sed -E 's/.*libcuvs_cu([0-9]+).*/\1/')"
+    CHIMERA_CUDA_HOME="${CHIMERA_CUDA_HOME:-$(ls -d /usr/local/cuda-"${CUDA_MAJOR:-13}".* 2>/dev/null | sort -V | tail -1)}"
+    if [[ ! -x "$CHIMERA_CUDA_HOME/bin/nvcc" ]]; then
+        echo "error: no nvcc under $CHIMERA_CUDA_HOME (needed to build chimera)" >&2
+        exit 1
+    fi
+    export CUDACXX="$CHIMERA_CUDA_HOME/bin/nvcc"
+    # scikit-build-core forwards CMAKE_ARGS. Pass the architecture explicitly
+    # rather than relying on CMakeLists' default: getting it wrong does not fail
+    # the build, it ships PTX the driver cannot JIT and dies at the first kernel
+    # launch. `native` reads it off this node's GPU; set CHIMERA_CUDA_ARCH
+    # (89 = L40S, 80 = A100, 90 = H100) to build for a different node class.
+    export CMAKE_ARGS="-DCUDAToolkit_ROOT=$CHIMERA_CUDA_HOME -DCMAKE_CUDA_ARCHITECTURES=${CHIMERA_CUDA_ARCH:-native}"
+    echo "    chimera: nvcc=$CUDACXX arch=${CHIMERA_CUDA_ARCH:-native}"
+fi
+
 uv sync --locked "${ARGS[@]}"
 
 echo "==> $VENV ready"
@@ -107,4 +152,10 @@ try:
     print("tachiom profile:", tachiom.Tachiom.profile_supported())
 except Exception as exc:  # pragma: no cover - diagnostic only
     print("tachiom: unavailable —", exc)
+try:
+    import chimera
+
+    print("chimera:", chimera.ChimeraIndex)
+except Exception as exc:  # pragma: no cover - diagnostic only
+    print("chimera: unavailable —", exc)
 PY
