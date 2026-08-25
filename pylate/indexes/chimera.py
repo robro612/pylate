@@ -304,6 +304,29 @@ class Chimera(Base):
         self._index = self._chimera.ChimeraIndex.load(
             self._chimera_path, **self._search_options()
         )
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Force the C++ index to build its search state before it is timed.
+
+        ``chimera_index::search`` calls ``initialize_search_state()`` lazily on
+        the first query, and that is not cheap: device allocations plus the
+        upload of the cluster-major codes, ~28 B/token. Left alone it lands
+        inside whatever the caller is measuring. On beir/trec-covid — 3.4 GB
+        index, 50 queries — it dragged a sweep point to 1.63 QPS against ~27 for
+        the identical configuration measured second.
+
+        PLAID and tachiom both do their loading at load time, so warming up here
+        makes Chimera's reported QPS steady-state like theirs rather than
+        handicapping it with a one-off cost. One throwaway query, discarded.
+        """
+        dim = self._params.get("dim")
+        if dim is None:
+            return
+        rng = np.random.default_rng(0)
+        query = rng.standard_normal((self.query_tokens, dim)).astype(np.float32)
+        query /= np.linalg.norm(query, axis=1, keepdims=True)
+        self._index.search(np.ascontiguousarray(query), k=1)
 
     def _search_options(self) -> dict:
         return dict(
