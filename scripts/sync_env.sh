@@ -128,8 +128,18 @@ if [[ "$CHIMERA" == 1 ]]; then
     # the build, it ships PTX the driver cannot JIT and dies at the first kernel
     # launch. `native` reads it off this node's GPU; set CHIMERA_CUDA_ARCH
     # (89 = L40S, 80 = A100, 90 = H100) to build for a different node class.
-    export CMAKE_ARGS="-DCUDAToolkit_ROOT=$CHIMERA_CUDA_HOME -DCMAKE_CUDA_ARCHITECTURES=${CHIMERA_CUDA_ARCH:-native}"
-    echo "    chimera: nvcc=$CUDACXX arch=${CHIMERA_CUDA_ARCH:-native}"
+    #
+    # Q_DOCLEN is the compile-time query token count, and it has to cover the
+    # longest query_length in conf/eval/config.yaml — 48, for trec-covid,
+    # scidocs, scifact — because the wrapper refuses to truncate. Datasets
+    # configured shorter are zero-padded up to it, which is score-preserving but
+    # spends the padded tokens' share of the candidate budget, so this is a real
+    # trade rather than a free upper bound. Must be a multiple of 16.
+    # Changing it invalidates every index already built.
+    export CMAKE_ARGS="-DCUDAToolkit_ROOT=$CHIMERA_CUDA_HOME"
+    CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_CUDA_ARCHITECTURES=${CHIMERA_CUDA_ARCH:-native}"
+    CMAKE_ARGS="$CMAKE_ARGS -DCHIMERA_Q_DOCLEN=${CHIMERA_Q_DOCLEN:-48}"
+    echo "    chimera: nvcc=$CUDACXX arch=${CHIMERA_CUDA_ARCH:-native} Q_DOCLEN=${CHIMERA_Q_DOCLEN:-48}"
 fi
 
 uv sync --locked "${ARGS[@]}"

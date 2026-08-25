@@ -25,8 +25,11 @@ except ImportError as exc:  # pragma: no cover - depends on local build state
     pytest.skip(f"Chimera extension not built: {exc}", allow_module_level=True)
 
 
+_chimera = _load_chimera()
 DIM = 128
-QUERY_TOKENS = 32
+# Whatever this environment was compiled for; sync_env.sh builds 48 so the
+# 48-token BEIR datasets work, but the suite must not assume that.
+QUERY_TOKENS = getattr(_chimera, "Q_DOCLEN", 32)
 N_DOCUMENTS = 400
 
 
@@ -40,7 +43,7 @@ def corpus():
     answer at rank 1 is unambiguous.
     """
     rng = np.random.default_rng(0)
-    doclens = rng.integers(40, 90, size=N_DOCUMENTS)
+    doclens = rng.integers(QUERY_TOKENS + 8, QUERY_TOKENS + 58, size=N_DOCUMENTS)
     documents = []
     for length in doclens:
         vectors = rng.standard_normal((length, DIM)).astype(np.float32)

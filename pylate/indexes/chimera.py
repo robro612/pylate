@@ -61,13 +61,23 @@ def _load_chimera():
 def _compile_time_limits() -> tuple[int, int]:
     """Return ``(padded_dim, query_tokens)`` for the installed build.
 
-    These are compile-time constants with no runtime accessor, so a build with
-    a non-default ``config.cuh`` has to be declared through
-    ``CHIMERA_PADDED_DIM`` / ``CHIMERA_Q_DOCLEN``.
+    Read off the module, which exports the `#define`s it was compiled with, so
+    an environment built for a longer query length is detected rather than
+    assumed. The env vars are an escape hatch for a build predating that
+    export; the constants themselves fall back to upstream's ColBERTv2 shape.
     """
+    module = _load_chimera()
     return (
-        int(os.environ.get("CHIMERA_PADDED_DIM", _DEFAULT_PADDED_DIM)),
-        int(os.environ.get("CHIMERA_Q_DOCLEN", _DEFAULT_QUERY_TOKENS)),
+        int(
+            os.environ.get(
+                "CHIMERA_PADDED_DIM", getattr(module, "PADDED_DIM", _DEFAULT_PADDED_DIM)
+            )
+        ),
+        int(
+            os.environ.get(
+                "CHIMERA_Q_DOCLEN", getattr(module, "Q_DOCLEN", _DEFAULT_QUERY_TOKENS)
+            )
+        ),
     )
 
 
@@ -268,6 +278,19 @@ class Chimera(Base):
         if not self.is_indexed:
             raise ValueError(
                 "The index is empty. Please add documents before querying."
+            )
+        built_tokens = self._params.get("query_tokens")
+        built_dim = self._params.get("padded_dim")
+        if (built_tokens, built_dim) != (None, None) and (
+            built_tokens != self.query_tokens or built_dim != self.padded_dim
+        ):
+            raise RuntimeError(
+                f"This index was built by a Chimera compiled for "
+                f"Q_DOCLEN={built_tokens} / PADDED_DIM={built_dim}, but the "
+                f"installed extension is {self.query_tokens} / "
+                f"{self.padded_dim}. The rotation and code layout depend on "
+                "both, so the index has to be rebuilt (or the extension "
+                "rebuilt to match)."
             )
         n_clusters = self._params.get("n_clusters")
         if n_clusters is not None and self.nprobe > n_clusters:
