@@ -56,6 +56,16 @@ cu130) CUDA_EXTRA="cu130" PROFILED=0 CHIMERA=1 ;;
 cu126) CUDA_EXTRA="cu126" PROFILED=0 CHIMERA=0 ;;
 cu130-profile) CUDA_EXTRA="cu130" PROFILED=1 CHIMERA=1 ;;
 cu126-profile) CUDA_EXTRA="cu126" PROFILED=1 CHIMERA=0 ;;
+# Pinned to one node class rather than one CUDA variant. The lotte
+# chimera-vs-tachiom comparison builds and times on a single A100 node
+# (rack7n05: Ice Lake Xeon Gold 6338, full AVX-512, 1 TB), which is what makes
+# native builds safe here: Chimera's CMakeLists hardcodes -march=native, and
+# this target is meant to be driven with RUSTFLAGS="-C target-cpu=native" to
+# override tachiom's portable x86-64-v3 pin so both engines get AVX-512.
+# Nothing built under this target is portable to another node class -- that is
+# the point, and it is why it does not reuse .venv-cu130 (built Zen4/sm_89 on
+# an L40S). Drive it with CHIMERA_CUDA_ARCH=80 and CHIMERA_Q_DOCLEN=32.
+cu130-a100) CUDA_EXTRA="cu130" PROFILED=0 CHIMERA=1 ;;
 # A second profiling environment on the same axes. It exists so a Rust change
 # can be built and measured while a long sweep still runs against
 # .venv-cu130-profile: each sweep point is a fresh `uv run` process, so
@@ -64,7 +74,7 @@ cu126-profile) CUDA_EXTRA="cu126" PROFILED=1 CHIMERA=0 ;;
 # change lands in the four standard environments.
 cu130-profile-b) CUDA_EXTRA="cu130" PROFILED=1 CHIMERA=1 ;;
 *)
-    echo "usage: $0 {cu130|cu126|cu130-profile|cu126-profile|cu130-profile-b}" >&2
+    echo "usage: $0 {cu130|cu126|cu130-profile|cu126-profile|cu130-profile-b|cu130-a100}" >&2
     exit 2
     ;;
 esac

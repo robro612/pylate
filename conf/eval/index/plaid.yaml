@@ -2,6 +2,17 @@ type: plaid
 retrieval:
   - colbert
 nbits: 2
+# Search-side knobs. Both are read by scripts/benchmark_indexes.py via
+# index_cfg.get(), but they used to be absent here, which under Hydra's strict
+# mode made `index.n_full_scores=...` an error rather than an override. Listed
+# at fast-plaid's own defaults so they are sweepable and self-documenting, the
+# way tachiom's k_docs_to_score and chimera's k_full_bit already are.
+#
+# n_full_scores is PLAID's rerank depth -- the direct analogue of tachiom's
+# k_docs_to_score and chimera's k_full_bit, and the knob that has to be swept
+# for a Pareto comparison rather than pinned at one point.
+n_ivf_probe: 8
+n_full_scores: 8192
 random_rotation: false
 use_triton: null
 add_batch_size: 4 # batch size for number of shards to add at a time

@@ -65,6 +65,11 @@ search:
   maxsim_backend: null
   profile: true
   e2e_profile_batch_size: 1
+  # Deterministic query subsample (null = all queries). Frozen to
+  # results/subsamples/<dataset>_n<N>.json on first use and reused verbatim, so
+  # every run and every index scores the identical set.
+  query_subsample: null
+  query_subsample_seed: 42
   metrics:
     - map
     - ndcg@10
