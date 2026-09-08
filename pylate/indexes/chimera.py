@@ -1,22 +1,201 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
 import pickle
+import resource
 import shutil
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from ..profiling import Span, active
 from ..rank import RerankResult
 from .base import Base
 
 logger = logging.getLogger(__name__)
+
+
+def _current_rss_gib() -> float:
+    """Resident set size of this process, in GiB."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+    except (OSError, IndexError, ValueError):  # pragma: no cover - diagnostic only
+        return float("nan")
+    return pages * os.sysconf("SC_PAGE_SIZE") / 1024**3
+
+
+def _peak_rss_gib() -> float:
+    """High-water RSS of this process, in GiB (ru_maxrss is KiB on Linux)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
+
+
+# Filling the corpus buffer used to be one `np.load(..., mmap_mode="r")` per
+# shard, in a serial loop. Over NFS that leaves a single read outstanding at a
+# time, which on /exp (vers=3, rsize=256K, nconnect=4) measures ~160 MiB/s --
+# ~9 minutes for lotte/pooled/dev even uncontended, and the 30-40 minutes
+# actually observed once the rest of the build competes for the NIC. The mount
+# only approaches its ~1 GiB/s ceiling with many requests in flight, so the fill
+# is issued as chunk-sized pread()s from a thread pool instead. Measured 5.3x on
+# an 18 GiB four-shard subset (121s -> 23s) and 5.6x on a 3 GiB one; see
+# scripts/analysis/shard_load_bench.py, which also shows that mmap is not itself
+# the problem (a plain np.load is no faster) and that the fp16->fp32 cast is
+# only ~15% of the parallel time.
+_SHARD_LOAD_WORKERS = int(os.environ.get("PYLATE_SHARD_LOAD_WORKERS", "0")) or min(
+    32, 2 * (os.cpu_count() or 8)
+)
+_SHARD_LOAD_CHUNK_BYTES = (
+    int(os.environ.get("PYLATE_SHARD_LOAD_CHUNK_MIB", "16")) * 1024**2
+)
+
+
+def _npy_header(path: Path) -> tuple[int, tuple[int, ...], np.dtype]:
+    """Return ``(data_offset, shape, dtype)`` for a C-ordered 2-D ``.npy``."""
+    with open(path, "rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(handle)
+        else:
+            raise ValueError(f"{path}: unsupported .npy version {version}")
+        if fortran or len(shape) != 2:
+            raise ValueError(
+                f"{path}: expected a C-ordered 2-D array, got shape {shape} "
+                f"(fortran_order={fortran})"
+            )
+        return handle.tell(), shape, dtype
+
+
+def _fill_from_shards(
+    dest: np.ndarray,
+    vec_paths: list[Path],
+    shard_row_counts: list[int],
+    workers: int = _SHARD_LOAD_WORKERS,
+    chunk_bytes: int = _SHARD_LOAD_CHUNK_BYTES,
+) -> None:
+    """Fill ``dest`` from ``vec_paths``, casting to ``dest``'s dtype.
+
+    Rows land shard by shard in the order given, and in file order within a
+    shard -- byte for byte what the serial loop produced. ``os.preadv`` carries
+    its own offset, so one fd per shard is shared by every worker with no file
+    position to race on, and each worker reuses a single staging buffer, which
+    bounds the extra memory at ``workers * chunk_bytes`` (512 MiB at the
+    defaults) rather than at a multiple of the shard size. numpy releases the
+    GIL for both the read and the dtype conversion, so the cast of one chunk
+    overlaps the reads of the others.
+
+    ``PYLATE_SHARD_LOAD_WORKERS=1`` reduces this to a serial chunked read, which
+    is the closest thing to the old behaviour if a filesystem ever punishes
+    concurrency.
+    """
+    dim = dest.shape[1]
+    fds: list[int] = []
+    offsets: list[int] = []
+    tasks: list[tuple[int, int, int, int]] = []  # shard, file_row, dest_row, rows
+    dtype: np.dtype | None = None
+    dest_row = 0
+
+    try:
+        for path, expected_rows in zip(vec_paths, shard_row_counts):
+            data_offset, shape, shard_dtype = _npy_header(path)
+            if shape[1] != dim:
+                raise ValueError(
+                    f"{path} has dim {shape[1]}, but the buffer expects {dim}"
+                )
+            if shape[0] != expected_rows:
+                # The old loop turned this into an opaque broadcast error.
+                raise ValueError(
+                    f"{path} holds {shape[0]} tokens but its .doclens.npy sums "
+                    f"to {expected_rows}; the shard pair is inconsistent."
+                )
+            if dtype is None:
+                dtype = shard_dtype
+            elif shard_dtype != dtype:
+                raise ValueError(
+                    f"{path} has dtype {shard_dtype}, but earlier shards are "
+                    f"{dtype}; the shard set is not uniform."
+                )
+            shard = len(offsets)
+            offsets.append(data_offset)
+            fds.append(os.open(path, os.O_RDONLY))
+            chunk_rows = max(1, chunk_bytes // (dim * dtype.itemsize))
+            done = 0
+            while done < shape[0]:
+                rows = min(chunk_rows, shape[0] - done)
+                tasks.append((shard, done, dest_row + done, rows))
+                done += rows
+            dest_row += shape[0]
+
+        if dest_row != dest.shape[0]:
+            raise ValueError(
+                f"shards hold {dest_row} tokens but the buffer has "
+                f"{dest.shape[0]} rows"
+            )
+
+        row_bytes = dim * dtype.itemsize
+        chunk_rows = max(1, chunk_bytes // row_bytes)
+        local = threading.local()
+
+        def _load_chunk(task: tuple[int, int, int, int]) -> None:
+            shard, file_row, drow, rows = task
+            staging = getattr(local, "staging", None)
+            if staging is None:
+                staging = local.staging = np.empty((chunk_rows, dim), dtype=dtype)
+                local.raw = memoryview(staging.reshape(-1).view(np.uint8))
+            view = local.raw[: rows * row_bytes]
+            pos = offsets[shard] + file_row * row_bytes
+            got = 0
+            while got < len(view):
+                read = os.preadv(fds[shard], [view[got:]], pos + got)
+                if not read:
+                    raise EOFError(
+                        f"{vec_paths[shard]}: short read at byte {pos + got}"
+                    )
+                got += read
+            np.copyto(dest[drow : drow + rows], staging[:rows])
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for _ in tqdm(
+                pool.map(_load_chunk, tasks),
+                total=len(tasks),
+                desc="  Loading embedding shards",
+                unit="chunk",
+            ):
+                pass
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+# A loaded Chimera index, kept alive across wrapper instances in one process.
+#
+# Sweeps are the reason. Hydra's BasicLauncher runs multirun points in-process,
+# and the harness builds a fresh Chimera() per point, so every point used to
+# re-read the whole index from disk -- 41 GB for lotte/pooled/dev, and /exp is
+# NFS at ~150 MiB/s for a single reader, so several minutes per point purely to
+# arrive back where the previous point already was.
+#
+# chimera_index::try_set_search_options retunes a live index in place, but only
+# *narrows*: it returns false when the new options would need a bigger
+# allocation than the workspace was sized for. So a sweep only avoids reloads if
+# it visits the widest configuration first -- see
+# scripts/slurm/lotte_chimera_sweep.sbatch, which orders its loops that way for
+# exactly this reason.
+#
+# Keyed by index directory; a miss or a widening drops the old index before
+# loading, so two 41 GB indexes are never resident at once.
+_LOADED_INDEXES: dict[str, object] = {}
+
 
 # PADDED_DIM and Q_DOCLEN are `#define`s in Chimera's config.cuh, baked into the
 # binary and not exported through the bindings. The wrapper needs them to reject
@@ -301,9 +480,31 @@ class Chimera(Base):
             self.cagra_itopk_size = min(
                 max(self.cagra_itopk_size, self.nprobe), _CAGRA_MAX_TOPK
             )
+        key = str(self._chimera_path)
+        cached = _LOADED_INDEXES.get(key)
+        if cached is not None:
+            if cached.try_set_search_options(**self._search_options()):
+                logger.info(
+                    "Chimera: reusing the loaded index (retuned in place, "
+                    "no reload)"
+                )
+                self._index = cached
+                self._warm_up()
+                return
+            # Widening past what the live workspace was sized for. Drop the old
+            # index before loading, so peak memory stays at one index.
+            logger.info(
+                "Chimera: search options widen past the loaded workspace; "
+                "reloading"
+            )
+            _LOADED_INDEXES.pop(key, None)
+            del cached
+            gc.collect()
+
         self._index = self._chimera.ChimeraIndex.load(
             self._chimera_path, **self._search_options()
         )
+        _LOADED_INDEXES[key] = self._index
         self._warm_up()
 
     def _warm_up(self) -> None:
@@ -378,6 +579,27 @@ class Chimera(Base):
             )
         return n_clusters
 
+    @staticmethod
+    def _heartbeat(stop: threading.Event, label: str, interval: float = 60.0) -> None:
+        """Report liveness while an opaque blocking C++ call runs.
+
+        ``ChimeraIndex.build`` clusters, assigns, encodes, and builds the CAGRA
+        graph in one call that never yields to Python, so there is nothing for
+        a progress bar to attach to -- only the fork can report real stage
+        progress. A heartbeat still separates "working" from "hung", and the
+        RSS trace is what warns you a build is heading for the node's ceiling
+        before the OOM killer is the one to mention it.
+        """
+        t0 = time.perf_counter()
+        while not stop.wait(interval):
+            logger.info(
+                "%s: %.1f min elapsed, RSS %.1f GiB (peak %.1f GiB)",
+                label,
+                (time.perf_counter() - t0) / 60.0,
+                _current_rss_gib(),
+                _peak_rss_gib(),
+            )
+
     def _build(
         self,
         embeddings: np.ndarray,
@@ -399,20 +621,39 @@ class Chimera(Base):
             "Chimera.build: %d docs, %d tokens, dim=%d, n_clusters=%d, ex_bits=%d",
             len(doc_lens), n_tokens, dim, n_clusters, self.ex_bits,
         )
+        stop = threading.Event()
+        threading.Thread(
+            target=self._heartbeat,
+            args=(stop, "Chimera.build"),
+            daemon=True,
+        ).start()
         build_start = time.perf_counter()
-        self._index = self._chimera.ChimeraIndex.build(
-            embeddings,
-            doc_lens.astype(np.int32).tolist(),
-            n_clusters=n_clusters,
-            ex_bits=self.ex_bits,
-            **self._search_options(),
-        )
+        try:
+            self._index = self._chimera.ChimeraIndex.build(
+                embeddings,
+                doc_lens.astype(np.int32).tolist(),
+                n_clusters=n_clusters,
+                ex_bits=self.ex_bits,
+                **self._search_options(),
+            )
+        finally:
+            stop.set()
         build_seconds = time.perf_counter() - build_start
+        logger.info(
+            "Chimera.build: finished in %.1f min, peak RSS %.1f GiB",
+            build_seconds / 60.0,
+            _peak_rss_gib(),
+        )
 
         # chimera_index::save writes into an existing directory; it does not
         # create one.
         os.makedirs(self._chimera_path, exist_ok=True)
+        logger.info("Chimera: saving index to %s", self._chimera_path)
+        save_start = time.perf_counter()
         self._index.save(self._chimera_path)
+        logger.info(
+            "Chimera: saved in %.1f s", time.perf_counter() - save_start
+        )
 
         # The built index is kept and searched directly. It did not used to be:
         # searching what build() returned was nondeterministic, losing the
@@ -528,10 +769,29 @@ class Chimera(Base):
         embeddings = np.empty((total_tokens, dim), dtype=np.float32)
         doc_lens = np.concatenate(all_doclens).astype(np.int32)
 
-        offset = 0
-        for path, count in zip(vec_paths, shard_tok_counts):
-            embeddings[offset : offset + count] = np.load(str(path), mmap_mode="r")
-            offset += count
+        # This fill is the single largest allocation in the build --
+        # n_tokens * dim * 4 bytes, 169 GiB on lotte/pooled/dev -- and it is
+        # network-bound, so _fill_from_shards issues many concurrent chunk reads
+        # rather than walking the shards one at a time. It used to sit silent,
+        # which made a slow build indistinguishable from a hung one.
+        logger.info(
+            "Chimera: filling %.1f GiB f32 buffer from %d shards "
+            "(%d tokens, dim=%d, %d readers)",
+            embeddings.nbytes / 1024**3,
+            len(vec_paths),
+            total_tokens,
+            dim,
+            _SHARD_LOAD_WORKERS,
+        )
+        fill_start = time.perf_counter()
+        _fill_from_shards(embeddings, vec_paths, shard_tok_counts)
+        fill_s = max(time.perf_counter() - fill_start, 1e-9)
+        logger.info(
+            "Chimera: shard fill took %.1fs (%.0f MiB/s read)",
+            fill_s,
+            sum(p.stat().st_size for p in vec_paths) / 1024**2 / fill_s,
+        )
+        logger.info("Chimera: buffer filled, RSS %.1f GiB", _current_rss_gib())
 
         if len(doc_lens) != len(documents_ids):
             raise ValueError(
